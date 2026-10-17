@@ -8,7 +8,7 @@ import pytest
 
 from vhe.query import parser, plan
 from vhe.query.parser import parse, parse_brief, parse_with_llm
-from vhe.query.select import select, select_for
+from vhe.rank.select import select, select_for
 
 # The irl-event field-test briefs (vhe-field-test/eval/sets/irl-event/briefs.json, B1-B5).
 B1 = ('Cut a 60-90 s energetic recap of the Persian Day Parade. Open on an establishing wide of Madison Avenue with '

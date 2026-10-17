@@ -64,6 +64,13 @@ topic) a clip serves, `role` is opener/closer/soundbite. `--export DIR` writes o
 (order, file, start, end, duration) and `edit.edl` (CMX3600, references the original files for relinking in
 Resolve/Premiere); `--rough-cut` adds `rough_cut.mp4`, all clips joined at 1280x720.
 
+Ranking data: `--dump-candidates OUT.json` writes every candidate the run scored (`vhe-candidates/1`: the run, the
+parsed brief and its query vector, `feature_names`, and per candidate file, file-local start/end as in the clips,
+source, stage, score, features, selected, rank, role, item); `--dump-all` adds every gated candidate before
+refinement. `vhe features footage/ --brief TEXT --spans spans.json --out OUT.json` featurises spans picked elsewhere
+(`[{"file", "start", "end"}]` or a `--json` edit list) the same way. `--persona ID` records who the edit is for;
+`--scorer model.json` ranks with a learned model (`vhe-linear-rank/1`) instead of the hand-weighted total.
+
 ## How it works
 
 ```
@@ -82,9 +89,12 @@ query (per request; a folder is one corpus: all files on a virtual timeline, a s
   candidates .... per file: utterances, sub-shots, multi-length windows, peak windows, model proposals
   gate .......... drop candidates with > 20 % unusable steps (covered, blown out, blurry, very shaky), any mood;
                   with live sound asked for, > 10 % muted steps
-  score ......... relevance = SigLIP sigmoid probability (absolute across files), the best shot item minus the
-                  avoid penalty; other signals z-scored over the pooled corpus (loudness centred per file first);
-                  quality from blur/blown/shake, not brightness
+  signals ....... relevance = SigLIP sigmoid probability (absolute across files), the best shot item minus the
+                  avoid penalty; highlight saliency (NON-COMMERCIAL) as its own signal; other signals z-scored over
+                  the pooled corpus (loudness centred per file first); quality from blur/blown/shake, not brightness
+  score ......... per candidate a versioned feature vector (rank/features.py) and a Scorer (rank/scorer.py): the
+                  hand-weighted total (relevance averaged with the saliency, length-bucket centring, length and
+                  cut priors, speech bonus) or a learned model file; refined spans are featurised and rescored
   refine ........ per file: snap edges to cuts, word boundaries, speech pauses, steady frames; enforce lengths
   select ........ opener/closer first, then shot items round robin, MMR with no overlap, runtime budget, per-file
                   cap for variety; spoken topics: transcript sentences above a similarity threshold, time order
@@ -100,7 +110,8 @@ vhe/
   ingest/decode.py
   signals/{shots,motion,audio,speech,frames,tags,quality,changes,highlight_nc}.py
   index/store.py
-  query/{parser,plan,candidates,score,select,refine}.py
+  query/{parser,plan,candidates,refine}.py
+  rank/{signals,features,scorer,select,dump}.py
   export/clips.py
   ui/{server.py,index.html}
 tests/

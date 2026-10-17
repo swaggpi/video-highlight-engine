@@ -2,7 +2,12 @@
 
 Both run on a Corpus (vhe/corpus.py): every file's index on one virtual timeline, so there is one code path.
 Candidates are generated and refined per file (no clip spans two files); scoring, selection and the edit order
-run over all files together. Clips carry the file and file-local times for playback and export."""
+run over all files together. Clips carry the file and file-local times for playback and export.
+
+clips() orchestrates: parse the brief -> per-step signals -> candidates -> usable gate -> features (vhe.rank.features)
+-> Scorer.score -> refine the best -> features of the refined spans -> Scorer.rescore -> selection -> edit order.
+The scorer is the hand-weighted one unless a learned model is given (vhe.rank.scorer); a run can dump every
+candidate's features, score and selection (vhe.rank.dump)."""
 from __future__ import annotations
 
 import bisect
@@ -17,24 +22,22 @@ import numpy as np
 
 from vhe.config import resolve_device
 from vhe.corpus import Corpus, open_corpus
-from vhe.query.candidates import LENGTHS, cuts_inside, fit_span, generate, peak_times, speech_spans
+from vhe.query.candidates import fit_span, generate, peak_times, speech_spans
 from vhe.query.parser import ParsedQuery, parse_brief
 from vhe.query.plan import LIVE_MAX_MUTED, assign, combine, item_centre, item_scores, muted_steps, topic_scores
 from vhe.query.refine import Context, refine
-from vhe.query.score import relevance, segment_scores, smooth, timestep_signals
-from vhe.query.select import select_for
+from vhe.rank import dump as dumps
+from vhe.rank.features import INDEX, featurize, query_names, query_vector
+from vhe.rank.scorer import Scorer, load_scorer
+from vhe.rank.select import select_for
+from vhe.rank.signals import blend_nc, nc_signal, relevance, segment_scores, smooth, span_mean, timestep_signals
 
-CUT_PENALTY = 0.15
-LENGTH_PRIOR = 0.15
 TAG_MIN_PROB = 0.3
-SPEECH_BONUS = 0.3  # utterance-aligned candidates beat windows that start mid-sentence, scaled by speech weight
 MAX_UNUSABLE = 0.2  # candidates with more unusable steps (covered, blown, blurry, very shaky) are dropped, any mood
-BUCKET_MIN = 5  # length buckets smaller than this are not median-centred (a singleton would become exactly 0)
 EDGE_WEIGHTS = {"relevance": 1.0, "steady": 0.8, "quality": 0.6}  # opener/closer: the shot asked for, held steady
 EDGE_POOL = 30
 ITEM_POOL = 60  # with a shot list, each item's own best candidates join the pool
 EMB_BLOCK = 1 << 16  # rows cast to float32 per matmul block
-SIGNALS = ("relevance", "quality", "energy", "steady", "speech")
 STOPWORDS = {"the", "and", "with", "for", "from", "that", "this", "der", "die", "das", "und", "mit", "ein", "eine",
              "von", "auf", "für", "den", "dem", "des", "a", "an", "of", "on", "in", "at", "to", "is"}
 
@@ -48,7 +51,9 @@ def _disjoint(o: dict, others) -> bool:
 
 
 class Engine:
-    def __init__(self, source: Path | str | Corpus, device: str = "auto", use_nc: bool = True) -> None:
+    def __init__(self, source: Path | str | Corpus, device: str = "auto", use_nc: bool = True,
+                 scorer: Scorer | str | Path | None = None) -> None:
+        """scorer: a Scorer, "heuristic" / None (the hand-weighted total) or a learned model file."""
         self.corpus = source if isinstance(source, Corpus) else open_corpus(Path(source))
         c = self.corpus
         self.device = resolve_device(device)
@@ -61,11 +66,13 @@ class Engine:
         scale = c.meta.get("logit_scale")
         self._logit = None if scale is None else (float(scale), float(c.meta.get("logit_bias") or 0.0))
         self.load_seconds = 0.0
+        self.scorer = load_scorer(scorer)
 
     @classmethod
-    def open(cls, path: Path | str, device: str = "auto", use_nc: bool = True) -> "Engine":
+    def open(cls, path: Path | str, device: str = "auto", use_nc: bool = True,
+             scorer: Scorer | str | Path | None = None) -> "Engine":
         """A project folder, a per-video index dir, or a video with its index next to it."""
-        return cls(open_corpus(Path(path)), device, use_nc)
+        return cls(open_corpus(Path(path)), device, use_nc, scorer)
 
     @property
     def encoder(self):
@@ -89,18 +96,18 @@ class Engine:
                 self._text_cache.update(zip(missing, self.encoder.texts(missing)))
         return np.stack([self._text_cache[t] for t in texts])
 
-    def _relevance(self, text: str, nc_saliency: np.ndarray | None = None) -> np.ndarray:
+    def _relevance(self, text: str) -> np.ndarray:
         c = self.corpus
-        return relevance(self._similarity(self.text_vector(text)), c.fps, self._logit, nc_saliency, c.file_id)
+        return relevance(self._similarity(self.text_vector(text)), c.fps, self._logit, c.file_id)
 
-    def _relevances(self, texts: list[str], nc_saliency: np.ndarray | None = None) -> np.ndarray:
-        """(texts, steps) relevance per text on the absolute scale. With one text this is text_vector's path, so
-        a single-text query scores exactly as before."""
+    def _relevances(self, texts: list[str]) -> np.ndarray:
+        """(texts, steps) SigLIP relevance per text on the absolute scale. With one text this is text_vector's path,
+        so a single-text query scores exactly as before."""
         c = self.corpus
         if len(texts) == 1:
-            return self._relevance(texts[0], nc_saliency)[None]
+            return self._relevance(texts[0])[None]
         sims = self._similarity(self.text_vectors(texts).T)
-        return np.stack([relevance(sims[:, k], c.fps, self._logit, nc_saliency, c.file_id) for k in range(len(texts))])
+        return np.stack([relevance(sims[:, k], c.fps, self._logit, c.file_id) for k in range(len(texts))])
 
     def _similarity(self, v: np.ndarray) -> np.ndarray:
         """emb @ v in float32 (v: one vector, or (dim, k) for k texts), one block of rows at a time."""
@@ -110,20 +117,29 @@ class Engine:
             out[a:a + EMB_BLOCK] = self._emb[a:a + EMB_BLOCK].astype(np.float32) @ v
         return out
 
-    def _plan_relevance(self, p: ParsedQuery, nc_sal: np.ndarray | None) -> tuple[np.ndarray | None, np.ndarray | None]:
-        """(relevance per step, per-item relevance (items, steps) or None). The best of the shot items (or the text),
-        minus the bounded avoid penalty. The highlight model's saliency is blended into every item alike, so the max
-        over items is the same as blending it into the max. Which item a clip serves is decided on SigLIP alone:
-        the query-wide saliency says nothing about a single item and would shift the absolute ITEM_MIN_REL scale."""
+    def _signals(self, p: ParsedQuery) -> tuple[dict, np.ndarray | None, list[list]]:
+        """(per-step signals, raw highlight-model saliency or None, its proposals per file) for a parsed brief.
+
+        relevance: the hand-weighted relevance the candidates, the heuristic scorer and the reported scores use: per
+        shot item (or the text) SigLIP averaged with the highlight saliency where a file has it, the best item per
+        step, minus the bounded avoid penalty. siglip / avoid_pen / nc_sal: the same parts kept apart (features).
+        items: SigLIP relevance per shot item (which item a clip serves is decided on SigLIP alone: the query-wide
+        saliency says nothing about a single item and would shift the absolute ITEM_MIN_REL scale)."""
+        c = self.corpus
+        nc_raw, proposals = self._nc_scores(self._nc_query(p))
+        nc = nc_signal(nc_raw)
+        sig = timestep_signals(c.grid, c.fps, None, c.audio_steps, c.file_id)
+        sig.update(siglip=None, avoid_pen=None, nc_sal=nc, items=None, item_centre=None, muted=self._muted)
         items = p.shots or ([p.text] if p.text else [])
-        if not items:
-            return None, None
-        rel_items = self._relevances(items, nc_sal)
-        rel_avoid = self._relevances(p.avoid) if p.avoid else None
-        if not p.shots:
-            return combine(rel_items, rel_avoid), None
-        has_nc = nc_sal is not None and np.isfinite(nc_sal).any()
-        return combine(rel_items, rel_avoid), (self._relevances(items) if has_nc else rel_items)
+        if items:
+            rel_items = self._relevances(items)
+            rel_avoid = self._relevances(p.avoid) if p.avoid else None
+            want = combine(rel_items)
+            sig.update(relevance=combine(blend_nc(rel_items, nc), rel_avoid), siglip=want,
+                       avoid_pen=want - combine(rel_items, rel_avoid))
+            if p.shots:
+                sig.update(items=rel_items, item_centre=item_centre(rel_items))
+        return sig, nc_raw, proposals
 
     def _avoided(self, rel: np.ndarray, p: ParsedQuery) -> np.ndarray:
         """Opener/closer relevance with the brief's avoid penalty too."""
@@ -238,98 +254,102 @@ class Engine:
             keep &= self._unusable(S, E, K, self._muted) <= LIVE_MAX_MUTED
         return keep
 
-    def _pool(self, sig: dict, weights: dict, cands: tuple, p: ParsedQuery, size: int) -> list[dict]:
-        """Stage 1, vectorised over every candidate: segment means from prefix sums, compared within length
-        buckets. Stage 2 on the best `size`: exact relevance (mean of the best 60% of steps) and refined edges, so
-        selection (budget, overlap, MMR) runs on the final clips."""
+    def _pool(self, sig: dict, weights: dict, cands: tuple, p: ParsedQuery, size: int, persona: str | None = None,
+              trace: dict | None = None) -> list[dict]:
+        """Stage 1, vectorised over every candidate: features and Scorer.score. Stage 2 on the best `size` (with a
+        shot list, also each item's own best): refined edges, the usable gate again, features of the refined spans
+        and Scorer.rescore, so selection (budget, overlap, MMR) runs on the final clips. Each returned candidate
+        carries its total, its refined features ("x") and, with a shot list, the item it serves. trace: filled with
+        the stage-1 features, scores, spans and query vector (for a full candidate dump)."""
         c = self.corpus
         S, E, K, src = cands
-        i0, i1 = c.steps(S, E, K)
-        means = {}
-        for key in SIGNALS:
-            cum = np.concatenate([[0.0], np.cumsum(sig[key])])
-            means[key] = (cum[i1] - cum[i0]) / (i1 - i0)
-        means["speech"] = means["speech"] * 2 - 1
-        total = sum(weights.get(k, 0.0) * means[k] for k in means)
-        # Short windows on a peak have higher means than long ones; compare each candidate within its length
-        # bucket, then add a mild prior towards the middle of the allowed range.
-        bucket = np.searchsorted(np.asarray(LENGTHS, dtype=float), E - S - 1e-6)
-        for b in np.unique(bucket):
-            if np.count_nonzero(bucket == b) >= BUCKET_MIN:
-                total[bucket == b] -= np.median(total[bucket == b])
-        target = (p.min_len + p.max_len) / 2
-        n_cuts = cuts_inside(S, E, np.asarray(c.cuts))
-        total += -LENGTH_PRIOR * np.abs((E - S) - target) / max(target, 1.0) - CUT_PENALTY * n_cuts
-        total += SPEECH_BONUS * max(0.0, weights.get("speech", 0.0)) * np.array([s == "speech" for s in src])
-
-        chosen = np.argsort(-total)[:size]
+        q = query_vector(p, persona, self.scorer.personas, weights)
+        X0 = featurize(c, sig, S, E, K, src, p)
+        s0 = np.asarray(self.scorer.score(X0, q), dtype=float)
+        if trace is not None:
+            trace.update(X=X0, s=s0, S=S, E=E, K=K, src=src, q=q)
+        chosen = np.argsort(-s0)[:size]
         if sig.get("items") is not None and len(sig["items"]) > 1:
             # A generic item ("wide of the avenue", relevant everywhere) would fill the pool by itself: also take
             # each item's own best candidates, ranked with that item's relevance in place of the max.
+            i0, i1 = c.steps(S, E, K)
             w = weights.get("relevance", 0.0)
-            extra = []
-            for row in sig["items"]:
-                cum = np.concatenate([[0.0], np.cumsum(row)])
-                own = total + w * ((cum[i1] - cum[i0]) / (i1 - i0) - means["relevance"])
-                extra.append(np.argsort(-own)[:ITEM_POOL])
+            h_mean = X0[:, INDEX["h_rel_mean"]]
+            extra = [np.argsort(-(s0 + w * (span_mean(row, i0, i1) - h_mean)))[:ITEM_POOL] for row in sig["items"]]
             chosen = np.concatenate([chosen, *extra])
             chosen = chosen[np.sort(np.unique(chosen, return_index=True)[1])]
-        out = []
+        out, rows = [], []
         for j in chosen:
-            parts = segment_scores(sig, int(i0[j]), int(i1[j]), weights)
-            adj = float(total[j] + weights.get("relevance", 0.0) * (parts["relevance"] - means["relevance"][j]))
             k, off = int(K[j]), c.offsets[K[j]]
             s, e = refine(float(S[j] - off), float(E[j] - off), self._context(k), p.min_len, p.max_len)
-            out.append({"start": off + s, "end": off + e, "file": k, "source": src[j], "cuts_inside": int(n_cuts[j]),
-                        "total": adj, "relevance": parts["relevance"]})
-        if out:  # refinement moves edges by up to a second or so: gate the final spans again
-            out = [o for o, ok in zip(out, self._gate(*(np.array([o[key] for o in out])
-                                                        for key in ("start", "end", "file")), p)) if ok]
-        if out and sig.get("items") is not None:  # which shot item each final span serves
-            r0, r1 = c.steps(*(np.array([o[key] for o in out]) for key in ("start", "end", "file")))
+            out.append({"start": off + s, "end": off + e, "file": k, "source": src[j],
+                        "cuts_inside": int(X0[j, INDEX["n_cuts_inside"]]),
+                        "relevance": float(X0[j, INDEX["h_rel_top60"]])})
+            rows.append(j)
+        if not out:
+            return out
+        # Refinement moves edges by up to a second or so: gate the final spans again.
+        keep = self._gate(*(np.array([o[key] for o in out]) for key in ("start", "end", "file")), p)
+        out, rows = [o for o, ok in zip(out, keep) if ok], np.array([j for j, ok in zip(rows, keep) if ok], dtype=int)
+        if not out:
+            return out
+        S1, E1, K1 = (np.array([o[key] for o in out]) for key in ("start", "end", "file"))
+        scores = None
+        if sig.get("items") is not None:  # which shot item each final span serves
+            r0, r1 = c.steps(S1, E1, K1)
             scores = item_scores(sig["items"], r0, r1)
             for o, row, it in zip(out, scores, assign(scores, sig["item_centre"])):
                 o["item_rel"], o["item"] = row, int(it)
+        X1 = featurize(c, sig, S1, E1, K1, [o["source"] for o in out], p, item_rel=scores)
+        totals = self.scorer.rescore(s0[rows], X0[rows], X1, q)
+        for o, t, x in zip(out, totals, X1):
+            o["total"], o["x"] = float(t), x
         return out
 
     def _edge_clip(self, text: str, sig: dict, cands: tuple, p: ParsedQuery, taken: list[dict],
-                   max_len: float) -> dict | None:
-        """Best clip for the opener/closer description: its own relevance (minus the brief's avoid penalty),
-        steady and clean, not overlapping."""
-        edge_sig = dict(sig, relevance=self._avoided(self._relevance(text), p), items=None)
-        pool = self._pool(edge_sig, EDGE_WEIGHTS, cands, p, EDGE_POOL)
+                   max_len: float, persona: str | None = None) -> dict | None:
+        """Best clip for the opener/closer description: its own relevance (minus the brief's avoid penalty, without
+        the brief's highlight saliency), steady and clean, not overlapping."""
+        rel = self._relevance(text)
+        avoided = self._avoided(rel, p)
+        edge_sig = dict(sig, relevance=avoided, siglip=rel, avoid_pen=rel - avoided, nc_sal=None, items=None,
+                        item_centre=None)
+        pool = self._pool(edge_sig, EDGE_WEIGHTS, cands, p, EDGE_POOL, persona)
         pool = [o for o in pool if o["end"] - o["start"] <= max_len + 1e-6
                 and _disjoint(o, taken)]
         return max(pool, key=lambda o: o["total"]) if pool else None
 
     def clips(self, query: str, count: int | None = None, min_len: float | None = None,
               max_len: float | None = None, llm: str | None = "auto",
-              budget_s: float | tuple[float, float] | None = None) -> dict:
-        """llm: Ollama model for parsing the brief, 'auto' (default model when reachable) or None (rules)."""
+              budget_s: float | tuple[float, float] | None = None, persona: str | None = None,
+              dump: Path | str | None = None, dump_all: bool = False) -> dict:
+        """llm: Ollama model for parsing the brief, 'auto' (default model when reachable) or None (rules).
+        persona: who the edit is for (part of the query vector a learned scorer sees). dump: write every scored
+        candidate there (vhe.rank.dump: the shortlist and the picks; with dump_all every gated candidate too)."""
         load_before = self.load_seconds
         t0 = time.perf_counter()
-        c, fps = self.corpus, self.corpus.fps
+        c = self.corpus
         p = self.parse(query, llm, count=count, min_len=min_len, max_len=max_len, budget_s=budget_s)
         if p.topics and not p.shots:  # "every moment the host talks about ...": transcript spans, not pictures
             clips, n_spans, method = self._topic_clips(p, None if p.exhaustive else p.count,
                                                        p.soundbite_len or (p.min_len, p.max_len), role=None)
             result = {"query": p.to_dict(), "clips": clips, "candidates": n_spans, "files": len(c.members),
                       "noncommercial": [], "unusable_dropped": 0, "topic_match": method}
+            if dump:
+                self._dump(dump, query, p, persona, self._signals(p)[0], topic=clips)
             return self._finish(result, t0, load_before)
-        nc_sal, proposals = self._nc_scores(self._nc_query(p))
-        rel, rel_items = self._plan_relevance(p, nc_sal)
-        sig = timestep_signals(c.grid, fps, rel, c.audio_steps, c.file_id)
-        sig["items"] = rel_items
-        sig["item_centre"] = None if rel_items is None else item_centre(rel_items)
+        sig, nc_raw, proposals = self._signals(p)
         per_step = sum(p.weights.get(k, 0.0) * sig[k] for k in ("relevance", "quality", "energy", "steady"))
         S, E, K, src = self._candidates(per_step, p, proposals)
         result = {"query": p.to_dict(), "clips": [], "candidates": len(S), "files": len(c.members),
                   "noncommercial": sorted({x for ix in c.members for x in ix.meta.get("noncommercial_components", [])})
-                  if nc_sal is not None else []}
+                  if nc_raw is not None else []}
         keep = self._gate(S, E, K, p)
         result["unusable_dropped"] = int(len(S) - keep.sum())
         cands = (S[keep], E[keep], K[keep], [s for s, k in zip(src, keep) if k])
         if not len(cands[0]):
+            if dump:
+                self._dump(dump, query, p, persona, sig)
             return self._finish(result, t0, load_before)
 
         # Opener and closer first: they take their slots (and budget) before the body is selected.
@@ -337,7 +357,7 @@ class Engine:
         room = np.inf if p.budget is None else p.budget[1]
         for role, text in (("opener", p.opener), ("closer", p.closer)):
             if text:
-                e = self._edge_clip(text, sig, cands, p, list(edges.values()), room)
+                e = self._edge_clip(text, sig, cands, p, list(edges.values()), room, persona)
                 if e is not None:
                     edges[role] = dict(e, text=text)
                     room -= e["end"] - e["start"]
@@ -346,14 +366,17 @@ class Engine:
             p, count=max(0, p.count - len(edges)),
             budget=None if p.budget is None else (max(0.0, p.budget[0] - used), p.budget[1] - used))
 
-        scored = [o for o in self._pool(sig, p.weights, cands, p, max(400, 40 * p.count))
-                  if _disjoint(o, edges.values())]
+        trace = {} if dump and dump_all else None
+        pool = self._pool(sig, p.weights, cands, p, max(400, 40 * p.count), persona, trace)
+        for cid, o in enumerate(pool):
+            o["cid"] = cid
+        scored = [o for o in pool if _disjoint(o, edges.values())]
         if scored:
             r0, r1 = c.steps(*(np.array([o[key] for o in scored]) for key in ("start", "end", "file")))
             speech_cum = np.concatenate([[0.0], np.cumsum(sig["speech"])])
             for o, f in zip(scored, (speech_cum[r1] - speech_cum[r0]) / (r1 - r0)):
                 o["speech_frac"] = float(f)
-            item_rel = np.array([o["item_rel"] for o in scored]) if rel_items is not None else None
+            item_rel = np.array([o["item_rel"] for o in scored]) if sig["items"] is not None else None
             body = select_for(scored, self._mean_vectors(r0, r1), body_p, groups=np.array([o["file"] for o in scored]),
                               item_rel=item_rel, item_centre=sig["item_centre"])
         else:
@@ -364,11 +387,92 @@ class Engine:
             ([("closer", edges["closer"])] if "closer" in edges else [])
         for role, o in ordered:
             result["clips"].append(self._clip(o, sig, p, role))
+        bites = []
         if p.topics:  # "also the best 5-8 s soundbite where the host sums up": a separate deliverable, at the end
             bites, _, result["topic_match"] = self._topic_clips(p, 1, p.soundbite_len or (p.min_len, p.max_len),
                                                                 role="soundbite")
             result["clips"] += bites
+        if dump:
+            self._dump(dump, query, p, persona, sig, pool, edges, body, bites, trace)
         return self._finish(result, t0, load_before)
+
+    # ---- features and candidate dumps ------------------------------------------------------------------------
+    def _span(self, k: int, s: float, e: float) -> tuple[str, float, float]:
+        """(file label, file-local start, end) of virtual span s..e in file k, exactly as an output clip has it."""
+        hit = self._hit(int(k), round(float(s), 3), round(float(e), 3))
+        return hit["file"], hit["file_start"], hit["file_end"]
+
+    @staticmethod
+    def _item_name(p: ParsedQuery, item) -> str | None:
+        if isinstance(item, (int, np.integer)):  # index into p.shots; -1: serves no item
+            return p.shots[int(item)] if 0 <= int(item) < len(p.shots) else None
+        return item
+
+    def _dump_doc(self, query: str, p: ParsedQuery, persona: str | None, candidates: list[dict]) -> dict:
+        c = self.corpus
+        personas = self.scorer.personas
+        return dumps.build(scorer=self.scorer.name, corpus_root=str(c.root or c.members[0].root),
+                           n_files=len(c.members), brief=query, parsed=p.to_dict(), persona=persona,
+                           q=query_vector(p, persona, personas), q_names=query_names(personas), candidates=candidates)
+
+    def _dump(self, path: Path | str, query: str, p: ParsedQuery, persona: str | None, sig: dict,
+              pool: list[dict] = (), edges: dict[str, dict] | None = None, body: list[dict] = (),
+              topic: list[dict] = (), trace: dict | None = None) -> None:
+        """Write the run's candidates (vhe.rank.dump): with a trace every gated candidate as generated, the
+        shortlist with its refined edges and final totals (selected ones with their selection rank and item), the
+        opener/closer and topic clips. Every feature vector uses the brief's signals."""
+        c = self.corpus
+        out = []
+        if trace:
+            for j in range(len(trace["S"])):
+                out.append(dumps.entry(*self._span(trace["K"][j], trace["S"][j], trace["E"][j]), trace["src"][j],
+                                       "candidate", trace["s"][j], trace["X"][j]))
+        picked = {o["cid"]: o for o in body}
+        for o in pool:
+            b = picked.get(o["cid"])
+            out.append(dumps.entry(*self._span(o["file"], o["start"], o["end"]), o["source"], "shortlist", o["total"],
+                                   o["x"], selected=b is not None, rank=None if b is None else b["rank"],
+                                   item=self._item_name(p, (b or o).get("item"))))
+        extra = [(o, "edge", role) for role, o in (edges or {}).items()] + \
+            [({"file": c.files.index(t["file"]), "start": t["start"], "end": t["end"], "source": t["source"],
+               "total": t["score"], "item": t["item"]}, "topic", t["role"]) for t in topic]
+        if extra:
+            S, E, K = (np.array([o[key] for o, _, _ in extra]) for key in ("start", "end", "file"))
+            X = featurize(c, sig, S, E, K, [o["source"] for o, _, _ in extra], p)
+            for (o, stage, role), x in zip(extra, X):
+                out.append(dumps.entry(*self._span(o["file"], o["start"], o["end"]), o["source"], stage, o["total"],
+                                       x, selected=True, role=role, item=self._item_name(p, o.get("item"))))
+        dumps.write(path, self._dump_doc(query, p, persona, out))
+
+    def features_for_spans(self, query: str, spans: list[dict], persona: str | None = None, llm: str | None = "auto",
+                           **overrides) -> dict:
+        """The dump document ("vhe-candidates/1", stage "external") for spans picked outside the engine (an editor,
+        another model): {"file", "start", "end"} in file-local seconds; "source", "selected", "rank", "role" and
+        "item" are carried over when given. Features come from the same signals clips() computes for this brief;
+        the score is the engine scorer's score() over these spans."""
+        c = self.corpus
+        p = self.parse(query, llm, **overrides)
+        sig = self._signals(p)[0]
+        K = np.array([self._file_index(sp["file"]) for sp in spans], dtype=int)
+        S = np.array([c.offsets[k] + min(max(float(sp["start"]), 0.0), c.durations[k]) for sp, k in zip(spans, K)])
+        E = np.array([c.offsets[k] + min(max(float(sp["end"]), 0.0), c.durations[k]) for sp, k in zip(spans, K)])
+        src = [str(sp.get("source") or "external") for sp in spans]
+        X = featurize(c, sig, S, E, K, src, p)
+        scores = self.scorer.score(X, query_vector(p, persona, self.scorer.personas)) if len(X) else []
+        out = [dumps.entry(*self._span(k, s, e), source, "external", sc, x, selected=bool(sp.get("selected", False)),
+                           rank=sp.get("rank"), role=sp.get("role"), item=sp.get("item"))
+               for sp, k, s, e, source, sc, x in zip(spans, K, S, E, src, scores, X)]
+        return self._dump_doc(query, p, persona, out)
+
+    def _file_index(self, name: str) -> int:
+        """A file label (path relative to the project), or a file name that is unique in the corpus."""
+        files = self.corpus.files
+        if name in files:
+            return files.index(name)
+        hits = [k for k, f in enumerate(files) if Path(f).name == Path(name).name]
+        if len(hits) != 1:
+            raise KeyError(f"file {name!r} is not in the corpus ({len(files)} files)")
+        return hits[0]
 
     def _topic_clips(self, p: ParsedQuery, n: int | None, length: tuple[float, float],
                      role: str | None) -> tuple[list[dict], int, str]:
@@ -418,9 +522,7 @@ class Engine:
         j0, j1 = (int(x) for x in c.steps(s, e, k))
         parts = segment_scores(sig, j0, j1, p.weights)
         labels = self._labels(j0, j1, parts)
-        item = o.get("item")
-        if isinstance(item, (int, np.integer)):  # index into p.shots; -1: serves no item
-            item = p.shots[int(item)] if 0 <= int(item) < len(p.shots) else None
+        item = self._item_name(p, o.get("item"))
         return self._hit(k, s, e) | {
             "duration": round(e - s, 3), "rank_score": round(o["total"], 3), "score": round(parts["total"], 3),
             "relevance": round(parts["relevance"], 3), "quality": round(parts["quality"], 3),

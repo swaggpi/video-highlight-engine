@@ -1,10 +1,11 @@
 """The query side of a brief plan (vhe.query.parser.ParsedQuery shots/avoid/topics/need_live_audio).
 
 Relevance with a shot list is the best item per step (each item on the same absolute log-odds scale as a single
-text, score.relevance), minus a bounded penalty where an avoid item matches better than both a floor and the wanted
-item. A clip serves the item it matches best, if it matches it well enough; selection uses that to cover distinct
-items. Spoken topics are matched against the transcript text of speech candidates: Ollama bge-m3 embeddings when
-the server is reachable, otherwise IDF-weighted keyword overlap. need_live_audio drops clips whose sound is muted."""
+text, vhe.rank.signals.relevance), minus a bounded penalty where an avoid item matches better than both a floor and
+the wanted item. A clip serves the item it matches best, if it matches it well enough; selection uses that to cover
+distinct items. Spoken topics are matched against the transcript text of speech candidates: Ollama bge-m3 embeddings
+when the server is reachable, otherwise IDF-weighted keyword overlap. need_live_audio drops clips whose sound is
+muted."""
 from __future__ import annotations
 
 import json
@@ -15,7 +16,9 @@ from datetime import datetime, timezone
 
 import numpy as np
 
-# Relevance units (score.relevance): 0 is log-odds -8, one unit 2.5 nats, clipped to +-3.
+from vhe.rank.signals import span_top_mean
+
+# Relevance units (vhe.rank.signals.relevance): 0 is log-odds -8, one unit 2.5 nats, clipped to +-3.
 AVOID_FLOOR = 1.2  # an avoid item matching below this (log-odds about -5) is noise and never penalised
 AVOID_MAX = 1.0  # at most one unit off: avoid never sinks a clearly relevant shot
 # A clip serves an item only above this (log-odds about -6.75, a partial SigLIP match). On the irl-event footage
@@ -24,7 +27,6 @@ AVOID_MAX = 1.0  # at most one unit off: avoid never sinks a clearly relevant sh
 # median (how unusual the match is for that item), and only this floor is absolute.
 ITEM_MIN_REL = 0.5
 ITEM_MARGIN = 0.5  # exhaustive per-item picks: the clip must match this item nearly as well as its best item
-TOP_FRAC = 0.6  # a span is as relevant as its best 60 % of steps (same rule as score.segment_scores)
 
 LIVE_MIN_DB = -60.0  # loudness (dBFS) below this is muted: phone mutes are digital silence at -120 dB
 LIVE_MAX_MUTED = 0.1  # need_live_audio: clips with a larger muted (or audio-less) fraction are dropped
@@ -56,12 +58,11 @@ def combine(rel_items: np.ndarray, rel_avoid: np.ndarray | None = None) -> np.nd
 
 
 def item_scores(rel_items: np.ndarray, i0: np.ndarray, i1: np.ndarray) -> np.ndarray:
-    """(spans, items): each item's relevance over each grid-step span [i0, i1), as the mean of its best steps."""
-    out = np.zeros((len(i0), len(rel_items)))
-    for j, (a, b) in enumerate(zip(np.asarray(i0, int), np.asarray(i1, int))):
-        block = np.sort(rel_items[:, a:max(b, a + 1)], axis=1)
-        out[j] = block[:, -max(1, int(np.ceil(TOP_FRAC * block.shape[1]))):].mean(1)
-    return out
+    """(spans, items): each item's relevance over each grid-step span [i0, i1), as the mean of its best steps
+    (vhe.rank.signals.span_top_mean, the segment_scores rule)."""
+    if not len(rel_items):
+        return np.zeros((len(i0), 0))
+    return np.stack([span_top_mean(row, i0, i1) for row in rel_items], axis=1)
 
 
 def item_centre(rel_items: np.ndarray) -> np.ndarray:

@@ -4,7 +4,7 @@ import cv2
 import numpy as np
 
 from vhe.config import BAD_FRAMING_MARGIN, OBSTRUCTED_MARGIN, SHAKY
-from vhe.query.score import timestep_signals
+from vhe.rank.signals import timestep_signals
 from vhe.signals.motion import motion_signals, phase_shift
 from vhe.signals.quality import reason_names, usable_mask
 from vhe.signals.tags import (

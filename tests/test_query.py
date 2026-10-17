@@ -7,8 +7,8 @@ import pytest
 from vhe.query.candidates import cuts_inside, generate, peak_times, speech_spans
 from vhe.query.parser import parse
 from vhe.query.refine import Context, refine
-from vhe.query.score import robust_z, segment_scores
-from vhe.query.select import EXHAUSTIVE_MIN_TOTAL, overlap_fraction, select, select_for
+from vhe.rank.signals import robust_z, segment_scores
+from vhe.rank.select import EXHAUSTIVE_MIN_TOTAL, overlap_fraction, select, select_for
 
 
 def test_parse_energy_and_short():

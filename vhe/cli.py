@@ -75,9 +75,9 @@ def cmd_search(a: argparse.Namespace) -> None:
 def cmd_clips(a: argparse.Namespace) -> None:
     from vhe.engine import Engine
 
-    eng = Engine.open(Path(a.path), a.device, use_nc=not a.no_nc)
+    eng = Engine.open(Path(a.path), a.device, use_nc=not a.no_nc, scorer=a.scorer)
     res = eng.clips(a.query, count=a.count, min_len=a.min_len, max_len=a.max_len, llm=None if a.no_llm else a.llm,
-                    budget_s=_budget(a.budget))
+                    budget_s=_budget(a.budget), persona=a.persona, dump=a.dump_candidates, dump_all=a.dump_all)
     q = res["query"]
     budget = f" budget={q['budget'][0]:.0f}-{q['budget'][1]:.0f}s" if q.get("budget") else ""
     edges = "".join(f" {k}={q[k]!r}" for k in ("opener", "closer") if q.get(k))
@@ -102,6 +102,8 @@ def cmd_clips(a: argparse.Namespace) -> None:
         print("NON-COMMERCIAL components used:", ", ".join(res["noncommercial"]))
     if a.json:
         Path(a.json).write_text(json.dumps(edit_json(res), indent=1, ensure_ascii=False))
+    if a.dump_candidates:
+        print(f"scorer {eng.scorer.name}: candidates dumped to {a.dump_candidates}")
     if a.export:
         from vhe.export.clips import export_clips
 
@@ -109,6 +111,17 @@ def cmd_clips(a: argparse.Namespace) -> None:
                            with_rough_cut=a.rough_cut)
         print(f"exported {len(out['clips'])} clips, {out['csv'].name}, {out['edl'].name}"
               f"{', ' + out['rough_cut'].name if out['rough_cut'] else ''} to {a.export}")
+
+
+def cmd_features(a: argparse.Namespace) -> None:
+    from vhe.engine import Engine
+    from vhe.rank.dump import load_spans, write
+
+    eng = Engine.open(Path(a.path), a.device, use_nc=not a.no_nc, scorer=a.scorer)
+    doc = eng.features_for_spans(a.brief, load_spans(a.spans), persona=a.persona, llm=None if a.no_llm else a.llm)
+    write(a.out, doc)
+    print(f"{len(doc['candidates'])} spans, {len(doc['feature_names'])} features ({doc['feature_version']}) "
+          f"-> {a.out}")
 
 
 def cmd_info(a: argparse.Namespace) -> None:
@@ -170,7 +183,26 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--export", default=None, help="write clips, clips.csv and edit.edl to this folder")
     p.add_argument("--rough-cut", action="store_true", help="with --export: also a joined preview rough_cut.mp4")
     p.add_argument("--json", default=None, help="write the edit list (file-local times) as JSON")
+    p.add_argument("--scorer", default=None, help="ranking model file (vhe-linear-rank/1); default: heuristic")
+    p.add_argument("--persona", default=None, help="who the edit is for (an id, e.g. p2-tiktok)")
+    p.add_argument("--dump-candidates", default=None, metavar="OUT.json",
+                   help="write every scored candidate with its features (vhe-candidates/1)")
+    p.add_argument("--dump-all", action="store_true",
+                   help="with --dump-candidates: also every gated candidate before refinement (large)")
     p.set_defaults(func=cmd_clips)
+
+    p = sub.add_parser("features", help="feature vectors for given spans under a brief (vhe-candidates/1)")
+    p.add_argument("path", help="project folder, video file, or per-video index dir")
+    p.add_argument("--brief", required=True)
+    p.add_argument("--spans", required=True,
+                   help="JSON: [{file, start, end}] in file-local seconds, or a `clips --json` edit list")
+    p.add_argument("--out", required=True)
+    p.add_argument("--persona", default=None)
+    p.add_argument("--scorer", default=None, help="model whose score is recorded; default: heuristic")
+    p.add_argument("--llm", default="auto", help="Ollama model that parses the brief (as for clips)")
+    p.add_argument("--no-llm", action="store_true", help="parse the brief with the rules only")
+    p.add_argument("--no-nc", action="store_true")
+    p.set_defaults(func=cmd_features)
 
     p = sub.add_parser("info", help="index summary and timings (or a project's files)")
     p.add_argument("index")

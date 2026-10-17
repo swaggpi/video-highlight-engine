@@ -15,8 +15,8 @@ from vhe.index.store import Index, save_index
 from vhe.project import PROJECT_DIR, slug, write_manifest
 from vhe.query.candidates import cuts_inside
 from vhe.query.parser import ParsedQuery
-from vhe.query.score import relevance, robust_z, timestep_signals
-from vhe.query.select import per_file_cap, select_for
+from vhe.rank.signals import relevance, robust_z, timestep_signals
+from vhe.rank.select import per_file_cap, select_for
 
 FPS = 3.0
 DIM = 64
