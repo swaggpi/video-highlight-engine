@@ -56,9 +56,20 @@ function render(items, withExport) {
     const score = c.relevance !== undefined
       ? `score ${c.score.toFixed(2)} · rel ${c.relevance.toFixed(2)} · qual ${c.quality.toFixed(2)} · energy ${c.energy.toFixed(2)}`
       : `score ${c.score.toFixed(3)}`;
-    div.innerHTML = `<label class="meta"><input type="checkbox" data-i="${i}" ${withExport ? "checked" : "hidden"}> ` +
-      `${fmt(c.start)}–${fmt(c.end)} · ${score} · ${label}</label>` +
-      `<video controls preload="none" src="/media?path=${video}#t=${c.start},${c.end}"></video>`;
+    // Built with textContent: labels and transcripts come from model output and must not be parsed as HTML.
+    const row = document.createElement("label");
+    row.className = "meta";
+    const box = document.createElement("input");
+    box.type = "checkbox";
+    box.dataset.i = i;
+    box.checked = withExport;
+    box.hidden = !withExport;
+    row.append(box, ` ${fmt(c.start)}–${fmt(c.end)} · ${score} · ${label}`);
+    const player = document.createElement("video");
+    player.controls = true;
+    player.preload = "none";
+    player.src = `/media?path=${video}#t=${c.start},${c.end}`;
+    div.append(row, player);
     $("results").appendChild(div);
   });
   $("exportBtn").hidden = !withExport || !items.length;
@@ -69,7 +80,7 @@ $("clipsBtn").onclick = async () => {
   try {
     const r = await post("/api/clips", {video: $("video").value.trim(), query: $("query").value, count: +$("count").value});
     render(r.clips, true);
-    status(`${r.clips.length} clips in ${r.seconds}s` + (r.noncommercial.length ? " · uses non-commercial model" : ""));
+    status(`${r.clips.length} clips in ${r.seconds}s` + ((r.noncommercial || []).length ? " · uses non-commercial model" : ""));
   } catch (e) { status(e.message); }
 };
 

@@ -6,8 +6,8 @@ import numpy as np
 
 def to_grid(times: np.ndarray, values: np.ndarray, n: int, fps: float) -> np.ndarray:
     """Mean of `values` within each grid bin [t_i - 0.5/fps, t_i + 0.5/fps); empty bins are interpolated."""
-    idx = np.clip(np.round(times * fps).astype(int), 0, n - 1)
-    ok = np.isfinite(values)
+    idx = np.round(times * fps).astype(int)
+    ok = np.isfinite(values) & (idx >= 0) & (idx < n)  # samples past the last frame are dropped, not folded in
     sums = np.bincount(idx[ok], weights=values[ok], minlength=n)
     counts = np.bincount(idx[ok], minlength=n)
     out = np.full(n, np.nan)

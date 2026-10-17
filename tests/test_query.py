@@ -32,6 +32,30 @@ def test_parse_german_and_limits():
     assert "strand" in p.text
 
 
+def test_parse_hyphenated_count():
+    p = parse("3 short high-energy scenes")
+    assert p.count == 3 and p.text == "" and p.max_len == 10.0
+
+
+def test_parse_length_not_count():
+    p = parse("10 second clips of the beach")
+    assert p.count == 5 and 7.0 <= p.min_len and p.max_len <= 13.0
+    assert "second" not in p.text and "beach" in p.text
+    p = parse("2 minute clips")
+    assert p.count == 5 and p.max_len > 100
+
+
+def test_parse_negated_speech_and_explicit_length_wins():
+    assert parse("forest without people talking").weights["speech"] == -1.0
+    p = parse("kurze Szenen 5 bis 8 Sekunden")
+    assert (p.min_len, p.max_len) == (5.0, 8.0)
+    assert parse("dogs", count=500).count == 50
+
+
+def test_parse_budget():
+    assert parse("highlights total 60 seconds").budget_s == 60.0
+
+
 def test_parse_range():
     p = parse("dog playing 5-15s")
     assert (p.min_len, p.max_len) == (5.0, 15.0)
@@ -82,6 +106,20 @@ def test_refine_snaps_to_cut_and_word():
     s, e = refine(10.4, 25.0, ctx, min_len=3, max_len=30)
     assert abs(s - 10.04) < 1e-6  # just after the cut
     assert abs(e - 25.3) < 1e-6  # after the word, not mid-word
+
+
+def test_refine_extension_respects_cuts():
+    ctx = Context(duration=60, cuts=[22.5], vad=[], words=[])
+    s, e = refine(20.0, 23.0, ctx, min_len=3, max_len=30)
+    assert e <= 22.5 and e - s >= 3 - 1e-6  # grows backwards instead of crossing the cut
+
+
+def test_select_budget():
+    cands = [{"start": 0, "end": 10, "total": 3.0}, {"start": 20, "end": 30, "total": 2.0},
+             {"start": 40, "end": 45, "total": 1.0}]
+    v = np.eye(3)
+    picked = select(cands, v, n=3, budget_s=15)
+    assert [c["start"] for c in picked] == [0, 40]
 
 
 def test_refine_enforces_length():

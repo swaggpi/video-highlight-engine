@@ -84,8 +84,16 @@ def snap_end(t: float, ctx: Context, radius: float = 1.0, pad: float = 0.2) -> f
 def refine(start: float, end: float, ctx: Context, min_len: float, max_len: float) -> tuple[float, float]:
     s, e = snap_start(start, ctx), snap_end(end, ctx)
     if e - s < min_len:
-        e = min(ctx.duration, s + min_len)
-        s = max(0.0, min(s, e - min_len))
+        # Grow towards the end first, without crossing the next cut; then backwards to the previous cut;
+        # only if the shot itself is too short, ignore cuts.
+        next_cut = min([c for c in ctx.cuts if c > e] + [ctx.duration + FRAME_GUARD]) - FRAME_GUARD
+        e = min(next_cut, s + min_len, ctx.duration)
+        if e - s < min_len:
+            prev_cut = max([c for c in ctx.cuts if c < s - FRAME_GUARD] + [-FRAME_GUARD]) + FRAME_GUARD
+            s = max(prev_cut, e - min_len, 0.0)
+        if e - s < min_len:
+            e = min(ctx.duration, s + min_len)
+            s = max(0.0, min(s, e - min_len))
     if e - s > max_len:
         e = s + max_len
         w = _word_at(ctx.words, e)

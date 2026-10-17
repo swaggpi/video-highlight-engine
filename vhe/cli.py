@@ -12,13 +12,17 @@ def _fmt(t: float) -> str:
 
 
 def cmd_index(a: argparse.Namespace) -> None:
+    import time
+
     from vhe.pipeline import build_index
-    from vhe.timing import format_report
+    from vhe.timing import format_report, hms
 
     cfg = Config(device=a.device, use_nc_highlight=not a.no_nc, asr_model=a.asr, asr_language=a.lang,
                  encoder=a.encoder, frame_height=a.frame_height, hwaccel=a.hwaccel)
-    out = build_index(Path(a.video), Path(a.out) if a.out else None, cfg, progress=lambda m: print(f"  {m}"),
-                      keep_cache=a.keep_cache)
+    t0 = time.perf_counter()
+    # flush: stdout is block-buffered when redirected to a log file
+    out = build_index(Path(a.video), Path(a.out) if a.out else None, cfg, keep_cache=a.keep_cache,
+                      progress=lambda m: print(f"  [{hms(time.perf_counter() - t0)}] {m}", flush=True))
     meta = json.loads((out / "meta.json").read_text())
     print(f"index: {out}")
     print(format_report(meta["timings"], meta["duration"]))
@@ -38,10 +42,11 @@ def cmd_clips(a: argparse.Namespace) -> None:
     from vhe.engine import Engine
 
     eng = Engine(Path(a.index), a.device, use_nc=not a.no_nc)
-    res = eng.clips(a.query, count=a.n, min_len=a.min_len, max_len=a.max_len, llm=a.llm)
+    res = eng.clips(a.query, count=a.n, min_len=a.min_len, max_len=a.max_len, llm=a.llm, budget_s=a.budget)
     q = res["query"]
-    print(f"parsed: text={q['text']!r} mood={q['mood']} len={q['min_len']:.0f}-{q['max_len']:.0f}s "
-          f"weights={q['weights']}  ({res.get('candidates', 0)} candidates, {res['seconds']:.2f}s)")
+    print(f"parsed: text={q['text']!r} mood={q['mood']} n={q['count']} len={q['min_len']:.0f}-{q['max_len']:.0f}s "
+          f"weights={q['weights']}  ({res.get('candidates', 0)} candidates, ranking {res['seconds']:.2f}s, "
+          f"model load {res['load_seconds']:.1f}s)")
     for c in res["clips"]:
         print(f"{_fmt(c['start'])}-{_fmt(c['end'])}  score {c['score']:+.2f}  rel {c['relevance']:+.2f}  "
               f"qual {c['quality']:+.2f}  energy {c['energy']:+.2f}  {', '.join(c['labels'])}")
@@ -101,6 +106,7 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--min-len", type=float, default=None)
     p.add_argument("--max-len", type=float, default=None)
     p.add_argument("--llm", default=None, help="Ollama model for query parsing (default: rules)")
+    p.add_argument("--budget", type=float, default=None, help="total seconds for all clips together")
     p.add_argument("--no-nc", action="store_true")
     p.add_argument("--export", default=None, help="write clip files to this folder")
     p.add_argument("--json", default=None, help="write the full result as JSON")

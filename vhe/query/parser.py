@@ -25,14 +25,17 @@ ENERGY = ["high-energy", "high energy", "energetic", "action", "action-packed", 
           "spannende", "schnell", "schnelle", "aufregend", "wilde"]
 SPEECH_ON = ["talking", "speaking", "speech", "interview", "conversation", "says", "spricht", "sprechen", "rede",
              "gespräch", "redet"]
-SPEECH_OFF = ["no talking", "without talking", "no speech", "without speech", "ohne sprache", "ohne reden",
-              "ohne gespräch"]
 SHORT = ["short", "quick", "kurz", "kurze", "kurzen"]
 LONG = ["long", "longer", "lang", "lange", "langen"]
 FILLER = ["show me", "find me", "find", "give me", "i want", "i need", "zeig mir", "finde", "ich will", "ich brauche",
-          "scenes", "scene", "clips", "clip", "moments", "moment", "parts", "szenen", "szene", "momente", "stellen",
+          "scenes", "scene", "clips", "clip", "shots", "shot", "moments", "moment", "parts", "szenen", "szene",
+          "momente", "stellen", "aufnahmen",
           "with", "mit", "and", "und", "the", "die", "der", "das", "some", "ein paar", "einige"]
-UNIT = r"(?:s|sec|secs|second|seconds|sek|sekunde|sekunden)\b"
+UNIT = r"(s|sec|secs|second|seconds|sek|sekunde|sekunden|min|mins|minute|minutes|minuten)\b"
+
+
+def _seconds(value: str, unit: str) -> float:
+    return float(value) * (60.0 if unit.startswith("min") else 1.0)
 
 
 @dataclass
@@ -44,6 +47,7 @@ class ParsedQuery:
     max_len: float = DEFAULT_MAX_LEN
     count: int = DEFAULT_COUNT
     mood: str | None = None
+    budget_s: float | None = None  # total duration of all clips together
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -63,32 +67,50 @@ def parse(query: str, count: int | None = None, min_len: float | None = None,
     q = raw.lower()
     p = ParsedQuery(raw=raw, text="")
     rest = q
+    explicit_len = False
+
+    # "10 second clips", "2-minute scenes": a length, not a count.
+    m = re.search(r"\b(\d+(?:\.\d+)?)[\s-]*" + UNIT + r"[\s-]+(?:long\s+)?"
+                  r"(?:clips|scenes|shots|moments|highlights|szenen|momente|stellen|aufnahmen)\b", rest)
+    if m:
+        target = _seconds(m.group(1), m.group(2))
+        p.min_len, p.max_len = max(1.0, 0.7 * target), 1.3 * target
+        explicit_len = True
+        rest = rest[:m.start(1)] + " " + rest[m.end(2):]
 
     m = re.search(r"(\d+(?:\.\d+)?)\s*(?:-|to|bis)\s*(\d+(?:\.\d+)?)\s*" + UNIT, rest)
     if m:
-        p.min_len, p.max_len = float(m.group(1)), float(m.group(2))
+        p.min_len, p.max_len = _seconds(m.group(1), m.group(3)), _seconds(m.group(2), m.group(3))
+        explicit_len = True
+        rest = rest.replace(m.group(0), " ")
+    m = re.search(r"(?:in total|total|insgesamt|gesamt)\s*(\d+(?:\.\d+)?)\s*" + UNIT, rest)
+    if m:
+        p.budget_s = _seconds(m.group(1), m.group(2))
         rest = rest.replace(m.group(0), " ")
     m = re.search(r"(?:under|less than|max(?:imum)?|at most|unter|höchstens|maximal|bis zu)\s*(\d+(?:\.\d+)?)\s*"
                   + UNIT, rest)
     if m:
-        p.max_len = float(m.group(1))
+        p.max_len = _seconds(m.group(1), m.group(2))
+        explicit_len = True
         rest = rest.replace(m.group(0), " ")
     m = re.search(r"(?:over|more than|at least|min(?:imum)?|über|mindestens)\s*(\d+(?:\.\d+)?)\s*" + UNIT, rest)
     if m:
-        p.min_len = float(m.group(1))
+        p.min_len = _seconds(m.group(1), m.group(2))
+        explicit_len = True
         rest = rest.replace(m.group(0), " ")
-    # "3 clips", "3 calm scenes", "3 ruhige Szenen": up to two words between the number and the noun.
-    m = re.search(r"\b(\d+)\s+(?:[^\W\d]+\s+){0,2}?(?:clips|scenes|moments|highlights|szenen|momente|stellen)\b",
-                  rest)
+    # "3 clips", "3 short high-energy scenes", "3 ruhige Szenen": up to three words between number and noun.
+    m = re.search(r"\b(\d+)\s+(?:[^\W\d][\w-]*\s+){0,3}?"
+                  r"(?:clips|scenes|shots|moments|highlights|szenen|momente|stellen|aufnahmen)\b", rest)
     if m:
         p.count = max(1, min(50, int(m.group(1))))
         rest = rest[:m.start(1)] + " " + rest[m.end(1):]
 
-    for phrase in SPEECH_OFF:
-        if _contains(rest, phrase):
-            p.weights["speech"] = -1.0
-            rest = _strip(rest, phrase)
-    if p.weights["speech"] == 0.0 and any(_contains(rest, w) for w in SPEECH_ON):
+    m = re.search(r"\b(?:without|no|ohne|kein|keine)\s+(?:[^\W\d][\w-]*\s+){0,2}?"
+                  r"(?:talking|speaking|speech|voices?|dialogue|sprache|reden|gespräch|stimmen?)\b", rest)
+    if m:
+        p.weights["speech"] = -1.0
+        rest = rest.replace(m.group(0), " ")
+    if p.weights["speech"] == 0.0 and any(_contains(rest, w) for w in SPEECH_ON):  # noqa: SIM102
         p.weights["speech"] = 1.0
 
     calm = [w for w in CALM if _contains(rest, w)]
@@ -102,7 +124,9 @@ def parse(query: str, count: int | None = None, min_len: float | None = None,
     for w in energy + calm:
         rest = _strip(rest, w)
 
-    if any(_contains(rest, w) for w in SHORT):
+    if explicit_len:
+        pass  # explicit seconds always win over "short"/"long"
+    elif any(_contains(rest, w) for w in SHORT):
         p.max_len = min(p.max_len, 10.0)
         p.min_len = min(p.min_len, 2.0)
     elif any(_contains(rest, w) for w in LONG):
@@ -118,7 +142,7 @@ def parse(query: str, count: int | None = None, min_len: float | None = None,
         p.weights["relevance"] = 0.0
 
     if count is not None:
-        p.count = count
+        p.count = max(1, min(50, int(count)))
     if min_len is not None:
         p.min_len = min_len
     if max_len is not None:
@@ -152,9 +176,14 @@ def parse_with_llm(query: str, model: str, host: str = "http://127.0.0.1:11434",
                                      headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=30) as resp:
             data = json.loads(json.loads(resp.read())["message"]["content"])
+        if not isinstance(data, dict):
+            return base
+        p = ParsedQuery(raw=query, text=str(data.get("content") or "").strip())
+        p.count = int(overrides.get("count") or data.get("count") or DEFAULT_COUNT)
+        p.min_len = float(overrides.get("min_len") or data.get("min_seconds") or DEFAULT_MIN_LEN)
+        p.max_len = float(overrides.get("max_len") or data.get("max_seconds") or DEFAULT_MAX_LEN)
     except Exception:
         return base
-    p = ParsedQuery(raw=query, text=data.get("content", "").strip())
     if data.get("mood") == "energetic":
         p.mood = "energetic"
         p.weights.update(energy=1.2, steady=0.0, quality=0.3)
@@ -162,9 +191,8 @@ def parse_with_llm(query: str, model: str, host: str = "http://127.0.0.1:11434",
         p.mood = "calm"
         p.weights.update(energy=-0.9, steady=0.8, quality=0.6)
     p.weights["speech"] = {"wanted": 1.0, "unwanted": -1.0}.get(data.get("speech"), 0.0)
-    p.min_len = float(overrides.get("min_len") or data.get("min_seconds") or DEFAULT_MIN_LEN)
-    p.max_len = float(overrides.get("max_len") or data.get("max_seconds") or DEFAULT_MAX_LEN)
-    p.count = int(overrides.get("count") or data.get("count") or DEFAULT_COUNT)
+    p.count = max(1, min(50, p.count))
+    p.budget_s = base.budget_s
     p.min_len = max(1.0, p.min_len)
     p.max_len = max(p.min_len + 1.0, p.max_len)
     if not p.text:

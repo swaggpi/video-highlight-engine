@@ -11,31 +11,31 @@ def overlap_fraction(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 
 def select(cands: list[dict], vectors: np.ndarray, n: int, lam: float = 1.0, sim_floor: float = 0.6,
-           max_overlap: float = 0.2, budget_s: float | None = None, pool: int = 400) -> list[dict]:
-    """cands: dicts with 'start', 'end', 'total'; vectors: L2-normalised mean embedding per candidate."""
-    order = np.argsort([-c["total"] for c in cands])[:pool]
+           max_overlap: float = 0.2, budget_s: float | None = None) -> list[dict]:
+    """cands: dicts with 'start', 'end', 'total'; vectors: L2-normalised mean embedding per candidate (same order).
+    Callers pass a pre-filtered pool; this is O(n * len(cands))."""
+    if not cands:
+        return []
+    totals = np.array([c["total"] for c in cands], dtype=float)
+    starts = np.array([c["start"] for c in cands], dtype=float)
+    ends = np.array([c["end"] for c in cands], dtype=float)
+    lengths = ends - starts
+    alive = np.ones(len(cands), dtype=bool)
+    max_sim = np.full(len(cands), -1.0)
     chosen: list[int] = []
     used = 0.0
-    remaining = list(order)
-    while remaining and len(chosen) < n:
-        best, best_val = None, -np.inf
-        for i in remaining:
-            c = cands[i]
-            if any(overlap_fraction((c["start"], c["end"]), (cands[j]["start"], cands[j]["end"])) > max_overlap
-                   for j in chosen):
-                continue
-            if budget_s is not None and used + (c["end"] - c["start"]) > budget_s:
-                continue
-            penalty = 0.0
-            if chosen:
-                sim = float(np.max(vectors[chosen] @ vectors[i]))
-                penalty = lam * max(0.0, sim - sim_floor) / (1.0 - sim_floor)
-            val = c["total"] - penalty
-            if val > best_val:
-                best, best_val = i, val
-        if best is None:
+    while alive.any() and len(chosen) < n:
+        penalty = lam * np.clip((max_sim - sim_floor) / (1.0 - sim_floor), 0.0, None)
+        val = np.where(alive, totals - penalty, -np.inf)
+        i = int(np.argmax(val))
+        if not np.isfinite(val[i]):
             break
-        chosen.append(best)
-        used += cands[best]["end"] - cands[best]["start"]
-        remaining.remove(best)
-    return [dict(cands[i], mmr=round(float(cands[i]["total"]), 4)) for i in chosen]
+        alive[i] = False
+        if budget_s is not None and used + lengths[i] > budget_s:
+            continue
+        chosen.append(i)
+        used += lengths[i]
+        inter = np.clip(np.minimum(ends, ends[i]) - np.maximum(starts, starts[i]), 0.0, None)
+        alive &= inter / np.maximum(np.minimum(lengths, lengths[i]), 1e-9) <= max_overlap
+        max_sim = np.maximum(max_sim, vectors @ vectors[i])
+    return [dict(cands[i], rank=r) for r, i in enumerate(chosen)]

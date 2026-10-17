@@ -33,13 +33,15 @@ class State:
 
 
 def _index_job(state: State, video: str) -> None:
+    from vhe.engine import MODEL_LOCK
     from vhe.pipeline import build_index
 
     def progress(msg: str) -> None:
         state.job["stage"] = msg
 
     try:
-        build_index(Path(video), cfg=Config(device=state.device), progress=progress)
+        with MODEL_LOCK:  # queries wait while indexing holds the accelerator
+            build_index(Path(video), cfg=Config(device=state.device), progress=progress)
         state.engines.pop(str(Path(video).resolve()), None)
         state.job.update(state="done", stage="done")
     except Exception as exc:  # surfaced in the UI
@@ -47,10 +49,22 @@ def _index_job(state: State, video: str) -> None:
         state.job.update(state="error", error=str(exc))
 
 
-def make_handler(state: State):
+def make_handler(state: State, port: int):
+    allowed_hosts = {f"127.0.0.1:{port}", f"localhost:{port}"}
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *args) -> None:
             pass
+
+        def _trusted(self, post: bool) -> bool:
+            # Blocks DNS rebinding (foreign Host header) and simple cross-site form posts (non-JSON body).
+            if self.headers.get("Host") not in allowed_hosts:
+                self._json({"error": "forbidden host"}, 403)
+                return False
+            if post and not (self.headers.get("Content-Type") or "").startswith("application/json"):
+                self._json({"error": "JSON required"}, 415)
+                return False
+            return True
 
         def _json(self, obj, code: int = 200) -> None:
             body = json.dumps(obj, ensure_ascii=False).encode()
@@ -65,6 +79,8 @@ def make_handler(state: State):
             return json.loads(self.rfile.read(n) or b"{}")
 
         def do_GET(self) -> None:
+            if not self._trusted(post=False):
+                return
             url = urllib.parse.urlparse(self.path)
             if url.path == "/":
                 body = PAGE.read_bytes()
@@ -81,6 +97,8 @@ def make_handler(state: State):
                 self._json({"error": "not found"}, 404)
 
         def do_POST(self) -> None:
+            if not self._trusted(post=True):
+                return
             path = urllib.parse.urlparse(self.path).path
             try:
                 data = self._body()
@@ -88,9 +106,10 @@ def make_handler(state: State):
                 if path == "/api/index":
                     if not Path(video).is_file():
                         return self._json({"error": f"file not found: {video}"}, 400)
-                    if state.job["state"] == "running":
-                        return self._json({"error": "an index job is already running"}, 409)
-                    state.job = {"state": "running", "stage": "starting", "error": None, "video": video}
+                    with state.lock:
+                        if state.job["state"] == "running":
+                            return self._json({"error": "an index job is already running"}, 409)
+                        state.job = {"state": "running", "stage": "starting", "error": None, "video": video}
                     threading.Thread(target=_index_job, args=(state, video), daemon=True).start()
                     return self._json({"ok": True})
                 if not default_index_dir(Path(video)).joinpath("meta.json").exists():
@@ -119,11 +138,18 @@ def make_handler(state: State):
             size = path.stat().st_size
             start, end = 0, size - 1
             rng = self.headers.get("Range")
-            if rng and rng.startswith("bytes="):
-                a, _, b = rng[6:].partition("-")
-                start = int(a) if a else max(0, size - int(b))
-                end = int(b) if a and b else size - 1
-            end = min(end, size - 1)
+            if rng:
+                try:
+                    a, _, b = rng.removeprefix("bytes=").split(",")[0].partition("-")
+                    start = int(a) if a else max(0, size - int(b))
+                    end = min(int(b), size - 1) if a and b else size - 1
+                    if start > end or start >= size:
+                        raise ValueError
+                except ValueError:
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
             length = end - start + 1
             self.send_response(206 if rng else 200)
             self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "video/mp4")
@@ -149,6 +175,6 @@ def make_handler(state: State):
 
 
 def serve(port: int = 8765, device: str = "auto") -> None:
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(State(device)))
+    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(State(device), port))
     print(f"vhe UI on http://127.0.0.1:{port}")
     server.serve_forever()

@@ -3,6 +3,7 @@ per-timestep array on the 3 fps grid) and speech.json (transcript). Vectors are 
 stored in meta; a different encoder means re-indexing."""
 from __future__ import annotations
 
+import functools
 import json
 from pathlib import Path
 
@@ -62,8 +63,12 @@ class Index:
     def vad(self) -> list[tuple[float, float]]:
         return [tuple(x) for x in self.meta.get("vad", [])]
 
-    @property
+    @functools.cached_property
     def words(self) -> list[dict]:
         if not self.transcript:
             return []
-        return [w for seg in self.transcript["segments"] for w in seg["words"]]
+        return sorted((w for seg in self.transcript["segments"] for w in seg["words"]), key=lambda w: w["start"])
+
+    @property
+    def has_audio(self) -> bool:
+        return bool(self.grid.get("has_audio", self.meta.get("has_audio", True)))

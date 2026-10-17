@@ -36,3 +36,30 @@ def format_report(stages: list[dict], video_seconds: float | None = None) -> str
         lines.append(f"{60 * total / video_seconds:.1f} min per hour of video "
                      f"({video_seconds / max(total, 1e-9):.2f}x realtime)")
     return "\n".join(lines)
+
+
+def hms(seconds: float) -> str:
+    s = int(round(seconds))
+    return f"{s // 3600}h{s // 60 % 60:02d}m" if s >= 3600 else f"{s // 60}m{s % 60:02d}s"
+
+
+class Counter:
+    """'label done/total (pct), rate, ETA' messages for long stages, at most one every `every_s` seconds."""
+
+    def __init__(self, say, label: str, unit: str = "", every_s: float = 5.0) -> None:
+        self.say, self.label, self.unit, self.every_s = say, label, unit, every_s
+        self.start = time.perf_counter()
+        self.last = -every_s
+
+    def __call__(self, done: float, total: float) -> None:
+        now = time.perf_counter()
+        if done < total and now - self.last < self.every_s:
+            return
+        self.last = now
+        elapsed = now - self.start
+        rate = done / elapsed if elapsed > 0 else 0.0
+        eta = (total - done) / rate if rate > 0 else 0.0
+        msg = f"{self.label} {done:.0f}/{total:.0f}{self.unit} ({100 * done / max(total, 1e-9):.0f}%)"
+        if done < total and rate > 0:
+            msg += f", {rate:.2f}{self.unit}/s, eta {hms(eta)}"
+        self.say(msg)

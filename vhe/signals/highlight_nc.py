@@ -25,7 +25,11 @@ def window_starts(duration: float, window: float, overlap: float) -> list[float]
         return [0.0]
     step = window - overlap
     starts = list(np.arange(0.0, duration - window, step))
-    starts.append(max(0.0, duration - window))  # last window ends exactly at the end
+    last = max(0.0, duration - window)  # last window ends exactly at the end
+    if starts and last - starts[-1] < 5.0:
+        starts[-1] = last  # avoid a near-duplicate final window
+    else:
+        starts.append(last)
     return [round(float(s), 3) for s in starts]
 
 
@@ -38,25 +42,33 @@ class NCHighlighter:
         self.device = "cuda" if device == "cuda" else "cpu"  # Lighthouse does not support MPS
         self.predictor = CGDETRPredictor(ckpt, device=self.device, feature_name="clip")
         self.clip_len = float(self.predictor._clip_len)
+        self._feats: dict[str, dict] = {}
 
-    def encode(self, video: Path, duration: float, window: float, overlap: float, cache: Path) -> list[dict]:
+    def encode(self, video: Path, duration: float, window: float, overlap: float, cache: Path,
+               progress=None) -> list[dict]:
         cache.mkdir(parents=True, exist_ok=True)
         window = min(window, 74 * self.clip_len)  # positional embedding limit: 75 clips
         chunks = []
         with tempfile.TemporaryDirectory() as tmp:
-            for k, start in enumerate(window_starts(duration, window, overlap)):
+            starts = window_starts(duration, window, overlap)
+            for k, start in enumerate(starts):
+                if progress:
+                    progress(k, len(starts))
                 length = min(window, duration - start)
                 if length < 2 * self.clip_len:
                     continue
-                part = Path(tmp) / f"part_{k}.mp4"
+                part = Path(tmp) / f"part_{k}.avi"
                 # Lighthouse samples one frame per clip_len seconds at 224 px, so a 1 fps proxy is enough.
+                # MJPEG is in every ffmpeg build and cheap to write at 1 fps.
                 subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{start}", "-i", str(video), "-t", f"{length}",
-                                "-an", "-vf", "fps=1,scale=-2:224", "-c:v", "libx264", "-preset", "ultrafast",
-                                "-crf", "28", str(part)], check=True)
+                                "-an", "-vf", "fps=1,scale=-2:224", "-c:v", "mjpeg", "-q:v", "3", str(part)],
+                               check=True)
                 feats = self.predictor.encode_video(str(part))
                 path = cache / f"chunk_{k:03d}.pt"
                 torch.save({k2: (v.cpu() if isinstance(v, torch.Tensor) else v) for k2, v in feats.items()}, path)
                 chunks.append({"start": start, "length": length, "path": path.name})
+        if progress:
+            progress(len(starts), len(starts))
         return chunks
 
     def predict(self, query: str, chunks: list[dict], cache: Path, n_grid: int, grid_fps: float):
@@ -66,9 +78,13 @@ class NCHighlighter:
         proposals = []
         grid_t = np.arange(n_grid) / grid_fps
         for ch in chunks:
-            feats = torch.load(cache / ch["path"], map_location=self.device)
-            feats = {k: (v.to(self.device) if isinstance(v, torch.Tensor) else v) for k, v in feats.items()}
-            pred = self.predictor.predict(query, feats)
+            key = str(cache / ch["path"])
+            if key not in self._feats:
+                # weights_only: index folders may be shared; never unpickle arbitrary objects from them.
+                feats = torch.load(key, map_location=self.device, weights_only=True)
+                self._feats[key] = {k: (v.to(self.device) if isinstance(v, torch.Tensor) else v)
+                                    for k, v in feats.items()}
+            pred = self.predictor.predict(query, self._feats[key])
             if not pred:
                 continue
             sal = np.asarray(pred["pred_saliency_scores"], dtype=float)

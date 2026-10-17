@@ -11,7 +11,8 @@ class Config:
     # Sampling grid: every per-timestep signal lives on t_i = i / fps.
     fps: float = 3.0
     frame_height: int = 360  # cached analysis frames; encoders resize further
-    tiny_w: int = 64  # full-frame-rate grey stream for cuts, shake and motion
+    tiny_fps: float = 30.0  # grey stream for cuts, shake and motion (fixed rate: VFR-safe)
+    tiny_w: int = 64
     tiny_h: int = 36
     hwaccel: str = "auto"  # auto | none | videotoolbox | cuda
 

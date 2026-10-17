@@ -17,11 +17,11 @@ from vhe.signals.motion import motion_signals
 from vhe.signals.quality import frame_quality
 from vhe.signals.shots import detect_cuts, frame_diffs
 from vhe.signals.tags import LABELS, label_texts, tag_probs
-from vhe.timing import Timings
+from vhe.timing import Counter, Timings
 
 
 def change_points(emb: np.ndarray, fps: float, cuts: list[float], half_window_s: float = 1.0,
-                  z_thresh: float = 2.5, min_gap_s: float = 2.0) -> list[float]:
+                  z_thresh: float = 2.5, min_gap_s: float = 2.0, min_dist: float = 0.05) -> list[float]:
     """Content changes inside shots (raw footage is often one long take): peaks of the embedding distance
     between the second before and the second after each step."""
     k = max(1, int(round(half_window_s * fps)))
@@ -43,6 +43,8 @@ def change_points(emb: np.ndarray, fps: float, cuts: list[float], half_window_s:
     for j in np.argsort(-z):
         if z[j] < z_thresh:
             break
+        if dist[j] < min_dist:  # relative outliers in a static take are noise, not content changes
+            continue
         t = float(i[j] / fps)
         if cut_arr.size and np.min(np.abs(cut_arr - t)) < 1.0:
             continue
@@ -63,6 +65,17 @@ def build_index(video: Path, out_dir: Path | None = None, cfg: Config | None = N
     timings = Timings()
     fps = cfg.fps
 
+    try:
+        return _build(video, out, cfg, say, device, timings)
+    finally:
+        if not keep_cache:
+            shutil.rmtree(out / "frames", ignore_errors=True)
+            (out / "tiny.gray").unlink(missing_ok=True)
+            (out / "audio.wav").unlink(missing_ok=True)
+
+
+def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timings) -> Path:
+    fps = cfg.fps
     say("decoding")
     with timings.stage("decode") as r:
         info = decode(video, out, cfg)
@@ -75,12 +88,12 @@ def build_index(video: Path, out_dir: Path | None = None, cfg: Config | None = N
 
     say("detecting cuts")
     with timings.stage("cuts", items=len(tiny)):
-        cuts = detect_cuts(tiny, info["src_fps"], d=frame_diffs(tiny))
+        cuts = detect_cuts(tiny, info["tiny_fps"], d=frame_diffs(tiny))
 
     say("motion and shake")
     with timings.stage("motion", items=len(tiny)):
         grid: dict[str, np.ndarray] = {"t": np.arange(n) / fps}
-        grid.update(motion_signals(tiny, info["src_fps"], n, fps, cuts))
+        grid.update(motion_signals(tiny, info["tiny_fps"], n, fps, cuts))
     del tiny
 
     vad: list[tuple[float, float]] = []
@@ -99,10 +112,13 @@ def build_index(video: Path, out_dir: Path | None = None, cfg: Config | None = N
             from vhe.signals.speech import transcribe
 
             with timings.stage("speech"):
-                transcript = transcribe(out / "audio.wav", cfg.asr_model, cfg.asr_language, device)
+                transcript = transcribe(y, vad, cfg.asr_model, cfg.asr_language, device,
+                                        progress=Counter(say, "transcribing", unit="s"))
+        del y
     else:
         for key in ("loudness", "onset", "speech"):
             grid[key] = np.zeros(n, dtype=np.float32)
+    grid["has_audio"] = np.array(info["has_audio"])
 
     paths = frame_paths(out)
     say(f"embedding {len(paths)} frames")
@@ -110,7 +126,7 @@ def build_index(video: Path, out_dir: Path | None = None, cfg: Config | None = N
         encoder = Encoder(cfg.encoder, device)
     with timings.stage("frame_embed", items=len(paths)):
         emb = encoder.images(paths, cfg.batch_size,
-                             progress=lambda done, total: say(f"embedding frames {done}/{total}"))
+                             progress=Counter(say, "embedding frames"))
     with timings.stage("tags"):
         scale, bias = encoder.logit_params()
         grid["tags"] = tag_probs(emb, encoder.texts(label_texts()), scale, bias)
@@ -119,8 +135,18 @@ def build_index(video: Path, out_dir: Path | None = None, cfg: Config | None = N
         grid.update(frame_quality(paths))
     grid["emb"] = emb
     cps = change_points(emb, fps, cuts)
+    del encoder  # free memory before the optional model loads
 
-    nc_meta = None
+    meta = {
+        **info, "fps": fps, "config": cfg.to_dict(), "device": device, "encoder": cfg.encoder,
+        "logit_scale": scale, "logit_bias": bias, "labels": LABELS,
+        "cuts": cuts, "change_points": cps, "vad": vad, "nc_highlight": None,
+        "noncommercial_components": [],
+        "timings": timings.stages, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+    # Save before the optional stage so a failure there never loses the expensive work above.
+    save_index(out, meta, grid, transcript)
+
     if cfg.use_nc_highlight:
         say("non-commercial highlight features")
         try:
@@ -129,22 +155,14 @@ def build_index(video: Path, out_dir: Path | None = None, cfg: Config | None = N
             with timings.stage("load_nc_model"):
                 hl = NCHighlighter(cfg.nc_checkpoint, device)
             with timings.stage("nc_highlight_encode"):
-                chunks = hl.encode(Path(info["source"]), duration, cfg.nc_window_s, cfg.nc_overlap_s, out / "nc")
-            nc_meta = {"component": NC_COMPONENT, "chunks": chunks}
-        except (ImportError, FileNotFoundError) as exc:
+                chunks = hl.encode(Path(info["source"]), duration, cfg.nc_window_s, cfg.nc_overlap_s, out / "nc",
+                                   progress=Counter(say, "highlight windows", every_s=0))
+            if chunks:
+                meta.update(nc_highlight={"component": NC_COMPONENT, "chunks": chunks},
+                            noncommercial_components=[NC_COMPONENT])
+        except Exception as exc:  # optional stage: keep the index without it
             say(f"skipping non-commercial highlight model: {exc}")
-
-    meta = {
-        **info, "fps": fps, "config": cfg.to_dict(), "device": device, "encoder": cfg.encoder,
-        "logit_scale": scale, "logit_bias": bias, "labels": LABELS,
-        "cuts": cuts, "change_points": cps, "vad": vad, "nc_highlight": nc_meta,
-        "noncommercial_components": [nc_meta["component"]] if nc_meta else [],
-        "timings": timings.stages, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
-    }
-    save_index(out, meta, grid, transcript)
-    if not keep_cache:
-        shutil.rmtree(out / "frames", ignore_errors=True)
-        (out / "tiny.gray").unlink(missing_ok=True)
-        (out / "audio.wav").unlink(missing_ok=True)
+        meta["timings"] = timings.stages
+        save_index(out, meta, grid, transcript)
     say("done")
     return out

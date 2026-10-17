@@ -13,7 +13,7 @@ from vhe.signals import to_grid
 
 
 def _moving_average(x: np.ndarray, width: int) -> np.ndarray:
-    width = max(1, int(width))
+    width = max(1, min(int(width), len(x)))  # mode="same" returns max(len, width) samples otherwise
     kernel = np.ones(width) / width
     return np.convolve(x, kernel, mode="same")
 

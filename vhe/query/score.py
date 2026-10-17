@@ -30,7 +30,7 @@ def smooth(x: np.ndarray, width: int) -> np.ndarray:
 
 
 def timestep_signals(grid: dict, fps: float, text_emb: np.ndarray | None,
-                     nc_saliency: np.ndarray | None) -> dict[str, np.ndarray]:
+                     nc_saliency: np.ndarray | None, has_audio: bool = True) -> dict[str, np.ndarray]:
     n = len(grid["t"])
     if text_emb is not None:
         sim = grid["emb"].astype(np.float32) @ text_emb.astype(np.float32)
@@ -41,8 +41,11 @@ def timestep_signals(grid: dict, fps: float, text_emb: np.ndarray | None,
         rel = np.zeros(n)
     quality = (0.6 * robust_z(grid["sharpness"]) + 0.4 * robust_z(grid["exposure"])
                - 0.5 * np.clip(grid["clipped"] * 4, 0, 1))
-    energy = (robust_z(grid["motion"]) + robust_z(grid["loudness"]) + robust_z(grid["onset"])
-              + 0.5 * robust_z(grid["cam_speed"])) / 3.5
+    if has_audio:
+        energy = (robust_z(grid["motion"]) + robust_z(grid["loudness"]) + robust_z(grid["onset"])
+                  + 0.5 * robust_z(grid["cam_speed"])) / 3.5
+    else:
+        energy = (robust_z(grid["motion"]) + 0.5 * robust_z(grid["cam_speed"])) / 1.5
     steady = -robust_z(grid["shake"])
     return {"relevance": rel, "quality": quality, "energy": energy, "steady": steady,
             "speech": np.asarray(grid["speech"], dtype=float)}

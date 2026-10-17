@@ -20,18 +20,27 @@ def load_audio(path: Path) -> np.ndarray:
     return y
 
 
-def audio_signals(y: np.ndarray, n_grid: int, grid_fps: float) -> dict[str, np.ndarray]:
+def audio_signals(y: np.ndarray, n_grid: int, grid_fps: float, chunk_s: float = 300.0) -> dict[str, np.ndarray]:
+    """Processed in 5-minute chunks: librosa's frame/STFT matrices for a full hour would need ~2 GB."""
     import librosa
 
     hop = 512
-    rms = librosa.feature.rms(y=y, frame_length=2048, hop_length=hop)[0]
-    onset = librosa.onset.onset_strength(y=y, sr=SR, hop_length=hop)
-    times = librosa.frames_to_time(np.arange(len(rms)), sr=SR, hop_length=hop)
-    loud_db = 20 * np.log10(rms + 1e-6)
-    m = min(len(times), len(onset))
+    if len(y) < 2048:
+        return {"loudness": np.zeros(n_grid), "onset": np.zeros(n_grid)}
+    step = int(chunk_s * SR) // hop * hop
+    times, loud, onset = [], [], []
+    for start in range(0, len(y), step):
+        part = y[start:start + step + 2048]  # overlap one window so frames at chunk edges are complete
+        rms = librosa.feature.rms(y=part, frame_length=2048, hop_length=hop, center=False)[0]
+        ons = librosa.onset.onset_strength(y=part, sr=SR, hop_length=hop, center=False)
+        k = min(len(rms), len(ons), step // hop)
+        times.append(start / SR + (np.arange(k) * hop + 1024) / SR)
+        loud.append(20 * np.log10(rms[:k] + 1e-6))
+        onset.append(ons[:k])
+    t = np.concatenate(times)
     return {
-        "loudness": to_grid(times, loud_db, n_grid, grid_fps),
-        "onset": to_grid(times[:m], onset[:m], n_grid, grid_fps),
+        "loudness": to_grid(t, np.concatenate(loud), n_grid, grid_fps),
+        "onset": to_grid(t, np.concatenate(onset), n_grid, grid_fps),
     }
 
 
