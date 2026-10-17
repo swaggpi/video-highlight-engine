@@ -96,6 +96,30 @@ def test_usable_mask_on_synthetic_frames(tmp_path):
     assert blur_ratio(np.full((50, 50), 7, np.uint8)) == float("inf")
 
 
+def test_blur_test_with_sensor_noise(tmp_path):
+    """Noise must not hide defocus, and must not make a textureless or dark frame read as blurry. The defocused
+    frames read ~6-7 here, which the old threshold (2.5) let through."""
+    rng = np.random.default_rng(1)
+    tex = _frame("texture").astype(np.float32)
+    frames = {
+        "defocus_noisy": cv2.GaussianBlur(tex, (0, 0), 3) + rng.normal(0, 3, tex.shape),
+        "box_noisy": cv2.blur(tex, (9, 9)) + rng.normal(0, 6, tex.shape),
+        "sharp_noisy": tex + rng.normal(0, 3, tex.shape),
+        "sky_noisy": np.tile(np.linspace(150, 210, 360)[:, None], (1, 640)) + rng.normal(0, 4, tex.shape),
+        "dark_noisy": tex * 0.25 + rng.normal(0, 4, tex.shape),
+    }
+    paths = []
+    for k, g in frames.items():
+        paths.append(tmp_path / f"{k}.jpg")
+        cv2.imwrite(str(paths[-1]), np.clip(np.round(g), 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 90])
+    q = frame_quality(paths)
+    usable, bits = usable_mask(q["luma"], q["contrast"], q["blown"], q["blur_ratio"], np.zeros(len(paths)))
+    reasons = dict(zip(frames, (reason_names(b) for b in bits)))
+    assert reasons["defocus_noisy"] == ["blurry"] and reasons["box_noisy"] == ["blurry"]
+    assert reasons["sharp_noisy"] == [] and reasons["sky_noisy"] == [] and reasons["dark_noisy"] == []
+    assert q["blur_ratio"][2] > 2 * q["blur_ratio"][0]  # clear margin between sharp and defocused
+
+
 def test_low_confidence_segments_dropped():
     assert keep_segment({"no_speech_prob": 0.1, "avg_logprob": -0.3})
     assert keep_segment({"no_speech_prob": 0.9, "avg_logprob": -0.4})  # sure of the text: keep

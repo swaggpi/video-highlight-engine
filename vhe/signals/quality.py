@@ -17,8 +17,9 @@ REASONS = ("covered", "uniform", "blown_out", "blurry", "shaky")
 def blur_ratio(g: np.ndarray, side: int = BLUR_SIDE) -> float:
     """var(Lap(g)) / var(Lap(blur(g))) at a fixed short side of `side` px. Re-blurring removes most of the fine
     detail a sharp frame has and little of a blurry one's, whatever the amount of texture, so a sharp plain wall
-    is not "blurry". The downscale makes it resolution-independent and averages away JPEG block noise, which
-    otherwise reads as detail in heavily blurred frames. No detail at all is inf (the uniform test covers it)."""
+    is not "blurry". The downscale makes it resolution-independent and averages away JPEG block and sensor noise,
+    which otherwise reads as detail in heavily blurred frames. No detail at all is inf (the uniform test covers
+    it). Sharp real footage reads ~13-26, defocused ~3-11; see BLUR_RATIO in config.py for the calibration."""
     g = g.astype(np.float32)
     f = side / min(g.shape)
     if f < 1:
