@@ -11,7 +11,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vhe.index.store import Index, default_index_dir
+from vhe.index.store import Index, default_index_dir, usable_mask
 from vhe.project import PROJECT_DIR, load_project
 
 # Per-step arrays an older index may lack: fill values that mean "no defect" / "unknown" (NaN z-scores to 0).
@@ -67,7 +67,7 @@ class Corpus:
 
     @property
     def usable(self) -> np.ndarray:
-        return self.grid["usable"].astype(bool) if "usable" in self.grid else np.ones(self.n, dtype=bool)
+        return usable_mask(self.grid, self.n)
 
     @functools.cached_property
     def cuts(self) -> list[float]:

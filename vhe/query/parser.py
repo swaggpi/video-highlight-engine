@@ -131,8 +131,11 @@ def _set_mood(p: ParsedQuery, mood: str | None) -> None:
         p.weights.update(MOODS[mood])
 
 
+DASHES = re.compile(r"[‒–—−]")  # en/em dashes and minus sign -> '-' (also used by the CLI's --budget)
+
+
 def _normalise(q: str) -> str:
-    q = re.sub(r"[‒–—−]", "-", q.lower())  # en/em dashes, minus
+    q = DASHES.sub("-", q.lower())  # en/em dashes, minus
     q = re.sub(r"\b(\d+):([0-5]\d)\b(?:\s*(?:min|mins|minutes?|minuten)\b)?",
                lambda m: f"{int(m.group(1)) * 60 + int(m.group(2))} s", q)  # 1:30 -> 90 s
     q = re.sub(r"\b(?:a|an|one|eine|einer)\s+(?=(?:min|minute|minuten)\b)", "1 ", q)

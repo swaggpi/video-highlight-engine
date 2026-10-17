@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import csv
 import json
+import math
 import subprocess
 from pathlib import Path
 
@@ -28,35 +29,42 @@ def _tc(f: int, fps: int) -> str:
     return f"{f // (3600 * fps):02d}:{f // (60 * fps) % 60:02d}:{f // fps % 60:02d}:{f % fps:02d}"
 
 
-def _source_tc(path: Path, fps: int) -> float:
-    """Embedded start timecode in seconds (camera files), else 0; NLEs match EDL source times against it."""
+def _source_tc(path: Path, base: int) -> int:
+    """Embedded start timecode as a frame count at the file's timecode base (camera files), else 0; NLEs match EDL
+    source times against it."""
     out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format_tags=timecode:stream_tags=timecode",
                           "-of", "default=nw=1:nk=1", str(path)], capture_output=True, text=True).stdout.split()
     for tc in out:
         parts = tc.replace(";", ":").split(":")
         if len(parts) == 4 and all(x.isdigit() for x in parts):
             h, m, s, f = map(int, parts)
-            return h * 3600 + m * 60 + s + f / fps
-    return 0.0
+            return (h * 3600 + m * 60 + s) * base + f
+    return 0
 
 
 def write_edl(clips: list[dict], sources: dict[str, Path], path: Path, title: str = "vhe edit") -> Path:
-    """CMX3600, non-drop frame at the first source's rounded frame rate; one event per clip, in edit order."""
+    """CMX3600, non-drop frame. Each source's in/out use that file's own frame rate (frames = round(t * fps), shown
+    on its timecode base ceil(fps): 29.97 -> 30, 23.976 -> 24), so 29.97 fps footage does not drift against its
+    timecode and a 25p file in a 30p folder keeps 25-frame seconds. The record side is one rate: the first source's."""
     probes = {f: probe(sources[f]) for f in dict.fromkeys(c["file"] for c in clips)}
-    fps = max(1, int(round(next(iter(probes.values())).fps))) if probes else 25
-    starts = {f: _source_tc(sources[f], fps) for f in probes}
+    fps = {f: max(1.0, p.fps) for f, p in probes.items()}
+    base = {f: math.ceil(round(r, 2)) for f, r in fps.items()}
+    starts = {f: _source_tc(sources[f], base[f]) for f in probes}
+    first = next(iter(probes), None)
+    rec_fps, rec_base = (fps[first], base[first]) if first else (25.0, 25)
     lines = [f"TITLE: {title}", "FCM: NON-DROP FRAME", ""]
-    rec = int(EDL_START_TC * fps)
+    rec = int(EDL_START_TC * rec_base)
     for i, c in enumerate(clips, 1):
-        # Whole frames throughout, so record durations equal source durations and never drift.
-        src_in, src_out = (int(round((starts[c["file"]] + c[k]) * fps)) for k in ("file_start", "file_end"))
-        track = "AA/V" if probes[c["file"]].has_audio else "V"
-        lines.append(f"{i:03d}  AX       {track:<5} C        {_tc(src_in, fps)} {_tc(src_out, fps)} "
-                     f"{_tc(rec, fps)} {_tc(rec + src_out - src_in, fps)}")
-        lines.append(f"* FROM CLIP NAME: {Path(c['file']).name}")
-        lines.append(f"* SOURCE FILE: {sources[c['file']]}")
+        f = c["file"]
+        src_in, src_out = (starts[f] + int(round(c[k] * fps[f])) for k in ("file_start", "file_end"))
+        dur = int(round((c["file_end"] - c["file_start"]) * rec_fps))  # whole record frames: no drift
+        track = "AA/V" if probes[f].has_audio else "V"
+        lines.append(f"{i:03d}  AX       {track:<5} C        {_tc(src_in, base[f])} {_tc(src_out, base[f])} "
+                     f"{_tc(rec, rec_base)} {_tc(rec + dur, rec_base)}")
+        lines.append(f"* FROM CLIP NAME: {Path(f).name}")
+        lines.append(f"* SOURCE FILE: {sources[f]}")
         lines.append("")
-        rec += src_out - src_in
+        rec += dur
     path.write_text("\n".join(lines))
     return path
 

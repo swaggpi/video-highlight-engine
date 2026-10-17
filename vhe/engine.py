@@ -31,12 +31,18 @@ MAX_UNUSABLE = 0.2  # candidates with more unusable steps (covered, blown, blurr
 BUCKET_MIN = 5  # length buckets smaller than this are not median-centred (a singleton would become exactly 0)
 EDGE_WEIGHTS = {"relevance": 1.0, "steady": 0.8, "quality": 0.6}  # opener/closer: the shot asked for, held steady
 EDGE_POOL = 30
+EMB_BLOCK = 1 << 16  # rows cast to float32 per matmul block
 SIGNALS = ("relevance", "quality", "energy", "steady", "speech")
 STOPWORDS = {"the", "and", "with", "for", "from", "that", "this", "der", "die", "das", "und", "mit", "ein", "eine",
              "von", "auf", "für", "den", "dem", "des", "a", "an", "of", "on", "in", "at", "to", "is"}
 
 # One model lock per process: UI requests and indexing must not run inference concurrently (MPS/CUDA memory).
 MODEL_LOCK = threading.RLock()
+
+
+def _disjoint(o: dict, others) -> bool:
+    """True if span `o` does not overlap any of `others` (touching is fine)."""
+    return all(min(o["end"], t["end"]) <= max(o["start"], t["start"]) for t in others)
 
 
 class Engine:
@@ -49,7 +55,7 @@ class Engine:
         self._nc = None
         self._text_cache: dict[str, np.ndarray] = {}
         self._contexts: dict[int, Context] = {}
-        self._emb = c.grid["emb"].astype(np.float32)
+        self._emb = c.grid["emb"]  # stored dtype (float16 saves ~1 GB on a 40 h corpus); cast per block in _similarity
         scale = c.meta.get("logit_scale")
         self._logit = None if scale is None else (float(scale), float(c.meta.get("logit_bias") or 0.0))
         self.load_seconds = 0.0
@@ -78,7 +84,15 @@ class Engine:
 
     def _relevance(self, text: str, nc_saliency: np.ndarray | None = None) -> np.ndarray:
         c = self.corpus
-        return relevance(self._emb @ self.text_vector(text), c.fps, self._logit, nc_saliency, c.file_id)
+        return relevance(self._similarity(self.text_vector(text)), c.fps, self._logit, nc_saliency, c.file_id)
+
+    def _similarity(self, v: np.ndarray) -> np.ndarray:
+        """emb @ v in float32, casting one block of rows at a time instead of the whole corpus."""
+        v = v.astype(np.float32)
+        out = np.empty(len(self._emb), np.float32)
+        for a in range(0, len(out), EMB_BLOCK):
+            out[a:a + EMB_BLOCK] = self._emb[a:a + EMB_BLOCK].astype(np.float32) @ v
+        return out
 
     def _nc_scores(self, text: str) -> tuple[np.ndarray | None, list[list]]:
         """Highlight-model saliency on the corpus grid (NaN for files without it) and proposals per file."""
@@ -109,7 +123,7 @@ class Engine:
         return self._contexts[k]
 
     def _mean_vectors(self, i0: np.ndarray, i1: np.ndarray) -> np.ndarray:
-        v = np.stack([self._emb[a:b].mean(0) for a, b in zip(i0, i1)]) if len(i0) else np.zeros((0, 1))
+        v = np.stack([self._emb[a:b].mean(0, dtype=np.float32) for a, b in zip(i0, i1)]) if len(i0) else np.zeros((0, 1))
         return v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
 
     def _hit(self, k: int, s: float, e: float, **extra) -> dict:
@@ -207,7 +221,7 @@ class Engine:
         """Best clip for the opener/closer description: its own relevance, steady and clean, not overlapping."""
         pool = self._pool(dict(sig, relevance=self._relevance(text)), EDGE_WEIGHTS, cands, p, EDGE_POOL)
         pool = [o for o in pool if o["end"] - o["start"] <= max_len + 1e-6
-                and all(min(o["end"], t["end"]) <= max(o["start"], t["start"]) for t in taken)]
+                and _disjoint(o, taken)]
         return max(pool, key=lambda o: o["total"]) if pool else None
 
     def clips(self, query: str, count: int | None = None, min_len: float | None = None,
@@ -247,7 +261,7 @@ class Engine:
             budget=None if p.budget is None else (max(0.0, p.budget[0] - used), p.budget[1] - used))
 
         scored = [o for o in self._pool(sig, p.weights, cands, p, max(400, 40 * p.count))
-                  if all(min(o["end"], t["end"]) <= max(o["start"], t["start"]) for t in edges.values())]
+                  if _disjoint(o, edges.values())]
         if scored:
             r0, r1 = c.steps(*(np.array([o[key] for o in scored]) for key in ("start", "end", "file")))
             speech_cum = np.concatenate([[0.0], np.cumsum(sig["speech"])])

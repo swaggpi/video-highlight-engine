@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 
 from vhe.config import Config
+from vhe.query.parser import DASHES
 
 
 def _fmt(t: float) -> str:
@@ -51,7 +52,7 @@ def _budget(v: str | None) -> float | tuple[float, float] | None:
     """--budget 75 or --budget 60-90 (seconds, all clips together)."""
     if not v:
         return None
-    lo, _, hi = v.replace("–", "-").partition("-")
+    lo, _, hi = DASHES.sub("-", v).partition("-")
     return (float(lo), float(hi)) if hi else float(lo)
 
 

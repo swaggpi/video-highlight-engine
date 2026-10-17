@@ -53,7 +53,8 @@ def _index_job(state: State, path: str) -> None:
                 from vhe.pipeline import build_index
 
                 build_index(Path(path), cfg=Config(device=state.device), progress=progress)
-        state.engines.pop(str(Path(path).resolve()), None)
+        with state.lock:
+            state.engines.pop(str(Path(path).resolve()), None)
         state.job.update(state="done", stage="done")
     except Exception as exc:  # surfaced in the UI
         traceback.print_exc()

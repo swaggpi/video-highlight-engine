@@ -12,6 +12,11 @@ import numpy as np
 INDEX_VERSION = 1
 
 
+def usable_mask(grid: dict, n: int) -> np.ndarray:
+    """bool per grid step; all True when an older index has no 'usable' array. Shared by Index and Corpus."""
+    return grid["usable"].astype(bool) if "usable" in grid else np.ones(n, dtype=bool)
+
+
 def default_index_dir(video: Path) -> Path:
     return video.parent / (video.name + ".vhe")
 
@@ -85,7 +90,7 @@ class Index:
     @property
     def usable(self) -> np.ndarray:
         """bool per grid step: no absolute defect (signals/quality.usable_mask). All True for older indexes."""
-        return self.grid["usable"].astype(bool) if "usable" in self.grid else np.ones(self.n, dtype=bool)
+        return usable_mask(self.grid, self.n)
 
     @property
     def unusable_reasons(self) -> np.ndarray:

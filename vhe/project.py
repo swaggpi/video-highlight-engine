@@ -17,11 +17,12 @@ from pathlib import Path
 from typing import Callable
 
 from vhe.config import MIN_DURATION_S, VIDEO_EXTENSIONS, Config, resolve_device
-from vhe.index.store import Index
+from vhe.index.store import INDEX_VERSION, Index
 from vhe.timing import hms
 
 PROJECT_VERSION = 1
 PROJECT_DIR = ".vhe"
+LANG_DETECT_DECODE_S = 600  # language detection decodes at most this much audio from the start of the file
 # Runtime choices that do not change the index contents.
 _UNHASHED = {"device", "hwaccel", "batch_size"}
 
@@ -62,6 +63,7 @@ def order_key(entry: dict) -> tuple:
 def is_current(entry: dict | None, size: int, mtime_ns: int, chash: str, root: Path) -> bool:
     return bool(entry and entry.get("status") == "ok" and entry.get("size") == size
                 and entry.get("mtime_ns") == mtime_ns and entry.get("config_hash") == chash
+                and entry.get("index_version") == INDEX_VERSION  # a bump makes Index() refuse the old files
                 and (root / entry["index_dir"] / "meta.json").exists())
 
 
@@ -79,13 +81,14 @@ def write_manifest(root: Path, manifest: dict) -> None:
 
 
 def detect_file_language(video: Path, cfg: Config, device: str) -> tuple[str | None, float]:
-    """Language of a file's speech (VAD regions only), from a separate audio-only decode."""
+    """Language of a file's speech (VAD regions only), from a separate audio-only decode of the first
+    LANG_DETECT_DECODE_S seconds (detection needs only a few tens of seconds of speech, not a 2 h recording)."""
     from vhe.signals.audio import load_audio, voice_activity
     from vhe.signals.speech import detect_language
 
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "audio.wav"
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-vn", "-map", "0:a:0", "-ac", "1",
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-t", str(LANG_DETECT_DECODE_S), "-vn", "-map", "0:a:0", "-ac", "1",
                         "-ar", "16000", str(wav)], check=True)
         y = load_audio(wav)
     return detect_language(y, voice_activity(y), cfg.asr_model, device)
@@ -180,7 +183,7 @@ def index_project(root: Path, cfg: Config | None = None, progress: Callable[[str
         try:
             indexer(path, out, file_cfg, progress=lambda m: say(f"  {m}"), keep_cache=keep_cache)
             meta = json.loads((out / "meta.json").read_text())
-            entry.update(status="ok", language=meta.get("language"), usable_fraction=meta.get("usable_fraction"),
+            entry.update(status="ok", index_version=INDEX_VERSION, language=meta.get("language"), usable_fraction=meta.get("usable_fraction"),
                          has_audio=meta.get("has_audio", entry["has_audio"]))
             entry.pop("error", None)
         except Exception as exc:
