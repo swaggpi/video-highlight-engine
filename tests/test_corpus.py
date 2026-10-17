@@ -230,8 +230,9 @@ def test_cli_json_edit_list(tmp_path):
     main(["clips", str(root), "30-40 s energetic recap", "--json", str(out), "--device", "cpu", "--no-nc"])
     doc = json.loads(out.read_text())
     assert doc["query"] == "30-40 s energetic recap" and tuple(doc["parsed"]["budget"]) == (30.0, 40.0)
-    assert doc["clips"] and all(set(c) == {"file", "start", "end", "duration", "score", "reason", "source"}
-                                for c in doc["clips"])
+    assert doc["parser"] == "rules"  # the test session turns the LLM off (conftest)
+    assert doc["clips"] and all(set(c) == {"file", "start", "end", "duration", "score", "reason", "source", "role",
+                                           "item"} for c in doc["clips"])
     assert all(0 <= c["start"] < c["end"] <= 60.0 and abs(c["end"] - c["start"] - c["duration"]) < 1e-3
                for c in doc["clips"])  # file-local seconds
     order = ["a.mp4", "b.mp4", "c.mp4"]

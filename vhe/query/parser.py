@@ -5,15 +5,23 @@ relevance.
 which image-text similarity barely measures. So mood words become weights on those signals instead of being
 matched as text. Durations are either a total runtime ("60-90 s energetic recap", "a 1 minute recap") or a
 per-clip length ("3-6 s each", "clips of 2-4 seconds"); every parsed phrase is removed from the content text so
-only visual words reach the image-text model. English and German. An optional local LLM (Ollama, JSON schema
-enforced) can replace the rules; the rules are always the fallback.
+only visual words reach the image-text model. English and German.
+
+A real brief is several sentences: a list of wanted shots, things to leave out, spoken topics, a sound requirement.
+These become a plan on the ParsedQuery (shots, avoid, topics, need_live_audio, soundbite length). A local LLM
+(Ollama, JSON schema enforced, cached on disk per model and brief) is the default parser when it is reachable; the
+rules are the fallback and also ground the model: numbers the brief does not contain are replaced by the rules'
+values, and avoid/topic items the rules find are added. Both paths end in the same _finalise.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 import re
 import urllib.request
 from dataclasses import asdict, dataclass, field
+from pathlib import Path
 
 DEFAULT_MIN_LEN = 3.0
 DEFAULT_MAX_LEN = 30.0
@@ -48,7 +56,7 @@ SPEECH_VISUAL = ["to camera", "to the camera", "interview", "interviews", "toast
 SPEECH_ON = SPEECH_VERBS + SPEECH_VISUAL
 SHORT = ["short", "quick", "kurz", "kurze", "kurzen"]
 LONG = ["long", "longer", "lang", "lange", "langen"]
-CLIP_NOUNS = r"(?:clips?|scenes?|shots?|moments?|highlights|parts|szenen?|momente|stellen|aufnahmen)"
+CLIP_NOUNS = r"(?:clips?|scenes?|shots?|moments?|highlights|parts|stretch(?:es)?|szenen?|momente|stellen|aufnahmen)"
 BUDGET_NOUNS = (r"(?:recaps?|edit|video|reel|montage|highlights?|cut|film|trailer|teaser|sizzle|summary|supercut|"
                 r"compilation|rückblick|zusammenfassung|zusammenschnitt|schnitt)")
 FORMAT = ["recap", "recaps", "edit", "reel", "montage", "highlight", "highlights", "supercut", "compilation",
@@ -58,8 +66,9 @@ FILLER = ["show me", "find me", "find", "give me", "i want", "i need", "make", "
           "ich will", "ich brauche", "scenes", "scene", "clips", "clip", "shots", "shot", "moments", "moment",
           "parts", "szenen", "szene", "momente", "stellen", "aufnahmen",
           "with", "mit", "and", "und", "the", "die", "der", "das", "some", "ein paar", "einige"]
-EDGE_STOP = {"a", "an", "the", "of", "with", "for", "from", "in", "on", "at", "and", "or", "to", "some", "ein", "eine",
-             "einer", "einem", "der", "die", "das", "den", "dem", "des", "von", "vom", "im", "am", "mit", "und"}
+EDGE_STOP = {"a", "an", "the", "of", "with", "for", "from", "in", "on", "at", "and", "or", "to", "some", "where",
+             "when", "ein", "eine", "einer", "einem", "der", "die", "das", "den", "dem", "des", "von", "vom", "im",
+             "am", "mit", "und"}
 UNIT = r"(?:s|sec|secs|second|seconds|sek|sekunde|sekunden|min|mins|minute|minutes|minuten)\b"
 NUM = r"\d+(?:\.\d+)?"
 VALUE = rf"(?P<a>{NUM})\s*(?P<ua>{UNIT})?(?:\s*(?:-|to|bis)\s*(?P<b>{NUM}))?[\s-]*(?P<u>{UNIT})"
@@ -73,9 +82,13 @@ MODIFIERS = (r"(?:(?P<total>in total|total|overall|altogether|insgesamt|gesamt)|
              r"höchstens|maximal|bis zu)|"
              r"(?P<ge>over|more than|at least|min(?:imum)?|über|mindestens)|"
              r"(?P<about>about|around|roughly|approx(?:imately)?|circa|ca\.?|ungefähr|etwa|rund))\s*$")
+# The description runs to the next punctuation, "then", or the other edge's verb phrase ("... and end with"), so
+# "end on the giant flag and the chanting crowd at the end of the route" keeps its "and ..." and its "end of".
+EDGE_VERBS = r"(?:end|ends|close|closes|finish|finishes|start|starts|open|opens|begin|begins|ende|starte|beginne)"
 EDGE_OF = (r"\s+(?:(?:it|the\s+(?:edit|video|recap|reel|film|montage))\s+)?(?:with|on|mit|auf)\s+"
            r"(?:(?:a|an|the|some|ein|eine|einem|einer|dem|der)\s+)?(?P<x>[^,;.]+?)\s*"
-           r"(?=[,;.]|\b(?:and|then|und|dann|end|ends|close|closes|finish|start|open|begin)\b|$)")
+           rf"(?=[,;.]|\b(?:then|dann)\b|\b(?:(?:and|und)\s+)?{EDGE_VERBS}\s+(?:it\s+|the\s+\w+\s+)?"
+           r"(?:with|on|mit|auf)\b|$)")
 OPENER = (r"\b(?:open|opens|opening|start|starts|starting|begin|begins|beginning|kick off|lead|beginne|beginnen|"
           r"starte|starten|fange an)" + EDGE_OF)
 CLOSER = (r"\b(?:end|ends|ending|close|closes|closing|finish|finishes|finishing|wrap up|wrap it up|ende|enden|"
@@ -100,6 +113,17 @@ class ParsedQuery:
     exhaustive: bool = False  # "every moment ...": all matches above a threshold instead of a fixed count
     opener: str | None = None  # "open with an establishing shot" -> "establishing shot"
     closer: str | None = None  # "end with the fireworks" -> "fireworks"
+    # The brief as a plan. shots: wanted visual items, short image-text phrases (relevance is the best item, and
+    # selection covers distinct items first). avoid: visual things to leave out. topics: spoken topics, matched
+    # against the transcript. need_live_audio: drop clips whose sound is muted. soundbite_len: a spoken clip asked
+    # for next to the visual ones ("the best 5-8 s soundbite where the host sums up").
+    shots: list[str] = field(default_factory=list)
+    avoid: list[str] = field(default_factory=list)
+    topics: list[str] = field(default_factory=list)
+    need_live_audio: bool = False
+    soundbite_len: tuple[float, float] | None = None
+    parser: str = "rules"  # "rules" or "llm:<model>"
+    parser_note: str | None = None  # "cached", or why the LLM was not used
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -206,8 +230,232 @@ def _clean_text(rest: str) -> str:
     return " ".join(w for w in words if w != "-")
 
 
+# ---- the plan: wanted shots, things to avoid, spoken topics, live sound ---------------------------------------------
+MAX_ITEMS = 12  # per list
+MAX_ITEM_WORDS = 16
+SOUNDBITE_LEN = (4.0, 12.0)  # a soundbite asked for without a length
+# A brief that lists the shots it wants is about content first: relevance outweighs mood. With the energetic
+# weight 1.2 a swinging phone (high motion) beat the actual police band (relevance +3 vs +1.5) on real footage.
+SHOT_LIST_RELEVANCE = 2.0
+LIVE_AUDIO = (r"(?:\bwith\s+)?\b(?:live|natural|ambient|original|real|nat)[\s-]+(?:natural\s+)?(?:sound|audio)\b"
+              r"(?:\s*\(\s*not\s+muted\s*\))?|\(\s*not\s+muted\s*\)|\bnot\s+muted\b|\bunmuted\b|\bsound\s+on\b|"
+              r"\bnat[\s-]?sound\b|\bmit\s+originalton\b")
+SOUNDBITE = rf"(?:{VALUE})?[\s-]*(?:long\s+)?\b(?:sound[\s-]?bites?|soundbites?)\b"
+# "the strongest 20-30 s stretch", "the best shot": one clip
+SINGLE = (r"\b(?:the|one|a)\s+(?:single\s+)?(?:best|strongest|top|key|most\s+[\w-]+)\s+(?:[^\W\d][\w-]*\s+){0,2}?"
+          r"(?:stretch|clip|shot|moment|sequence|scene|take)\b")
+AVOID_STRONG = (r"\b(?:leave out|leaving out|avoid(?:ing)?|exclude|excluding|skip(?:ping)?|cut out|"
+                r"(?:don't|do not|never) (?:use|include|show))\b")
+AVOID_WEAK = r"\b(?:no|without|nothing|ohne|kein|keine|nichts)\b"
+# Spoken topics: "talks (directly to his viewers) about ...", "explains ...", "sums up ...", "says that ...".
+TOPIC = (r"\b(?:(?:talks?|talking|speaks?|speaking|chats?|chatting)\s+(?:directly\s+|briefly\s+)?"
+         r"(?:(?:to|with)\s+(?:the\s+|his\s+|her\s+|their\s+)?[\w-]+\s+)?(?:about|on the subject of)|"
+         r"(?:says?|saying|tells?|telling)\s+(?:[\w-]+\s+)?(?:that|about|why|how|what|where)|"
+         r"explains?|explaining|mentions?|mentioning|describes?|describing|discuss(?:es)?|discussing|"
+         r"sums?\s+up|summing\s+up|summari[sz](?:es|ing|e)|introduces?|introducing|announces?|announcing|"
+         r"spricht\s+über|redet\s+über|erzählt|erklärt)\b")
+# Instructions about the output, not content: a sentence that starts like this is dropped whole; a clause like
+# "for a news package" or "so they can be used as ..." is dropped on its own.
+META_SENTENCE = (r"^(?:also\s+)?(?:give|return|provide|include|output|mark|export|note|add)\b.*"
+                 r"\b(?:clips?|times?|time\s*codes?|timecodes?|timestamps?|ranges?)\b")
+META_CLAUSE = (r"^(?:so\s+(?:that\s+)?(?:they|it|we|i|you)\s+can\b|"
+               r"to\s+(?:sit|go|play|run|lay)\s+(?:under|over|with)\b|for\s+(?:a|an|the|our|my)\s+[\w\s-]*?\b(?:package|voice-?over|segment|story|piece|post|deck|"
+               r"channel|show|report)\b|for\s+example\b|e\.?g\.?$)")
+LEAD = (r"^(?:(?:also|please|then|plus|and|or)\s+)*(?:(?:cut|make|create|build(?:\s+up)?(?:\s+through)?|show|include|"
+        r"feature|cover|pick|find|get|give(?:\s+me)?|list|use|add|want|need|i\s+want|i\s+need|we\s+need)\b\s*)?")
+SHOT_LEAD = (r"^(?:(?:shots?|clips?|scenes?|footage|frames?|moments?|anything|parts?)\s+"
+             r"(?:where|when|with|of|that|in which|showing)?\s*)")
+SUPERLATIVE = ["the most", "most", "best", "strongest", "nicest", "greatest", "recommended", "single"]
+# An item made only of these words is camera style or a generic clip noun ("steady or locked-off framing", "clips").
+STYLE = {"steady", "locked-off", "locked", "off", "static", "tripod", "handheld", "framing", "stable", "smooth", "or",
+         "and", "camera", "work", "shots", "shot", "clips", "clip", "scenes", "scene", "moments", "moment",
+         "stretch", "stretches", "parts", "highlights"}
+GENERIC_HEAD = {"stretch", "example", "examples", "thing", "things", "item", "items", "b-roll", "broll", "clip", "shot",
+                "scene", "moment", "part", "bit"}
+ITEM_EDGE = EDGE_STOP | {"where", "when", "that", "which", "who", "also", "then", "each", "every", "all", "one", "per"}
+
+
+def _depth_map(text: str) -> list[bool]:
+    """True for characters outside quotes and parentheses (where punctuation separates clauses)."""
+    out, depth, quote = [], 0, False
+    for ch in text:
+        if ch == "\"":
+            quote = not quote
+        elif ch in "“„”":
+            quote = ch != "”"
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth = max(0, depth - 1)
+        out.append(depth == 0 and not quote and ch not in "\"“”„()")
+    return out
+
+
+def _top_colon(text: str) -> int | None:
+    return next((i for i, (ch, top) in enumerate(zip(text, _depth_map(text))) if ch == ":" and top), None)
+
+
+def _split_top(text: str, seps: str) -> list[str]:
+    top, parts, a = _depth_map(text), [], 0
+    for i, ch in enumerate(text):
+        if ch in seps and top[i] and not (ch == "." and i + 1 < len(text) and not text[i + 1].isspace()):
+            parts.append(text[a:i])
+            a = i + 1
+    return [x for x in (*parts, text[a:]) if x.strip()]
+
+
+def _words(text: str) -> str:
+    """Quote and parenthesis characters and loose punctuation removed, the words kept."""
+    text = re.sub(r"[\"“”„()\[\]:;!?]", " ", text)
+    text = re.sub(r"(?<![\w])\.+|\.+(?![\w])|,", " ", text)
+    return " ".join(text.split())
+
+
+def _trim(words: list[str], stop: set) -> list[str]:
+    while words and words[0] in stop:
+        words.pop(0)
+    while words and words[-1] in stop:
+        words.pop()
+    return words
+
+
+def _clean_item(text: str) -> str:
+    """A shot/avoid phrase: lead verbs ("build through", "show"), mood, format and superlative words removed."""
+    s = _words(text)
+    for _ in range(3):
+        s = re.sub(LEAD, "", s).strip()
+        s = re.sub(SHOT_LEAD, "", s).strip()
+        s = " ".join(_trim(s.split(), ITEM_EDGE))
+    for w in CALM + ENERGY + FORMAT + SUPERLATIVE:
+        s = _strip(s, w)
+    words = _trim(s.split(), ITEM_EDGE)
+    if all(w in STYLE or w in ITEM_EDGE for w in words):  # "steady or locked-off framing" is style, not a shot
+        return ""
+    return " ".join(words[:MAX_ITEM_WORDS])
+
+
+def _list_items(text: str) -> list[str]:
+    """'a, b and c' -> [a, b, c]; 'and' splits only the last element of a comma list ('bride and groom' stays)."""
+    parts = _split_top(text, ",")
+    if len(parts) > 1:
+        last = re.split(r"\s+(?:and|or|und|oder)\s+", parts[-1].strip())
+        parts = parts[:-1] + last
+    return [x.strip() for x in parts if x.strip()]
+
+
+def _avoid_items(clause: str) -> list[str]:
+    """'shots where the camera points at the ground or sky, or where something blocks the lens' ->
+    ['camera points at the ground', 'camera points at the sky', 'something blocks the lens']."""
+    out: list[list[str]] = []
+    for frag in re.split(r",\s*(?:or\s+|and\s+)?|\s+or\s+", _words(clause.replace(",", " , "))):
+        frag = re.sub(SHOT_LEAD, "", frag.strip())
+        frag = re.sub(r"^(?:where|when|that|which|if)\s+", "", frag)
+        frag = re.sub(r"^(?:nothing|anything)\b", "something", frag)
+        words = _trim(frag.split(), ITEM_EDGE - {"something"})
+        if not words:
+            continue
+        if out and len(words) <= 2 and len(out[-1]) >= 3:  # "at the ground or sky": "sky" takes "ground"'s place
+            words = out[-1][:-len(words)] + words
+        out.append(words)
+    return [" ".join(w[:MAX_ITEM_WORDS]) for w in out]
+
+
+def _topic_items(verb: str, obj: str) -> list[str]:
+    """Spoken topics after the verb: a list ('the stream: where he is (...), why he mutes (...), and what ...') gives
+    one topic per element; a single object keeps the verb ('sums up the parade "short parade ..."')."""
+    colon = _top_colon(obj)
+    tail = obj[colon + 1:] if colon is not None else ""
+    parts = _list_items(tail) if tail.strip() else _list_items(obj if colon is None else obj[:colon])
+    items = [" ".join(re.sub(r"^(?:and|or)\s+", "", _words(x)).split()) for x in parts]
+    items = [x for x in items if x]
+    if len(items) == 1:
+        items = [" ".join(_words(f"{verb} {obj}").split())]
+    return items[:MAX_ITEMS]
+
+
+def _plan(rest: str, q: str, p: ParsedQuery) -> str:
+    """Fill p.shots/avoid/topics from the remaining brief (punctuation intact); return the rest without the avoid,
+    topic and output-instruction parts. Sentences with a topic give no shots (their subject is the speaker)."""
+    m = re.search(rf"(?<![\w-]){BUDGET_NOUNS}\s+(?:of|from|about|for)\s+(?P<x>[^.,;:!?]+)", q)
+    subject = _clean_item(m.group("x")) if m else ""
+    shots: list[str] = []
+    kept: list[str] = []
+    for sentence in _split_top(re.sub(r"\.{2,}|…", " ", rest), ".!?;"):
+        s = sentence.strip()
+        if re.search(META_SENTENCE, s):
+            continue
+        m = re.search(AVOID_STRONG, s)
+        if m:
+            p.avoid += _avoid_items(s[m.end():])
+            s = s[:m.start()]
+        while (m := re.search(AVOID_WEAK, s)):
+            end = next((m.end() + k for k, ch in enumerate(s[m.end():]) if ch == ","), len(s))
+            lead = "something " if m.group(0) == "nothing" else ""
+            p.avoid += _avoid_items(lead + s[m.end():end])
+            s = s[:m.start()] + s[end:]
+        m = re.search(TOPIC, s)
+        if m:
+            p.topics += _topic_items(m.group(0), s[m.end():])
+            kept.append(re.sub(r"\b(?:where|when|while|in which)\s*$", "", s[:m.start()].strip()))
+            continue
+        clauses = []
+        for c in _split_top(s, ","):
+            colon = _top_colon(c)
+            if re.search(META_CLAUSE, c[:colon].strip() if colon is not None else c.strip()):
+                c = c[colon + 1:] if colon is not None else ""  # "for example: a, b" keeps the list
+            clauses.append(c)
+        s = ",".join(c for c in clauses if c.strip())
+        colon = _top_colon(s)
+        body = s if colon is None or not s[colon + 1:].strip() else s[colon + 1:]
+        shots += [x for x in map(_clean_item, _list_items(body)) if x and x != subject]
+        kept.append(s)
+    seen = set()
+    p.shots = [x for x in shots if not (x in seen or seen.add(x))] if len(set(shots)) >= 2 else []
+    if p.shots:
+        p.text = subject
+    return ". ".join(kept)
+
+
+def _categorise(items: list[str], raw: str) -> list[str]:
+    """Named items get the category the other items share: if two or more items end in 'float(s)', a bare proper
+    name from the brief ('Pasargad', 'Gate of the Nations') becomes 'Pasargad float' for the image-text model."""
+    heads = [re.sub(r"s$", "", x.split()[-1]) for x in items if len(x.split()) >= 2]
+    common = [h for h in set(heads) if heads.count(h) >= 2 and h not in GENERIC_HEAD and len(h) > 2]
+    if len(common) != 1:
+        return items
+    head = common[0]
+    out = []
+    for x in items:
+        m = re.search(r"(?<![\w-])" + r"\W+".join(map(re.escape, x.split())) + r"(?![\w-])", raw, re.IGNORECASE)
+        proper = m is not None and all(w[0].isupper() for w in re.findall(r"[^\W\d_][\w'-]*", m.group(0))
+                                       if w.lower() not in EDGE_STOP)
+        out.append(f"{x} {head}" if proper and not re.search(rf"\b{re.escape(head)}", x, re.IGNORECASE) else x)
+    return out
+
+
+def _dedupe(items: list[str], also: tuple = ()) -> list[str]:
+    """Drop empties, repeats and items that restate one of `also` (opener/closer) or an earlier item."""
+    def toks(s):
+        return {w[:5] for w in re.findall(r"\w+", s.lower()) if w not in EDGE_STOP}
+
+    out, refs = [], [toks(a) for a in also if a]
+    for x in (" ".join(str(i).split()) for i in items):
+        t = toks(x)
+        if not t or any(len(t & r) / len(t | r) >= 0.6 for r in refs):
+            continue
+        out.append(x)
+        refs.append(t)
+    return out[:MAX_ITEMS]
+
+
 def parse(query: str, count: int | None = None, min_len: float | None = None, max_len: float | None = None,
           budget_s: float | tuple | None = None) -> ParsedQuery:
+    """Rules only (deterministic, no network)."""
+    p, explicit_len, hint = _parse_rules(query)
+    return _finalise(p, explicit_len, hint, count, min_len, max_len, budget_s)
+
+
+def _parse_rules(query: str) -> tuple[ParsedQuery, bool, str | None]:
     raw = query.strip()
     q = _normalise(raw)
     p = ParsedQuery(raw=raw, text="")
@@ -218,6 +466,21 @@ def parse(query: str, count: int | None = None, min_len: float | None = None, ma
         if m:
             setattr(p, attr, m.group("x").strip())
             rest = _cut(rest, m.start(), m.end())
+
+    m = re.search(LIVE_AUDIO, rest)
+    while m:
+        p.need_live_audio = True
+        rest = _cut(rest, m.start(), m.end())
+        m = re.search(LIVE_AUDIO, rest)
+    m = re.search(SOUNDBITE, rest)
+    if m:  # "the best 5-8 s soundbite": its own length, not the visual clips'
+        if m.group("a"):
+            a = _seconds(m.group("a"), m.group("ua") or m.group("u"))
+            b = _seconds(m.group("b"), m.group("u")) if m.group("b") else None
+            p.soundbite_len = (a, b) if b is not None else (max(1.0, 0.7 * a), 1.3 * a)
+        else:
+            p.soundbite_len = SOUNDBITE_LEN
+        rest = _cut(rest, m.start(), m.end())
 
     rest, budget, clip = _durations(rest, q)
     if budget:
@@ -238,6 +501,8 @@ def parse(query: str, count: int | None = None, min_len: float | None = None, ma
     if m:
         p.count, p.count_explicit = max(1, min(MAX_COUNT, int(m.group(1)))), True
         rest = _cut(rest, m.start(1), m.end(1))
+    elif not p.exhaustive and (m := re.search(SINGLE, rest)):
+        p.count, p.count_explicit = 1, True
 
     m = re.search(r"\b(?:without|no|ohne|kein|keine)\s+(?:[^\W\d][\w-]*\s+){0,2}?"
                   r"(?:talking|speaking|speech|voices?|dialogue|narration|sprache|reden|gespräch|stimmen?)\b", rest)
@@ -246,6 +511,7 @@ def parse(query: str, count: int | None = None, min_len: float | None = None, ma
         rest = _cut(rest, m.start(), m.end())
     if p.weights["speech"] == 0.0 and any(_contains(rest, w) for w in SPEECH_ON):
         p.weights["speech"] = 1.0
+    rest = _plan(rest, q, p)
     for w in SPEECH_VERBS:
         rest = _strip(rest, w)
 
@@ -269,13 +535,17 @@ def parse(query: str, count: int | None = None, min_len: float | None = None, ma
 
     # "scenic" is both a mood and content: keep it in the text so "scenic view" still matches landscapes.
     keep = [w for w in ("scenic",) if _contains(q, w)]
-    p.text = " ".join([*keep, _clean_text(rest)]).strip()
-    return _finalise(p, explicit_len, hint, count, min_len, max_len, budget_s)
+    if not p.shots:  # with a shot list the text is the subject ("recap of the parade"), set by _plan
+        p.text = " ".join([*keep, _clean_text(rest)]).strip()
+    return p, explicit_len, hint
+
+
 
 
 def _finalise(p: ParsedQuery, explicit_len: bool, hint: str | None, count: int | None, min_len: float | None,
               max_len: float | None, budget_s: float | tuple | None) -> ParsedQuery:
-    """Caller overrides, then everything derived from the budget, then clamps. Shared by rules and LLM."""
+    """Caller overrides, then everything derived from the budget, then clamps, then the plan lists. Shared by rules
+    and LLM."""
     if budget_s is not None:
         p.budget = tuple(float(x) for x in budget_s) if isinstance(budget_s, (tuple, list)) else _around(budget_s)
     if count is not None:
@@ -300,59 +570,207 @@ def _finalise(p: ParsedQuery, explicit_len: bool, hint: str | None, count: int |
         p.count = EXHAUSTIVE_CAP
     elif p.budget:
         p.count = max(1, min(MAX_CLIPS, round(mid / ((p.min_len + p.max_len) / 2))))
-    if not p.text:
+
+    p.shots = _categorise(_dedupe(p.shots, (p.opener, p.closer)), p.raw)
+    p.avoid = _dedupe(p.avoid)
+    p.topics = _dedupe(p.topics)
+    if p.shots and not p.text:
+        p.text = ", ".join(p.shots)
+    if len(p.shots) >= 2:
+        p.weights["relevance"] = max(p.weights["relevance"], SHOT_LIST_RELEVANCE)
+    if p.topics and not p.shots:  # "every moment the host talks about ...": speech clips matched to the topics
+        p.weights["speech"] = max(p.weights["speech"], 1.0)
+    if p.topics and p.shots and p.soundbite_len is None:
+        p.soundbite_len = SOUNDBITE_LEN
+    if p.soundbite_len is not None:
+        lo, hi = sorted(float(x) for x in p.soundbite_len)
+        p.soundbite_len = (round(max(1.0, lo), 2), round(max(lo + 1.0, hi), 2))
+    if not p.text and not p.shots:
         p.weights["relevance"] = 0.0
     return p
 
 
+# ---- LLM parsing (local Ollama) -------------------------------------------------------------------------------------
+DEFAULT_LLM = "qwen3:4b"
+OLLAMA_HOST = "http://127.0.0.1:11434"
+LLM_TIMEOUT = 60.0  # a cold load of a 4B model takes seconds; a hung server must not hang the query
+LLM_KEEP_ALIVE = "30s"  # unload soon after: indexing needs the (6 GB) GPU
+PARSE_CACHE = Path.home() / ".cache" / "vhe" / "parse"  # one JSON per (prompt version, model, brief)
+PROMPT_VERSION = 2
+
+_TEXT = {"type": "string"}
+_NUM = {"type": "number"}
+_LIST = {"type": "array", "items": {"type": "string"}}
 LLM_SCHEMA = {
     "type": "object",
     "properties": {
-        "content": {"type": "string", "description": "what should be visible, without mood, length or format words"},
+        "content": _TEXT, "shots": _LIST, "avoid": _LIST, "topics": _LIST, "need_live_audio": {"type": "boolean"},
         "mood": {"type": "string", "enum": ["calm", "energetic", "neutral"]},
         "speech": {"type": "string", "enum": ["wanted", "unwanted", "any"]},
-        "min_seconds": {"type": "number", "description": "per clip, 0 if not given"},
-        "max_seconds": {"type": "number", "description": "per clip, 0 if not given"},
-        "count": {"type": "integer", "description": "number of clips, 0 if not given"},
-        "budget_min_seconds": {"type": "number", "description": "total runtime of all clips, 0 if not given"},
-        "budget_max_seconds": {"type": "number", "description": "total runtime of all clips, 0 if not given"},
-        "exhaustive": {"type": "boolean", "description": "true for 'every/all moments ...'"},
-        "opener": {"type": "string", "description": "what the edit should open with, '' if not given"},
-        "closer": {"type": "string", "description": "what the edit should end with, '' if not given"},
+        "min_seconds": _NUM, "max_seconds": _NUM, "count": {"type": "integer"},
+        "budget_min_seconds": _NUM, "budget_max_seconds": _NUM,
+        "soundbite_min_seconds": _NUM, "soundbite_max_seconds": _NUM,
+        "exhaustive": {"type": "boolean"}, "opener": _TEXT, "closer": _TEXT,
     },
-    "required": ["content", "mood", "speech", "min_seconds", "max_seconds", "count", "budget_min_seconds",
-                 "budget_max_seconds", "exhaustive", "opener", "closer"],
 }
-LLM_PROMPT = ("Extract video edit parameters from an editor's brief as JSON. Distinguish the total runtime of the "
-              "edit (budget) from the length of each clip. Use 0 or '' for anything not stated.")
+LLM_SCHEMA["required"] = list(LLM_SCHEMA["properties"])
+LLM_PROMPT = """You turn a video editor's brief into a JSON edit plan for searching raw footage with an image-text \
+model and a transcript. Only extract what the brief says; never invent items or numbers.
+- content: the main subject of the edit in at most 10 words.
+- shots: one entry per visual item the brief asks for, each a short phrase of 2-6 words as a photo caption would say \
+it. Keep names and give them their category (a named float -> "<name> float"). Do not repeat the opening or closing \
+shot. Leave out mood, lengths, camera style and things to avoid. [] when the brief only asks for speech or names no \
+items.
+- avoid: visual things the brief says to leave out, as short phrases. [] if the brief excludes nothing.
+- topics: only when the brief asks for moments where someone talks about something: one short description per \
+topic, with any quoted words. [] otherwise.
+- need_live_audio: true only if the brief explicitly asks for live, natural or unmuted sound.
+- opener / closer: what the first / last shot shows, "" if not given.
+- min_seconds / max_seconds: length of each clip. budget_min_seconds / budget_max_seconds: total runtime of the \
+whole edit. count: number of clips. soundbite_min_seconds / soundbite_max_seconds: length of a requested spoken \
+soundbite. 0 for anything the brief does not state as a number.
+- exhaustive: true for "every / all / each ..." lists.
+- mood: "neutral" unless the brief asks for an energetic or calm feel. speech: "wanted" only if the clips must be \
+someone talking, "unwanted" if they must not contain talking, else "any"."""
+# Worked examples from other domains (never from an evaluation set): one visual list, one speech brief.
+LLM_EXAMPLES = [
+    ("Make a 2 minute highlight video of the Riverside Food Festival. Start with a drone view of the market tents. "
+     "Show the chefs at the grill, kids eating ice cream, the Golden Ladle stall and the brass band. Finish with the "
+     "lantern release. No shots of the toilets or of people's backs blocking the view.",
+     {"content": "Riverside Food Festival highlights",
+      "shots": ["chefs cooking at the grill", "kids eating ice cream", "Golden Ladle food stall", "brass band playing"],
+      "avoid": ["portable toilets", "person's back blocking the view"], "topics": [], "need_live_audio": False,
+      "mood": "neutral", "speech": "any", "min_seconds": 0, "max_seconds": 0, "count": 0, "budget_min_seconds": 102,
+      "budget_max_seconds": 138, "soundbite_min_seconds": 0, "soundbite_max_seconds": 0, "exhaustive": False,
+      "opener": "drone view of the market tents", "closer": "lantern release"}),
+    ("Pull all the bits where the coach explains the new training plan or talks about the injury (\"out for six "
+     "weeks\"). 10-20 s each.",
+     {"content": "coach talking", "shots": [], "avoid": [],
+      "topics": ["the new training plan", "the injury, \"out for six weeks\""], "need_live_audio": False,
+      "mood": "neutral", "speech": "wanted", "min_seconds": 10, "max_seconds": 20, "count": 0,
+      "budget_min_seconds": 0, "budget_max_seconds": 0, "soundbite_min_seconds": 0, "soundbite_max_seconds": 0,
+      "exhaustive": True, "opener": "", "closer": ""}),
+]
+LIVE_CUE = r"\b(?:sound|audio|noise|ton|muted)\b"
+EXHAUSTIVE_CUE = r"\b(?:every|each|all|any|whenever|jede[nrs]?|alle)\b"
 
 
-def parse_with_llm(query: str, model: str, host: str = "http://127.0.0.1:11434", **overrides) -> ParsedQuery:
-    """Ask a local Ollama model for the same fields; fall back to the rules on any failure."""
-    base = parse(query, **overrides)
-    body = {"model": model, "stream": False, "format": LLM_SCHEMA, "think": False, "options": {"temperature": 0},
-            "messages": [{"role": "system", "content": LLM_PROMPT}, {"role": "user", "content": query}]}
+def default_llm() -> str | None:
+    """The parser model: VHE_LLM overrides DEFAULT_LLM; 'none', 'off' or '' means rules only."""
+    v = os.environ.get("VHE_LLM", DEFAULT_LLM).strip()
+    return None if v.lower() in ("", "none", "off", "0", "rules") else v
+
+
+def _ask_llm(query: str, model: str, host: str) -> tuple[dict, bool]:
+    """(answer, from_cache). Raises on any failure. Answers are cached on disk, so a brief parses the same way on
+    every run and repeated runs do not wait for the model."""
+    key = hashlib.sha256(json.dumps([PROMPT_VERSION, model, query]).encode()).hexdigest()[:32]
+    path = Path(PARSE_CACHE) / f"{key}.json"
     try:
-        req = urllib.request.Request(f"{host}/api/chat", data=json.dumps(body).encode(),
-                                     headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            data = json.loads(json.loads(resp.read())["message"]["content"])
-        if not isinstance(data, dict):
-            return base
-        p = ParsedQuery(raw=query, text=str(data.get("content") or "").strip())
-        lo, hi = float(data.get("min_seconds") or 0), float(data.get("max_seconds") or 0)
-        p.min_len, p.max_len = lo or DEFAULT_MIN_LEN, hi or DEFAULT_MAX_LEN
-        if int(data.get("count") or 0) > 0:
-            p.count, p.count_explicit = int(data["count"]), True
-        blo, bhi = float(data.get("budget_min_seconds") or 0), float(data.get("budget_max_seconds") or 0)
-        if blo or bhi:
-            p.budget = (blo or round(bhi * (1 - BUDGET_TOL), 2), bhi or round(blo * (1 + BUDGET_TOL), 2))
-        p.exhaustive = bool(data.get("exhaustive"))
-        p.opener = str(data.get("opener") or "").strip() or None
-        p.closer = str(data.get("closer") or "").strip() or None
-    except Exception:
-        return base
-    _set_mood(p, data.get("mood"))
-    p.weights["speech"] = {"wanted": 1.0, "unwanted": -1.0}.get(data.get("speech"), 0.0)
-    return _finalise(p, bool(lo or hi), None, overrides.get("count"), overrides.get("min_len"),
-                     overrides.get("max_len"), overrides.get("budget_s"))
+        hit = json.loads(path.read_text())
+        if hit.get("model") == model and hit.get("brief") == query and isinstance(hit.get("data"), dict):
+            return hit["data"], True
+    except (OSError, ValueError):
+        pass
+    messages = [{"role": "system", "content": LLM_PROMPT}]
+    for user, answer in LLM_EXAMPLES:
+        messages += [{"role": "user", "content": user}, {"role": "assistant", "content": json.dumps(answer)}]
+    messages.append({"role": "user", "content": query})
+    body = {"model": model, "stream": False, "format": LLM_SCHEMA, "think": False, "keep_alive": LLM_KEEP_ALIVE,
+            "options": {"temperature": 0, "seed": 0}, "messages": messages}
+    req = urllib.request.Request(f"{host}/api/chat", data=json.dumps(body).encode(),
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
+        data = json.loads(json.loads(resp.read())["message"]["content"])
+    if not isinstance(data, dict):
+        raise ValueError("LLM answer is not a JSON object")
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"model": model, "brief": query, "prompt_version": PROMPT_VERSION, "data": data},
+                                  ensure_ascii=False, indent=1))
+        tmp.replace(path)
+    except OSError:
+        pass
+    return data, False
+
+
+def _numbers(raw: str) -> set[float]:
+    """Every number in the brief, also as minutes -> seconds ('a 2 minute recap' grounds 120)."""
+    nums = {float(x) for x in re.findall(NUM, _normalise(raw))}
+    return nums | {60.0 * x for x in nums}
+
+
+def _grounded(item: str, vocab: set[str]) -> bool:
+    """More than half of the item's content words (4-letter stems) occur in the brief: drops invented items."""
+    stems = [w[:4] for w in re.findall(r"[^\W\d_]+", item.lower()) if len(w) > 2 and w not in EDGE_STOP]
+    return bool(stems) and sum(s in vocab for s in stems) / len(stems) > 0.5
+
+
+def _from_llm(data: dict, base: ParsedQuery, explicit_len: bool) -> tuple[ParsedQuery, bool]:
+    """The model's plan, grounded in the brief: numbers it gives that the brief does not contain are ignored, and
+    numbers, live sound, speech and exhaustiveness the rules found always stand."""
+    nums, vocab = _numbers(base.raw), {w[:4] for w in re.findall(r"[^\W\d_]+", base.raw.lower())}
+
+    def num(key: str) -> float:
+        try:
+            v = float(data.get(key) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+        return v if v > 0 and any(abs(v - n) < 1e-6 for n in nums) else 0.0
+
+    def items(key: str) -> list[str]:
+        v = data.get(key)
+        return [str(x).strip() for x in v if str(x).strip() and _grounded(str(x), vocab)] if isinstance(v, list) else []
+
+    p = ParsedQuery(raw=base.raw, text=" ".join(str(data.get("content") or "").split()[:12]) or base.text)
+    p.weights = dict(base.weights)
+    _set_mood(p, base.mood or data.get("mood"))
+    p.weights["speech"] = base.weights["speech"]
+    p.min_len, p.max_len = base.min_len, base.max_len
+    if not explicit_len and (num("min_seconds") or num("max_seconds")):
+        lo, hi = num("min_seconds"), num("max_seconds")
+        p.min_len, p.max_len, explicit_len = lo or max(1.0, 0.7 * hi), hi or 1.3 * lo, True
+    p.count, p.count_explicit = base.count, base.count_explicit
+    if not p.count_explicit and num("count"):
+        p.count, p.count_explicit = int(num("count")), True
+    p.budget = base.budget
+    if p.budget is None and (num("budget_min_seconds") or num("budget_max_seconds")):
+        lo, hi = num("budget_min_seconds"), num("budget_max_seconds")
+        p.budget = (lo or round(hi * (1 - BUDGET_TOL), 2), hi or round(lo * (1 + BUDGET_TOL), 2))
+    p.soundbite_len = base.soundbite_len
+    if p.soundbite_len is None and num("soundbite_max_seconds"):
+        p.soundbite_len = (num("soundbite_min_seconds") or 0.7 * num("soundbite_max_seconds"),
+                           num("soundbite_max_seconds"))
+    p.exhaustive = base.exhaustive or (bool(data.get("exhaustive")) and re.search(EXHAUSTIVE_CUE, p.raw.lower())
+                                       is not None)
+    p.need_live_audio = base.need_live_audio or (bool(data.get("need_live_audio")) and
+                                                 re.search(LIVE_CUE, p.raw.lower()) is not None)
+    p.opener = " ".join(str(data.get("opener") or "").split()) or base.opener
+    p.closer = " ".join(str(data.get("closer") or "").split()) or base.closer
+    p.shots = items("shots") or base.shots
+    p.avoid = items("avoid") + base.avoid
+    p.topics = items("topics") or base.topics
+    if p.topics and not p.shots and p.text == base.text:
+        p.text = ""
+    return p, explicit_len
+
+
+def parse_with_llm(query: str, model: str, host: str = OLLAMA_HOST, **overrides) -> ParsedQuery:
+    """Ask a local Ollama model for the plan, grounded by the rules; the rules alone on any failure."""
+    base, explicit_len, hint = _parse_rules(query)
+    ov = (overrides.get("count"), overrides.get("min_len"), overrides.get("max_len"), overrides.get("budget_s"))
+    try:
+        data, cached = _ask_llm(base.raw, model, host)
+        p, explicit_len = _from_llm(data, base, explicit_len)
+    except Exception as exc:  # unreachable server, unknown model, timeout, malformed answer
+        base.parser_note = f"{model} unavailable ({type(exc).__name__}): rules used"
+        return _finalise(base, explicit_len, hint, *ov)
+    p.parser, p.parser_note = f"llm:{model}", "cached" if cached else None
+    return _finalise(p, explicit_len, hint, *ov)
+
+
+def parse_brief(query: str, llm: str | None = "auto", **overrides) -> ParsedQuery:
+    """The parser entry point. llm: an Ollama model, 'auto' (default_llm(), the default) or None (rules only)."""
+    model = default_llm() if llm == "auto" else llm
+    return parse_with_llm(query, model, **overrides) if model else parse(query, **overrides)

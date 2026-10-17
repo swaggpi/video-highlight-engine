@@ -72,6 +72,17 @@ def speech_spans(segments: list[dict], vad: list[tuple[float, float]], max_len: 
     return out
 
 
+def fit_span(s: float, e: float, lo: float, hi: float, duration: float) -> tuple[float, float] | None:
+    """An utterance grown evenly to at least lo seconds (into the surrounding pause), or None if longer than hi."""
+    if e - s > hi + 1e-6:
+        return None
+    if e - s < lo:
+        L = min(lo, duration)
+        s = min(max(0.0, (s + e) / 2 - L / 2), max(0.0, duration - L))
+        e = s + L
+    return s, e
+
+
 def generate(duration: float, cuts: list[float], change_points: list[float], min_len: float, max_len: float,
              peaks: list[float] = (), proposals: list[tuple] = (),
              speech: list[tuple[float, float]] = ()) -> list[tuple[float, float, str]]:
@@ -90,9 +101,9 @@ def generate(duration: float, cuts: list[float], change_points: list[float], min
 
     # First, so an identical window does not take the utterance's place.
     for s, e in speech:  # utterances shorter than min_len grow evenly into the surrounding pause
-        L = max(e - s, min_len)
-        start = min(max(0.0, (s + e) / 2 - L / 2), max(0.0, duration - L)) if L > e - s else s
-        add(start, start + L, "speech")
+        fitted = fit_span(s, e, min_len, max_len, duration)
+        if fitted:
+            add(*fitted, "speech")
     for a, b in shots_from_cuts(sorted(set(cuts) | set(change_points)), duration):
         add(a, b, "shot")
         for L in lengths:

@@ -401,7 +401,8 @@ def test_llm_path_carries_new_fields(monkeypatch):
               "opener": "drone shot", "closer": ""}
     body = json.dumps({"message": {"content": json.dumps(answer)}}).encode()
     monkeypatch.setattr(parser.urllib.request, "urlopen", lambda req, timeout: io.BytesIO(body))
-    p = parser.parse_with_llm("whatever", model="m")
+    # The model's numbers count only when the brief contains them (grounding); the rules find none here.
+    p = parser.parse_with_llm("drone opener, then the dance floor: 60 to 90", model="m")
     assert p.budget == (60.0, 90.0) and (p.min_len, p.max_len) == (2.0, 4.0) and p.count == 25
     assert p.opener == "drone shot" and p.closer is None and p.text == "dance floor"
     assert p.weights["steady"] >= 0.3

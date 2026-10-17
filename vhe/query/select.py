@@ -30,11 +30,15 @@ def overlap_fraction(a: tuple[float, float], b: tuple[float, float]) -> float:
 
 def select(cands: list[dict], vectors: np.ndarray, n: int, lam: float = 1.0, sim_floor: float = 0.6,
            max_overlap: float = 0.2, budget_s: float | tuple[float, float] | None = None, n_max: int | None = None,
-           min_total: float | None = None, groups: np.ndarray | None = None, cap: int | None = None) -> list[dict]:
+           min_total: float | None = None, groups: np.ndarray | None = None, cap: int | None = None,
+           items: np.ndarray | None = None) -> list[dict]:
     """cands: dicts with 'start', 'end', 'total'; vectors: L2-normalised mean embedding per candidate (same order).
     budget_s: a number is an upper bound on the summed length; (lo, hi) keeps picking past n (up to n_max) until
     the sum reaches lo, and never exceeds hi. min_total: candidates scoring below it are never picked.
     groups/cap: once a group (file) has `cap` picks, its candidates are only used when nothing else is left.
+    items: the shot item each candidate serves (-1: none). Picks go round robin over the items that still have
+    candidates: every item once before any item twice, and so on; candidates serving no item only come in when no
+    item has one left (coverage first, then the per-file cap, then MMR).
     Callers pass a pre-filtered pool; this is O(n * len(cands))."""
     if not cands:
         return []
@@ -52,11 +56,19 @@ def select(cands: list[dict], vectors: np.ndarray, n: int, lam: float = 1.0, sim
     picks: dict[int, int] = {}
     chosen: list[int] = []
     used = 0.0
+    items = None if items is None else np.asarray(items)
+    item_picks: dict[int, int] = {}
     while alive.any() and len(chosen) < n_max and (len(chosen) < n or used < lo):
         penalty = lam * np.clip((max_sim - sim_floor) / (1.0 - sim_floor), 0.0, None)
-        val = np.where(alive & ~deferred, totals - penalty, -np.inf)
+        pool = alive
+        if items is not None:  # round robin: an item with fewer picks first (every item once before any twice)
+            live = np.unique(items[alive & (items >= 0)])
+            if len(live):
+                least = min(item_picks.get(int(i), 0) for i in live)
+                pool = alive & np.isin(items, [i for i in live if item_picks.get(int(i), 0) == least])
+        val = np.where(pool & ~deferred, totals - penalty, -np.inf)
         if not np.isfinite(val).any():
-            val = np.where(alive, totals - penalty, -np.inf)
+            val = np.where(pool, totals - penalty, -np.inf)
         i = int(np.argmax(val))
         if not np.isfinite(val[i]):
             break
@@ -65,6 +77,8 @@ def select(cands: list[dict], vectors: np.ndarray, n: int, lam: float = 1.0, sim
             continue
         chosen.append(i)
         used += lengths[i]
+        if items is not None and items[i] >= 0:
+            item_picks[int(items[i])] = item_picks.get(int(items[i]), 0) + 1
         if groups is not None and cap is not None:
             picks[groups[i]] = picks.get(groups[i], 0) + 1
             if picks[groups[i]] >= cap:
@@ -75,10 +89,46 @@ def select(cands: list[dict], vectors: np.ndarray, n: int, lam: float = 1.0, sim
     return [dict(cands[i], rank=r) for r, i in enumerate(chosen)]
 
 
-def select_for(cands: list[dict], vectors: np.ndarray, p, groups: np.ndarray | None = None) -> list[dict]:
+def select_per_item(cands: list[dict], item_rel: np.ndarray, p, item_centre: np.ndarray | None = None) -> list[dict]:
+    """"Every float: A, B, C ...": the best clip for each named item; an item with no clip matching it above
+    ITEM_MIN_REL (and, centred, nearly as well as the clip's best item) is skipped rather than filled with another
+    clip. A clip's score for item i is its score with the relevance part replaced by its relevance to i; (item,
+    clip) pairs are taken best first, clips never overlap, and the budget (if any) caps the total."""
+    from vhe.query.plan import ITEM_MARGIN, eligible
+
+    if not cands:
+        return []
+    w = p.weights.get("relevance", 1.0)
+    base = np.array([c["total"] - w * c.get("relevance", 0.0) for c in cands])
+    centre = np.zeros(item_rel.shape[1]) if item_centre is None else np.asarray(item_centre)
+    score = np.where(eligible(item_rel, centre, ITEM_MARGIN), base[:, None] + w * item_rel, -np.inf)
+    hi = np.inf if p.budget is None else p.budget[1]
+    picked: list[dict] = []
+    used = 0.0
+    while len(picked) < p.count and np.isfinite(score).any():
+        j, i = np.unravel_index(int(np.argmax(score)), score.shape)
+        c = cands[j]
+        score[j, :] = -np.inf
+        if used + c["end"] - c["start"] > hi + 1e-6 or \
+                any(min(c["end"], o["end"]) > max(c["start"], o["start"]) for o in picked):
+            continue
+        picked.append(dict(c, item=int(i), rank=len(picked)))
+        used += c["end"] - c["start"]
+        score[:, i] = -np.inf
+    return picked
+
+
+def select_for(cands: list[dict], vectors: np.ndarray, p, groups: np.ndarray | None = None,
+               item_rel: np.ndarray | None = None, item_centre: np.ndarray | None = None) -> list[dict]:
     """Selection for a parsed query (vhe.query.parser.ParsedQuery) over refined, final-edge candidates: clips
     never overlap; a budget is filled to at least its minimum when the pool allows, and never past its maximum.
-    groups: file index per candidate, for the per-file cap (not applied to exhaustive queries)."""
+    groups: file index per candidate, for the per-file cap (not applied to exhaustive queries).
+    item_rel: (candidates, shot items) relevance to each item of p.shots. With two or more items, selection covers
+    distinct items before a second clip of one item; an exhaustive brief gets the best clip per item."""
+    covering = item_rel is not None and len(getattr(p, "shots", [])) >= 2 and len(item_rel) == len(cands)
+    if covering and p.exhaustive:
+        return select_per_item(cands, item_rel, p, item_centre)
+    items = np.array([c.get("item", -1) for c in cands]) if covering else None
     if p.exhaustive:  # every match: no diversity re-ordering, the budget (if any) only caps the total
         if p.weights.get("speech", 0.0) > 0:  # "every moment someone speaks": only clips that are mostly speech
             keep = [k for k, c in enumerate(cands) if c.get("speech_frac", 1.0) >= EXHAUSTIVE_MIN_SPEECH]
@@ -88,4 +138,5 @@ def select_for(cands: list[dict], vectors: np.ndarray, p, groups: np.ndarray | N
                       min_total=EXHAUSTIVE_MIN_TOTAL)
     n_max = MAX_CLIPS if p.budget is not None and not p.count_explicit else p.count
     cap = None if groups is None else per_file_cap(p.count, len(set(groups.tolist())))
-    return select(cands, vectors, p.count, max_overlap=0.0, budget_s=p.budget, n_max=n_max, groups=groups, cap=cap)
+    return select(cands, vectors, p.count, max_overlap=0.0, budget_s=p.budget, n_max=n_max, groups=groups, cap=cap,
+                  items=items)

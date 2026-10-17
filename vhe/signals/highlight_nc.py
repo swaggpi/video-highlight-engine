@@ -18,6 +18,30 @@ import numpy as np
 import torch
 
 NC_COMPONENT = "lighthouse-cg-detr-qvhighlights (CC BY-NC-SA 4.0 training data)"
+CLIP_CONTEXT = 77  # CLIP text context in tokens, start and end token included
+
+
+def _clip_tokens(text: str) -> int:
+    try:
+        from clip.clip import _tokenizer
+    except Exception:  # no CLIP package: a conservative estimate (BPE splits words and punctuation)
+        import re
+
+        return 2 * len(re.findall(r"\w+|[^\w\s]", text)) + 2
+    return len(_tokenizer.encode(text)) + 2
+
+
+def fit_clip_query(text: str, context: int = CLIP_CONTEXT) -> str:
+    """The longest whole-word prefix of `text` that fits CLIP's context. Lighthouse calls clip.tokenize without
+    truncation, which raises 'Input ... is too long for context length 77' on a long editor's brief."""
+    words = text.split()
+    if _clip_tokens(" ".join(words)) <= context:
+        return " ".join(words)
+    lo, hi = 0, len(words)  # binary search on the prefix length; token count grows with it
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        lo, hi = (mid, hi) if _clip_tokens(" ".join(words[:mid])) <= context else (lo, mid - 1)
+    return " ".join(words[:lo])
 
 
 def window_starts(duration: float, window: float, overlap: float) -> list[float]:
@@ -80,6 +104,9 @@ class NCHighlighter:
 
     def predict(self, query: str, chunks: list[dict], cache: Path, n_grid: int, grid_fps: float):
         """Return (saliency on the grid, proposed windows [(start, end, score)] in absolute seconds)."""
+        query = fit_clip_query(query)
+        if not query:
+            return np.full(n_grid, np.nan), []
         acc = np.zeros(n_grid)
         wsum = np.zeros(n_grid)
         proposals = []

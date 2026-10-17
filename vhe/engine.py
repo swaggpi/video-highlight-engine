@@ -17,8 +17,9 @@ import numpy as np
 
 from vhe.config import resolve_device
 from vhe.corpus import Corpus, open_corpus
-from vhe.query.candidates import LENGTHS, cuts_inside, generate, peak_times, speech_spans
-from vhe.query.parser import ParsedQuery, parse, parse_with_llm
+from vhe.query.candidates import LENGTHS, cuts_inside, fit_span, generate, peak_times, speech_spans
+from vhe.query.parser import ParsedQuery, parse_brief
+from vhe.query.plan import LIVE_MAX_MUTED, assign, combine, item_centre, item_scores, muted_steps, topic_scores
 from vhe.query.refine import Context, refine
 from vhe.query.score import relevance, segment_scores, smooth, timestep_signals
 from vhe.query.select import select_for
@@ -31,6 +32,7 @@ MAX_UNUSABLE = 0.2  # candidates with more unusable steps (covered, blown, blurr
 BUCKET_MIN = 5  # length buckets smaller than this are not median-centred (a singleton would become exactly 0)
 EDGE_WEIGHTS = {"relevance": 1.0, "steady": 0.8, "quality": 0.6}  # opener/closer: the shot asked for, held steady
 EDGE_POOL = 30
+ITEM_POOL = 60  # with a shot list, each item's own best candidates join the pool
 EMB_BLOCK = 1 << 16  # rows cast to float32 per matmul block
 SIGNALS = ("relevance", "quality", "energy", "steady", "speech")
 STOPWORDS = {"the", "and", "with", "for", "from", "that", "this", "der", "die", "das", "und", "mit", "ein", "eine",
@@ -77,22 +79,65 @@ class Engine:
             return self._encoder
 
     def text_vector(self, text: str) -> np.ndarray:
-        if text not in self._text_cache:
+        return self.text_vectors([text])[0]
+
+    def text_vectors(self, texts: list[str]) -> np.ndarray:
+        """SigLIP text embeddings, the uncached ones in one batch (the encoder truncates to its 64 tokens)."""
+        missing = list(dict.fromkeys(t for t in texts if t not in self._text_cache))
+        if missing:
             with MODEL_LOCK:
-                self._text_cache[text] = self.encoder.texts([text])[0]
-        return self._text_cache[text]
+                self._text_cache.update(zip(missing, self.encoder.texts(missing)))
+        return np.stack([self._text_cache[t] for t in texts])
 
     def _relevance(self, text: str, nc_saliency: np.ndarray | None = None) -> np.ndarray:
         c = self.corpus
         return relevance(self._similarity(self.text_vector(text)), c.fps, self._logit, nc_saliency, c.file_id)
 
+    def _relevances(self, texts: list[str], nc_saliency: np.ndarray | None = None) -> np.ndarray:
+        """(texts, steps) relevance per text on the absolute scale. With one text this is text_vector's path, so
+        a single-text query scores exactly as before."""
+        c = self.corpus
+        if len(texts) == 1:
+            return self._relevance(texts[0], nc_saliency)[None]
+        sims = self._similarity(self.text_vectors(texts).T)
+        return np.stack([relevance(sims[:, k], c.fps, self._logit, nc_saliency, c.file_id) for k in range(len(texts))])
+
     def _similarity(self, v: np.ndarray) -> np.ndarray:
-        """emb @ v in float32, casting one block of rows at a time instead of the whole corpus."""
+        """emb @ v in float32 (v: one vector, or (dim, k) for k texts), one block of rows at a time."""
         v = v.astype(np.float32)
-        out = np.empty(len(self._emb), np.float32)
+        out = np.empty((len(self._emb), *v.shape[1:]), np.float32)
         for a in range(0, len(out), EMB_BLOCK):
             out[a:a + EMB_BLOCK] = self._emb[a:a + EMB_BLOCK].astype(np.float32) @ v
         return out
+
+    def _plan_relevance(self, p: ParsedQuery, nc_sal: np.ndarray | None) -> tuple[np.ndarray | None, np.ndarray | None]:
+        """(relevance per step, per-item relevance (items, steps) or None). The best of the shot items (or the text),
+        minus the bounded avoid penalty. The highlight model's saliency is blended into every item alike, so the max
+        over items is the same as blending it into the max. Which item a clip serves is decided on SigLIP alone:
+        the query-wide saliency says nothing about a single item and would shift the absolute ITEM_MIN_REL scale."""
+        items = p.shots or ([p.text] if p.text else [])
+        if not items:
+            return None, None
+        rel_items = self._relevances(items, nc_sal)
+        rel_avoid = self._relevances(p.avoid) if p.avoid else None
+        if not p.shots:
+            return combine(rel_items, rel_avoid), None
+        has_nc = nc_sal is not None and np.isfinite(nc_sal).any()
+        return combine(rel_items, rel_avoid), (self._relevances(items) if has_nc else rel_items)
+
+    def _avoided(self, rel: np.ndarray, p: ParsedQuery) -> np.ndarray:
+        """Opener/closer relevance with the brief's avoid penalty too."""
+        return combine(rel[None], self._relevances(p.avoid)) if p.avoid else rel
+
+    @staticmethod
+    def _nc_query(p: ParsedQuery) -> str:
+        """The highlight model was trained on short English sentences: the raw query when it is one, the shot list
+        when there is one (an LLM's one-line summary such as "news package" names no visible content), else the
+        content text. highlight_nc fits whatever it gets into CLIP's 77 tokens."""
+        if p.shots:
+            return ", ".join(p.shots)
+        simple = not (p.avoid or p.topics) and len(p.raw.split()) <= 25
+        return p.raw if simple and p.text else p.text
 
     def _nc_scores(self, text: str) -> tuple[np.ndarray | None, list[list]]:
         """Highlight-model saliency on the corpus grid (NaN for files without it) and proposals per file."""
@@ -155,8 +200,9 @@ class Engine:
         return results[:k]
 
     # ---- highlight clips -----------------------------------------------------------------------------
-    def parse(self, query: str, llm: str | None = None, **overrides) -> ParsedQuery:
-        return parse_with_llm(query, llm, **overrides) if llm else parse(query, **overrides)
+    def parse(self, query: str, llm: str | None = "auto", **overrides) -> ParsedQuery:
+        """llm: an Ollama model, 'auto' (the default parser model when reachable) or None (rules only)."""
+        return parse_brief(query, llm, **overrides)
 
     def _candidates(self, per_step: np.ndarray, p: ParsedQuery, proposals: list[list]) -> tuple:
         """Per file, on its own timeline, then shifted: (start, end, file, source) arrays in virtual seconds."""
@@ -173,11 +219,24 @@ class Engine:
         S, E, K, src = zip(*out)
         return np.array(S), np.array(E), np.array(K), list(src)
 
-    def _unusable(self, S: np.ndarray, E: np.ndarray, K: np.ndarray) -> np.ndarray:
-        """Fraction of unusable grid steps per span."""
+    def _unusable(self, S: np.ndarray, E: np.ndarray, K: np.ndarray, bad: np.ndarray | None = None) -> np.ndarray:
+        """Fraction of unusable grid steps per span (or of the steps flagged in `bad`)."""
         i0, i1 = self.corpus.steps(S, E, K)
-        bad = np.concatenate([[0], np.cumsum(~self.corpus.usable)])
+        bad = np.concatenate([[0], np.cumsum(~self.corpus.usable if bad is None else bad)])
         return (bad[i1] - bad[i0]) / (i1 - i0)
+
+    @functools.cached_property
+    def _muted(self) -> np.ndarray:
+        return muted_steps(self.corpus.grid["loudness"], self.corpus.audio_steps)
+
+    def _gate(self, S: np.ndarray, E: np.ndarray, K: np.ndarray, p: ParsedQuery) -> np.ndarray:
+        """Candidates to keep: few unusable steps, and live sound where the brief asks for it."""
+        if not len(S):
+            return np.zeros(0, bool)
+        keep = self._unusable(S, E, K) <= MAX_UNUSABLE
+        if p.need_live_audio:
+            keep &= self._unusable(S, E, K, self._muted) <= LIVE_MAX_MUTED
+        return keep
 
     def _pool(self, sig: dict, weights: dict, cands: tuple, p: ParsedQuery, size: int) -> list[dict]:
         """Stage 1, vectorised over every candidate: segment means from prefix sums, compared within length
@@ -203,44 +262,71 @@ class Engine:
         total += -LENGTH_PRIOR * np.abs((E - S) - target) / max(target, 1.0) - CUT_PENALTY * n_cuts
         total += SPEECH_BONUS * max(0.0, weights.get("speech", 0.0)) * np.array([s == "speech" for s in src])
 
+        chosen = np.argsort(-total)[:size]
+        if sig.get("items") is not None and len(sig["items"]) > 1:
+            # A generic item ("wide of the avenue", relevant everywhere) would fill the pool by itself: also take
+            # each item's own best candidates, ranked with that item's relevance in place of the max.
+            w = weights.get("relevance", 0.0)
+            extra = []
+            for row in sig["items"]:
+                cum = np.concatenate([[0.0], np.cumsum(row)])
+                own = total + w * ((cum[i1] - cum[i0]) / (i1 - i0) - means["relevance"])
+                extra.append(np.argsort(-own)[:ITEM_POOL])
+            chosen = np.concatenate([chosen, *extra])
+            chosen = chosen[np.sort(np.unique(chosen, return_index=True)[1])]
         out = []
-        for j in np.argsort(-total)[:size]:
+        for j in chosen:
             parts = segment_scores(sig, int(i0[j]), int(i1[j]), weights)
             adj = float(total[j] + weights.get("relevance", 0.0) * (parts["relevance"] - means["relevance"][j]))
             k, off = int(K[j]), c.offsets[K[j]]
             s, e = refine(float(S[j] - off), float(E[j] - off), self._context(k), p.min_len, p.max_len)
             out.append({"start": off + s, "end": off + e, "file": k, "source": src[j], "cuts_inside": int(n_cuts[j]),
-                        "total": adj})
+                        "total": adj, "relevance": parts["relevance"]})
         if out:  # refinement moves edges by up to a second or so: gate the final spans again
-            frac = self._unusable(*(np.array([o[key] for o in out]) for key in ("start", "end", "file")))
-            out = [o for o, f in zip(out, frac) if f <= MAX_UNUSABLE]
+            out = [o for o, ok in zip(out, self._gate(*(np.array([o[key] for o in out])
+                                                        for key in ("start", "end", "file")), p)) if ok]
+        if out and sig.get("items") is not None:  # which shot item each final span serves
+            r0, r1 = c.steps(*(np.array([o[key] for o in out]) for key in ("start", "end", "file")))
+            scores = item_scores(sig["items"], r0, r1)
+            for o, row, it in zip(out, scores, assign(scores, sig["item_centre"])):
+                o["item_rel"], o["item"] = row, int(it)
         return out
 
     def _edge_clip(self, text: str, sig: dict, cands: tuple, p: ParsedQuery, taken: list[dict],
                    max_len: float) -> dict | None:
-        """Best clip for the opener/closer description: its own relevance, steady and clean, not overlapping."""
-        pool = self._pool(dict(sig, relevance=self._relevance(text)), EDGE_WEIGHTS, cands, p, EDGE_POOL)
+        """Best clip for the opener/closer description: its own relevance (minus the brief's avoid penalty),
+        steady and clean, not overlapping."""
+        edge_sig = dict(sig, relevance=self._avoided(self._relevance(text), p), items=None)
+        pool = self._pool(edge_sig, EDGE_WEIGHTS, cands, p, EDGE_POOL)
         pool = [o for o in pool if o["end"] - o["start"] <= max_len + 1e-6
                 and _disjoint(o, taken)]
         return max(pool, key=lambda o: o["total"]) if pool else None
 
     def clips(self, query: str, count: int | None = None, min_len: float | None = None,
-              max_len: float | None = None, llm: str | None = None,
+              max_len: float | None = None, llm: str | None = "auto",
               budget_s: float | tuple[float, float] | None = None) -> dict:
+        """llm: Ollama model for parsing the brief, 'auto' (default model when reachable) or None (rules)."""
         load_before = self.load_seconds
         t0 = time.perf_counter()
         c, fps = self.corpus, self.corpus.fps
         p = self.parse(query, llm, count=count, min_len=min_len, max_len=max_len, budget_s=budget_s)
-        # The highlight model was trained on full English sentences, so it gets the raw query.
-        nc_sal, proposals = self._nc_scores(p.raw if p.text else "")
-        rel = self._relevance(p.text, nc_sal) if p.text else None
+        if p.topics and not p.shots:  # "every moment the host talks about ...": transcript spans, not pictures
+            clips, n_spans, method = self._topic_clips(p, None if p.exhaustive else p.count,
+                                                       p.soundbite_len or (p.min_len, p.max_len), role=None)
+            result = {"query": p.to_dict(), "clips": clips, "candidates": n_spans, "files": len(c.members),
+                      "noncommercial": [], "unusable_dropped": 0, "topic_match": method}
+            return self._finish(result, t0, load_before)
+        nc_sal, proposals = self._nc_scores(self._nc_query(p))
+        rel, rel_items = self._plan_relevance(p, nc_sal)
         sig = timestep_signals(c.grid, fps, rel, c.audio_steps, c.file_id)
+        sig["items"] = rel_items
+        sig["item_centre"] = None if rel_items is None else item_centre(rel_items)
         per_step = sum(p.weights.get(k, 0.0) * sig[k] for k in ("relevance", "quality", "energy", "steady"))
         S, E, K, src = self._candidates(per_step, p, proposals)
         result = {"query": p.to_dict(), "clips": [], "candidates": len(S), "files": len(c.members),
                   "noncommercial": sorted({x for ix in c.members for x in ix.meta.get("noncommercial_components", [])})
                   if nc_sal is not None else []}
-        keep = self._unusable(S, E, K) <= MAX_UNUSABLE if len(S) else np.zeros(0, bool)
+        keep = self._gate(S, E, K, p)
         result["unusable_dropped"] = int(len(S) - keep.sum())
         cands = (S[keep], E[keep], K[keep], [s for s, k in zip(src, keep) if k])
         if not len(cands[0]):
@@ -267,7 +353,9 @@ class Engine:
             speech_cum = np.concatenate([[0.0], np.cumsum(sig["speech"])])
             for o, f in zip(scored, (speech_cum[r1] - speech_cum[r0]) / (r1 - r0)):
                 o["speech_frac"] = float(f)
-            body = select_for(scored, self._mean_vectors(r0, r1), body_p, groups=np.array([o["file"] for o in scored]))
+            item_rel = np.array([o["item_rel"] for o in scored]) if rel_items is not None else None
+            body = select_for(scored, self._mean_vectors(r0, r1), body_p, groups=np.array([o["file"] for o in scored]),
+                              item_rel=item_rel, item_centre=sig["item_centre"])
         else:
             body = []
         # Edit order: files in manifest order (= virtual time), then time within the file; opener first, closer last.
@@ -276,7 +364,53 @@ class Engine:
             ([("closer", edges["closer"])] if "closer" in edges else [])
         for role, o in ordered:
             result["clips"].append(self._clip(o, sig, p, role))
+        if p.topics:  # "also the best 5-8 s soundbite where the host sums up": a separate deliverable, at the end
+            bites, _, result["topic_match"] = self._topic_clips(p, 1, p.soundbite_len or (p.min_len, p.max_len),
+                                                                role="soundbite")
+            result["clips"] += bites
         return self._finish(result, t0, load_before)
+
+    def _topic_clips(self, p: ParsedQuery, n: int | None, length: tuple[float, float],
+                     role: str | None) -> tuple[list[dict], int, str]:
+        """Transcript-sentence spans (speech_spans) whose words match p.topics: (clips in edit order, number of spans
+        scored, match method). n=None returns every span above the threshold; otherwise the best n above it.
+        Picture defects do not gate speech (the speaker may be off camera); muted spans are dropped when the brief
+        asks for live sound."""
+        c = self.corpus
+        lo, hi = length
+        spans = []
+        for k, ix in enumerate(c.members):
+            dur = float(c.durations[k])
+            for s, e in speech_spans((ix.transcript or {}).get("segments", []), ix.vad, hi):
+                fitted = fit_span(s, e, lo, hi, dur)
+                if fitted is None:
+                    continue
+                s, e = refine(*fitted, self._context(k), lo, hi)
+                text = self._words_between(c.offsets[k] + s, c.offsets[k] + e)
+                if text:
+                    spans.append({"start": c.offsets[k] + s, "end": c.offsets[k] + e, "file": k, "text": text})
+        if p.need_live_audio and spans:
+            muted = self._unusable(*(np.array([o[key] for o in spans]) for key in ("start", "end", "file")),
+                                   self._muted)
+            spans = [o for o, m in zip(spans, muted) if m <= LIVE_MAX_MUTED]
+        score, best, method, thresh = topic_scores([o["text"] for o in spans], p.topics)
+        order = [j for j in np.argsort(-score, kind="stable") if score[j] >= thresh]
+        picked: list[dict] = []
+        for j in order:
+            o = spans[j]
+            if n is not None and len(picked) >= n:
+                break
+            if _disjoint(o, picked):
+                picked.append(dict(o, total=float(score[j]), source="speech", item=p.topics[int(best[j])]))
+        picked.sort(key=lambda o: o["start"])
+        sig = timestep_signals(c.grid, c.fps, None, c.audio_steps, c.file_id)
+        out = []
+        for o in picked:
+            clip = self._clip(o, sig, p, role)
+            clip["score"] = clip["rank_score"] = round(o["total"], 3)
+            clip["reason"] = f"talks about '{o['item']}' ({method} {o['total']:.2f})"
+            out.append(clip)
+        return out, len(spans), method
 
     def _clip(self, o: dict, sig: dict, p: ParsedQuery, role: str | None) -> dict:
         c = self.corpus
@@ -284,15 +418,21 @@ class Engine:
         j0, j1 = (int(x) for x in c.steps(s, e, k))
         parts = segment_scores(sig, j0, j1, p.weights)
         labels = self._labels(j0, j1, parts)
+        item = o.get("item")
+        if isinstance(item, (int, np.integer)):  # index into p.shots; -1: serves no item
+            item = p.shots[int(item)] if 0 <= int(item) < len(p.shots) else None
         return self._hit(k, s, e) | {
             "duration": round(e - s, 3), "rank_score": round(o["total"], 3), "score": round(parts["total"], 3),
             "relevance": round(parts["relevance"], 3), "quality": round(parts["quality"], 3),
             "energy": round(parts["energy"], 3), "labels": labels, "source": o["source"], "role": role,
-            "reason": self._reason(parts, p, labels, role, o.get("text")), "transcript": self._words_between(s, e)}
+            "item": item, "reason": self._reason(parts, p, labels, role, o.get("text"), item),
+            "transcript": self._words_between(s, e)}
 
     @staticmethod
-    def _reason(parts: dict, p: ParsedQuery, labels: list[str], role: str | None, text: str | None) -> str:
-        names = {"relevance": f"matches '{p.text}'", "quality": "clean footage", "steady": "steady camera",
+    def _reason(parts: dict, p: ParsedQuery, labels: list[str], role: str | None, text: str | None,
+                item: str | None = None) -> str:
+        what = f"'{item}'" if item else "the shot list" if p.shots else f"'{p.text}'"
+        names = {"relevance": f"matches {what}", "quality": "clean footage", "steady": "steady camera",
                  "energy": "high energy" if p.weights.get("energy", 0.0) >= 0 else "calm", "speech": "speech"}
         contrib = sorted(((p.weights.get(k, 0.0) * parts[k], k) for k in names), reverse=True)
         bits = [f"{role}: {text}"] if role else []
