@@ -41,7 +41,23 @@ BLOWN_FRAC = 0.5  # fraction of pixels >= 250 above this: blown out
 # noise sigma >= 6; edge width flagged 26% of dark frames; an FFT high-band ratio flagged more textureless crops.
 BLUR_RATIO = 10.0
 BLUR_SIDE = 120  # px short side the re-blur test runs at (resolution-independent; averages away JPEG/sensor noise)
-SHAKY = 0.3  # camera jitter (motion.py shake, frame-widths per second) above this: very shaky
+# Very shaky: camera jitter (motion.py shake: RMS over 1 s of the camera velocity minus its 0.5 s mean, frame-widths
+# per second) above SHAKY. Calibrated 2026-10-17 on 71 visually labelled 1 s strips (festival-commons + irl-event:
+# 13 shaky, 37 steady / smooth pan / subject-only motion / covered lens, 21 whip-pan or ambiguous handheld). Value at
+# the labelled step: 0.5 -> precision 1.00, recall 0.85 (0.4 -> 0.92 / 0.85); max within +-0.5 s: 0.92 / 0.92. The
+# old cv2.phaseCorrelate signal at the old 0.3 had precision 0.35 (a spinning umbrella read 7.3, a covered lens 15.8).
+SHAKY = 0.5
+# Framing defects from zero-shot SigLIP2 margins (tags.defect_scores: logsumexp of defect prompts minus logsumexp of
+# scene prompts, in logits). Calibrated 2026-10-17 on 169 labelled analysis frames (same two sets; candidates from
+# the top of several prompt scores, known bad moments, and 60 random steps).
+# Obstructed (hard): lens covered by fabric/hand, or a near object (a back, a flag, a bag) filling the frame. At 0.5:
+# precision 0.77, recall 0.85 (17/20) against normal/ground/sky frames; 2/97 normal frames flagged; 14/20 partial
+# blocks (a back or head over ~40% of the frame) flagged too. 1.4-1.8% of all festival steps, 0.4-0.6% of irl-event.
+OBSTRUCTED_MARGIN = 0.5
+# Bad framing (soft: its reason bit is set and quality is penalised, but the step stays usable, since a sky shot can
+# be intended): camera at the ground or pointed straight up. At 1.0: precision 0.77, recall 0.84 (27/32); the false
+# positives are mostly whip-pan blur.
+BAD_FRAMING_MARGIN = 1.0
 
 
 @dataclass

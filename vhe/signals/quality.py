@@ -8,10 +8,22 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from vhe.config import BLOWN_FRAC, BLUR_RATIO, BLUR_SIDE, COVERED_LUMA, SHAKY, UNIFORM_STD
+from vhe.config import (
+    BAD_FRAMING_MARGIN,
+    BLOWN_FRAC,
+    BLUR_RATIO,
+    BLUR_SIDE,
+    COVERED_LUMA,
+    OBSTRUCTED_MARGIN,
+    SHAKY,
+    UNIFORM_STD,
+)
 
-# Bit i of grid["unusable"] set = reason REASONS[i] applies at that step.
-REASONS = ("covered", "uniform", "blown_out", "blurry", "shaky")
+# Bit i of grid["unusable"] set = reason REASONS[i] applies at that step. New reasons are appended, so older indexes
+# decode the same. SOFT reasons are recorded but do not make a step unusable (score.py penalises quality instead).
+REASONS = ("covered", "uniform", "blown_out", "blurry", "shaky", "obstructed", "bad_framing")
+SOFT = ("bad_framing",)
+SOFT_BITS = sum(1 << REASONS.index(r) for r in SOFT)
 
 
 def blur_ratio(g: np.ndarray, side: int = BLUR_SIDE) -> float:
@@ -49,14 +61,21 @@ def frame_quality(paths: list[Path]) -> dict[str, np.ndarray]:
 
 
 def usable_mask(luma: np.ndarray, contrast: np.ndarray, blown: np.ndarray, ratio: np.ndarray,
-                shake: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """(usable bool[n], unusable reason bits uint8[n]) from absolute thresholds in config.py."""
+                shake: np.ndarray, obstruction: np.ndarray | None = None,
+                framing: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """(usable bool[n], reason bits uint8[n]) from absolute thresholds in config.py. obstruction / framing: the
+    SigLIP margins from tags.defect_scores (None = not tested). Usable = no hard reason (SOFT ones are allowed)."""
+    n = len(luma)
+
+    def above(x: np.ndarray | None, thr: float) -> np.ndarray:  # NaN / missing: not flagged
+        return np.zeros(n, dtype=bool) if x is None else np.nan_to_num(np.asarray(x, dtype=float), nan=-np.inf) > thr
+
     tests = (luma < COVERED_LUMA, contrast < UNIFORM_STD, blown > BLOWN_FRAC, ratio < BLUR_RATIO,
-             np.nan_to_num(shake) > SHAKY)
-    bits = np.zeros(len(luma), dtype=np.uint8)
+             above(shake, SHAKY), above(obstruction, OBSTRUCTED_MARGIN), above(framing, BAD_FRAMING_MARGIN))
+    bits = np.zeros(n, dtype=np.uint8)
     for i, t in enumerate(tests):
         bits |= np.asarray(t, dtype=np.uint8) << i
-    return bits == 0, bits
+    return (bits & ~np.uint8(SOFT_BITS)) == 0, bits
 
 
 def reason_names(bits: int) -> list[str]:

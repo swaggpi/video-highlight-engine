@@ -11,10 +11,12 @@ import numpy as np
 
 from vhe.config import BLOWN_FRAC
 from vhe.signals import robust_z, smooth  # noqa: F401  (re-exported: engine and tests import them from here)
+from vhe.signals.quality import REASONS
 
 # log-odds -> relevance: odds of e^-8 (p ~ 3e-4) is 0, every REL_WIDTH nats one unit, clipped to +-3 like the
 # z-scored signals. SigLIP2 logits: unrelated frames ~ -15..-10, partial matches ~ -6..-2, clear matches > 0.
 REL_MID, REL_WIDTH = -8.0, 2.5
+FRAMING_PENALTY = 1.0  # quality units off a step with the soft bad_framing reason (detail is 0.6 per z unit)
 
 
 def per_file(fn, x: np.ndarray, file_id: np.ndarray | None) -> np.ndarray:
@@ -43,8 +45,9 @@ def relevance(sim: np.ndarray, fps: float, logit: tuple[float, float] | None = N
 
 
 def _quality(grid: dict, usable: np.ndarray) -> np.ndarray:
-    """Technical quality from defects only: detail (content-invariant re-blur ratio), blown highlights, shake.
-    Mean brightness is not used: a dark concert is not bad footage. Unusable steps get the floor."""
+    """Technical quality from defects only: detail (content-invariant re-blur ratio), blown highlights, shake, and
+    the soft bad-framing reason (camera at the ground or straight up). Mean brightness is not used: a dark concert is
+    not bad footage. Unusable steps get the floor."""
     if "blur_ratio" in grid:
         r = np.asarray(grid["blur_ratio"], dtype=float)
         detail = robust_z(np.log(np.where(np.isfinite(r) & (r > 0), r, np.nan)))
@@ -52,7 +55,9 @@ def _quality(grid: dict, usable: np.ndarray) -> np.ndarray:
         detail = robust_z(grid["sharpness"])
     blown = np.clip(np.nan_to_num(np.asarray(grid.get("blown", 0.0), dtype=float)) / BLOWN_FRAC, 0, 1)
     shaky = np.clip(robust_z(grid["shake"]), 0, None) / 3
-    q = 0.6 * detail - 1.5 * blown - 0.6 * shaky
+    bits = np.asarray(grid.get("unusable", 0), dtype=np.uint8)
+    framing = (bits & np.uint8(1 << REASONS.index("bad_framing"))) > 0
+    q = 0.6 * detail - 1.5 * blown - 0.6 * shaky - FRAMING_PENALTY * framing
     return np.where(usable, np.clip(q, -3, 3), -3.0)
 
 

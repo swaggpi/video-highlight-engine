@@ -9,7 +9,8 @@ from pathlib import Path
 
 import numpy as np
 
-INDEX_VERSION = 1
+# 2: shake from tile-robust numpy phase correlation; 'obstruction'/'framing' scores and their usable-mask reasons.
+INDEX_VERSION = 2
 
 
 def usable_mask(grid: dict, n: int) -> np.ndarray:

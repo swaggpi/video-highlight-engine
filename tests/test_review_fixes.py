@@ -43,7 +43,7 @@ def test_index_version_bump_triggers_reindex(tmp_path, monkeypatch):
     same = FakeIndexer()
     index_project(tmp_path, cfg, indexer=same)
     assert same.calls == []
-    monkeypatch.setattr(project, "INDEX_VERSION", 2)
+    monkeypatch.setattr(project, "INDEX_VERSION", project.INDEX_VERSION + 1)
     bumped = FakeIndexer()
     index_project(tmp_path, cfg, indexer=bumped)
     assert [c[0] for c in bumped.calls] == ["a.mp4"]

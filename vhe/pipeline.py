@@ -17,7 +17,7 @@ from vhe.signals.frames import Encoder
 from vhe.signals.motion import motion_signals
 from vhe.signals.quality import frame_quality, usable_mask
 from vhe.signals.shots import detect_cuts, frame_diffs
-from vhe.signals.tags import LABELS, label_texts, tag_probs
+from vhe.signals.tags import LABELS, defect_scores, defect_texts, label_texts, tag_probs
 from vhe.timing import Counter, Timings
 
 
@@ -97,11 +97,13 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
     with timings.stage("tags"):
         scale, bias = encoder.logit_params()
         grid["tags"] = tag_probs(emb, encoder.texts(label_texts()), scale, bias)
+        grid.update(defect_scores(emb, encoder.texts(defect_texts()), scale, bias))
     say("frame quality")
     with timings.stage("quality", items=len(paths)):
         grid.update(frame_quality(paths))
     grid["usable"], grid["unusable"] = usable_mask(grid["luma"], grid["contrast"], grid["blown"],
-                                                   grid["blur_ratio"], grid["shake"])
+                                                   grid["blur_ratio"], grid["shake"], grid["obstruction"],
+                                                   grid["framing"])
     grid["emb"] = emb
     cps = change_points(emb, fps, cuts)
 
