@@ -4,21 +4,7 @@ from __future__ import annotations
 
 import numpy as np
 
-
-def robust_z(x: np.ndarray, clip: float = 3.0) -> np.ndarray:
-    x = np.asarray(x, dtype=np.float64)
-    finite = np.isfinite(x)
-    if not finite.any():
-        return np.zeros_like(x)
-    med = np.median(x[finite])
-    mad = np.median(np.abs(x[finite] - med)) * 1.4826
-    if mad < 1e-9:
-        mad = np.std(x[finite])
-    if mad < 1e-9:
-        return np.zeros_like(x)
-    z = (x - med) / mad
-    z[~finite] = 0.0
-    return np.clip(z, -clip, clip)
+from vhe.signals import robust_z  # noqa: F401  (re-exported: engine and tests import it from here)
 
 
 def smooth(x: np.ndarray, width: int) -> np.ndarray:

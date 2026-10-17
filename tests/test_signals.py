@@ -1,6 +1,6 @@
 import numpy as np
 
-from vhe.pipeline import change_points
+from vhe.signals.changes import change_points
 from vhe.signals import fill_nan, to_grid
 from vhe.signals.highlight_nc import window_starts
 from vhe.signals.shots import detect_cuts, shots_from_cuts

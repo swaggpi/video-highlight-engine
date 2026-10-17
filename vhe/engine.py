@@ -10,16 +10,16 @@ import numpy as np
 
 from vhe.config import resolve_device
 from vhe.index.store import Index
-from vhe.query.candidates import LENGTHS, cuts_inside, generate, peak_times
+from vhe.query.candidates import LENGTHS, cuts_inside, generate, peak_times, speech_spans
 from vhe.query.parser import ParsedQuery, parse, parse_with_llm
 from vhe.query.refine import Context, refine
 from vhe.query.score import robust_z, segment_scores, smooth, timestep_signals
-from vhe.query.select import select
+from vhe.query.select import select_for
 
 CUT_PENALTY = 0.15
 LENGTH_PRIOR = 0.15
 TAG_MIN_PROB = 0.3
-EXTRA_PICKS = 3  # spares in case refinement makes two picks collide
+SPEECH_BONUS = 0.3  # utterance-aligned candidates beat windows that start mid-sentence, scaled by speech weight
 STOPWORDS = {"the", "and", "with", "for", "from", "that", "this", "der", "die", "das", "und", "mit", "ein", "eine",
              "von", "auf", "für", "den", "dem", "des", "a", "an", "of", "on", "in", "at", "to", "is"}
 
@@ -101,19 +101,20 @@ class Engine:
         return parse_with_llm(query, llm, **overrides) if llm else parse(query, **overrides)
 
     def clips(self, query: str, count: int | None = None, min_len: float | None = None,
-              max_len: float | None = None, llm: str | None = None, budget_s: float | None = None) -> dict:
+              max_len: float | None = None, llm: str | None = None,
+              budget_s: float | tuple[float, float] | None = None) -> dict:
         load_before = self.load_seconds
         t0 = time.perf_counter()
         idx, fps, grid = self.index, self.index.fps, self.index.grid
-        p = self.parse(query, llm, count=count, min_len=min_len, max_len=max_len)
-        budget = budget_s if budget_s is not None else p.budget_s
+        p = self.parse(query, llm, count=count, min_len=min_len, max_len=max_len, budget_s=budget_s)
         text_vec = self.text_vector(p.text) if p.text else None
         # The highlight model was trained on full English sentences, so it gets the raw query.
         nc_sal, proposals = self._nc_scores(p.raw if p.text else "")
         sig = timestep_signals(grid, fps, text_vec, nc_sal, has_audio=idx.has_audio)
         per_step = sum(p.weights.get(k, 0.0) * sig[k] for k in ("relevance", "quality", "energy", "steady"))
+        speech = speech_spans((idx.transcript or {}).get("segments", []), idx.vad, p.max_len)
         cands = generate(idx.duration, idx.cuts, idx.change_points, p.min_len, p.max_len,
-                         peaks=peak_times(smooth(per_step, int(fps)), fps), proposals=proposals)
+                         peaks=peak_times(smooth(per_step, int(fps)), fps), proposals=proposals, speech=speech)
         result = {"query": p.to_dict(), "clips": [], "candidates": len(cands),
                   "noncommercial": idx.meta.get("noncommercial_components", []) if nc_sal is not None else []}
         if not cands:
@@ -139,25 +140,25 @@ class Engine:
         cut_arr = np.asarray(idx.cuts)
         n_cuts = np.array([cuts_inside(s, e, cut_arr) for s, e in zip(S, E)])
         total += -LENGTH_PRIOR * np.abs((E - S) - target) / max(target, 1.0) - CUT_PENALTY * n_cuts
+        total += SPEECH_BONUS * max(0.0, p.weights.get("speech", 0.0)) * np.array([c[2] == "speech" for c in cands])
 
-        # Stage 2 on a pool: exact relevance (mean of the best 60% of steps), MMR, refinement.
+        # Stage 2 on a pool: exact relevance (mean of the best 60% of steps), then refinement of every pooled
+        # candidate, so selection (budget, overlap, MMR) runs on the final clip edges.
         pool = np.argsort(-total)[:max(400, 40 * p.count)]
+        ctx = Context(idx.duration, idx.cuts, idx.vad, idx.words, grid.get("shake"), fps)
         scored = []
         for j in pool:
             parts = segment_scores(sig, int(i0[j]), int(i1[j]), p.weights)
             adj = float(total[j] + p.weights.get("relevance", 0.0) * (parts["relevance"] - means["relevance"][j]))
-            scored.append({"start": float(S[j]), "end": float(E[j]), "source": cands[j][2],
-                           "cuts_inside": int(n_cuts[j]), "total": adj})
-        chosen = select(scored, self._mean_vectors(i0[pool], i1[pool]), p.count + EXTRA_PICKS, budget_s=budget)
-
-        ctx = Context(idx.duration, idx.cuts, idx.vad, idx.words, grid.get("shake"), fps)
-        kept: list[tuple[float, float]] = []
-        for c in chosen:
-            s, e = refine(c["start"], c["end"], ctx, p.min_len, p.max_len)
-            s, e = self._avoid_overlap(s, e, kept, p.min_len)
-            if s is None:
-                continue
-            kept.append((s, e))
+            s, e = refine(float(S[j]), float(E[j]), ctx, p.min_len, p.max_len)
+            scored.append({"start": s, "end": e, "source": cands[j][2], "cuts_inside": int(n_cuts[j]), "total": adj})
+        r0 = np.clip(np.floor(np.array([c["start"] for c in scored]) * fps).astype(int), 0, idx.n - 1)
+        r1 = np.clip(np.maximum(np.ceil(np.array([c["end"] for c in scored]) * fps).astype(int), r0 + 1), 1, idx.n)
+        speech_cum = np.concatenate([[0.0], np.cumsum(sig["speech"])])
+        for c, f in zip(scored, (speech_cum[r1] - speech_cum[r0]) / (r1 - r0)):
+            c["speech_frac"] = float(f)
+        for c in select_for(scored, self._mean_vectors(r0, r1), p):
+            s, e = c["start"], c["end"]
             j0, j1 = int(np.floor(s * fps)), max(min(int(np.ceil(e * fps)), idx.n), int(np.floor(s * fps)) + 1)
             parts = segment_scores(sig, j0, j1, p.weights)
             result["clips"].append({
@@ -165,8 +166,6 @@ class Engine:
                 "relevance": round(parts["relevance"], 3), "quality": round(parts["quality"], 3),
                 "energy": round(parts["energy"], 3), "labels": self._labels(j0, j1, parts),
                 "source": c["source"], "transcript": self._words_between(s, e)})
-            if len(result["clips"]) >= p.count:
-                break
         return self._finish(result, t0, load_before)
 
     def _finish(self, result: dict, t0: float, load_before: float) -> dict:
@@ -174,18 +173,6 @@ class Engine:
         result["load_seconds"] = round(load, 3)
         result["seconds"] = round(time.perf_counter() - t0 - load, 3)  # ranking time, models already loaded
         return result
-
-    @staticmethod
-    def _avoid_overlap(s: float, e: float, kept: list[tuple[float, float]], min_len: float):
-        for ks, ke in kept:
-            if s < ke and e > ks:
-                if ks <= s:  # overlaps the end of a kept clip: start after it
-                    s = ke
-                else:  # overlaps the start of a kept clip: end before it
-                    e = ks
-            if e - s < min_len:
-                return None, None
-        return s, e
 
     def _labels(self, i0: int, i1: int, parts: dict) -> list[str]:
         probs = self.index.grid["tags"][i0:max(i1, i0 + 1)].astype(np.float32).mean(0)

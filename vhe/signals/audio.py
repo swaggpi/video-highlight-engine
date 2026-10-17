@@ -45,16 +45,18 @@ def audio_signals(y: np.ndarray, n_grid: int, grid_fps: float, chunk_s: float = 
 
 
 def voice_activity(y: np.ndarray) -> list[tuple[float, float]]:
-    from silero_vad import get_speech_timestamps, load_silero_vad
+    from silero_vad import get_speech_timestamps
     import torch
 
-    model = load_silero_vad()
-    ts = get_speech_timestamps(torch.from_numpy(y), model, sampling_rate=SR, return_seconds=True)
+    from vhe import models
+
+    ts = get_speech_timestamps(torch.from_numpy(y), models.silero_vad(), sampling_rate=SR, return_seconds=True)
     return [(float(s["start"]), float(s["end"])) for s in ts]
 
 
 def speech_mask(segments: list[tuple[float, float]], n_grid: int, grid_fps: float) -> np.ndarray:
+    """1 from the grid step at or before each segment start to the last step before its end."""
     mask = np.zeros(n_grid, dtype=np.float32)
     for s, e in segments:
-        mask[int(np.floor(s * grid_fps)):int(np.ceil(e * grid_fps)) + 1] = 1.0
+        mask[int(np.floor(s * grid_fps)):int(np.ceil(e * grid_fps))] = 1.0
     return mask[:n_grid]

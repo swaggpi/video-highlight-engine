@@ -35,17 +35,19 @@ def window_starts(duration: float, window: float, overlap: float) -> list[float]
 
 class NCHighlighter:
     def __init__(self, ckpt: str, device: str) -> None:
-        from lighthouse.models import CGDETRPredictor
+        from vhe import models
 
         if not Path(ckpt).exists():
             raise FileNotFoundError(f"missing checkpoint {ckpt}; see README 'Non-commercial highlight model'")
         self.device = "cuda" if device == "cuda" else "cpu"  # Lighthouse does not support MPS
-        self.predictor = CGDETRPredictor(ckpt, device=self.device, feature_name="clip")
+        self.predictor = models.cg_detr(ckpt, self.device)
         self.clip_len = float(self.predictor._clip_len)
         self._feats: dict[str, dict] = {}
 
-    def encode(self, video: Path, duration: float, window: float, overlap: float, cache: Path,
-               progress=None) -> list[dict]:
+    def encode(self, frames_dir: Path, grid_fps: float, duration: float, window: float, overlap: float,
+               cache: Path, progress=None) -> list[dict]:
+        """Features per window from the cached analysis frames (frames/%06d.jpg at grid_fps), not a second decode
+        of the source."""
         cache.mkdir(parents=True, exist_ok=True)
         window = min(window, 74 * self.clip_len)  # positional embedding limit: 75 clips
         chunks = []
@@ -58,10 +60,13 @@ class NCHighlighter:
                 if length < 2 * self.clip_len:
                     continue
                 part = Path(tmp) / f"part_{k}.avi"
-                # Lighthouse samples one frame per clip_len seconds at 224 px, so a 1 fps proxy is enough.
-                # MJPEG is in every ffmpeg build and cheap to write at 1 fps.
-                subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{start}", "-i", str(video), "-t", f"{length}",
-                                "-an", "-vf", "fps=1,scale=-2:224", "-c:v", "mjpeg", "-q:v", "3", str(part)],
+                # Lighthouse samples one frame per clip_len seconds at 224 px, so a 1 fps proxy is enough: every
+                # third cached frame (round=up: second k gets the frame at k s, not the one after). MJPEG is in
+                # every ffmpeg build and cheap to write at 1 fps.
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-framerate", f"{grid_fps}",
+                                "-start_number", str(int(round(start * grid_fps)) + 1),
+                                "-i", str(frames_dir / "%06d.jpg"), "-t", f"{length}",
+                                "-vf", "fps=1:round=up,scale=-2:224", "-c:v", "mjpeg", "-q:v", "3", str(part)],
                                check=True)
                 feats = self.predictor.encode_video(str(part))
                 path = cache / f"chunk_{k:03d}.pt"

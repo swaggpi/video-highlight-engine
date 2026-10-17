@@ -35,6 +35,8 @@ On Windows the venv paths are `.venv\Scripts\python.exe` and `.venv\Scripts\vhe.
 
 ```bash
 vhe index video.mp4                 # writes video.mp4.vhe/ next to the video, prints per-stage timings
+vhe index footage/                  # a folder of raw footage: every video (recursive) into footage/.vhe/,
+                                    # incremental (only new/changed files), one speech language (--lang or majority)
 vhe search video.mp4.vhe "dog on the beach"
 vhe clips video.mp4.vhe "3 short high-energy scenes" --export out/
 vhe clips video.mp4.vhe "ruhige Landschaft ohne Sprache" --llm qwen3.5:9b   # optional LLM query parsing via Ollama
@@ -67,9 +69,9 @@ query (per request)
 
 ```
 vhe/
-  config.py, timing.py, pipeline.py, engine.py, cli.py
+  config.py, timing.py, models.py, pipeline.py, project.py, engine.py, cli.py
   ingest/decode.py
-  signals/{shots,motion,audio,speech,frames,tags,quality,highlight_nc}.py
+  signals/{shots,motion,audio,speech,frames,tags,quality,changes,highlight_nc}.py
   index/store.py
   query/{parser,candidates,score,select,refine}.py
   export/clips.py

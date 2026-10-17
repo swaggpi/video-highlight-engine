@@ -16,6 +16,22 @@ def to_grid(times: np.ndarray, values: np.ndarray, n: int, fps: float) -> np.nda
     return fill_nan(out)
 
 
+def robust_z(x: np.ndarray, clip: float = 3.0) -> np.ndarray:
+    x = np.asarray(x, dtype=np.float64)
+    finite = np.isfinite(x)
+    if not finite.any():
+        return np.zeros_like(x)
+    med = np.median(x[finite])
+    mad = np.median(np.abs(x[finite] - med)) * 1.4826
+    if mad < 1e-9:
+        mad = np.std(x[finite])
+    if mad < 1e-9:
+        return np.zeros_like(x)
+    z = (x - med) / mad
+    z[~finite] = 0.0
+    return np.clip(z, -clip, clip)
+
+
 def fill_nan(x: np.ndarray) -> np.ndarray:
     x = np.asarray(x, dtype=float).copy()
     bad = ~np.isfinite(x)

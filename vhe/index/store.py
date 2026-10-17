@@ -17,10 +17,18 @@ def default_index_dir(video: Path) -> Path:
 
 
 def save_index(root: Path, meta: dict, grid: dict[str, np.ndarray], transcript: dict | None) -> None:
+    """Also records the source's size and mtime_ns, so callers can tell whether the index is current."""
     root.mkdir(parents=True, exist_ok=True)
     np.savez(root / "grid.npz", **grid)
+    speech = root / "speech.json"
     if transcript is not None:
-        (root / "speech.json").write_text(json.dumps(transcript, ensure_ascii=False))
+        speech.write_text(json.dumps(transcript, ensure_ascii=False))
+    else:
+        speech.unlink(missing_ok=True)  # a transcript from an earlier run would no longer match
+    src = Path(meta["video"]) if meta.get("video") else None
+    if src and src.exists():
+        st = src.stat()
+        meta = {**meta, "source_size": st.st_size, "source_mtime_ns": st.st_mtime_ns}
     (root / "meta.json").write_text(json.dumps({"version": INDEX_VERSION, **meta}, indent=1, ensure_ascii=False))
 
 
@@ -71,4 +79,19 @@ class Index:
 
     @property
     def has_audio(self) -> bool:
-        return bool(self.grid.get("has_audio", self.meta.get("has_audio", True)))
+        # Indexes before the project format also kept a copy in grid.npz.
+        return bool(self.meta.get("has_audio", self.grid.get("has_audio", True)))
+
+    @property
+    def usable(self) -> np.ndarray:
+        """bool per grid step: no absolute defect (signals/quality.usable_mask). All True for older indexes."""
+        return self.grid["usable"].astype(bool) if "usable" in self.grid else np.ones(self.n, dtype=bool)
+
+    @property
+    def unusable_reasons(self) -> np.ndarray:
+        """uint8 bits per grid step; bit i = signals.quality.REASONS[i] (decode with quality.reason_names)."""
+        return self.grid["unusable"] if "unusable" in self.grid else np.zeros(self.n, dtype=np.uint8)
+
+    @property
+    def recorded_at(self) -> str | None:
+        return self.meta.get("recorded_at")

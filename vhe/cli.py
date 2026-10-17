@@ -20,9 +20,26 @@ def cmd_index(a: argparse.Namespace) -> None:
     cfg = Config(device=a.device, use_nc_highlight=not a.no_nc, asr_model=a.asr, asr_language=a.lang,
                  encoder=a.encoder, frame_height=a.frame_height, hwaccel=a.hwaccel)
     t0 = time.perf_counter()
-    # flush: stdout is block-buffered when redirected to a log file
-    out = build_index(Path(a.video), Path(a.out) if a.out else None, cfg, keep_cache=a.keep_cache,
-                      progress=lambda m: print(f"  [{hms(time.perf_counter() - t0)}] {m}", flush=True))
+
+    def say(m: str) -> None:
+        print(f"  [{hms(time.perf_counter() - t0)}] {m}", flush=True)  # flush: block-buffered when redirected
+
+    if Path(a.video).is_dir():
+        if a.out:
+            raise SystemExit("--out applies to single files; a folder is indexed into <DIR>/.vhe/")
+        from vhe.project import index_project
+
+        manifest = index_project(Path(a.video), cfg, progress=say, keep_cache=a.keep_cache)
+        for e in manifest["files"]:
+            extra = (f"  usable {100 * e['usable_fraction']:.0f}%" if e.get("usable_fraction") is not None else "")
+            extra += f"  {e['language']}" if e.get("language") else ""
+            extra += f"  {e['error']}" if e.get("error") else ""
+            print(f"{e['status']:<10}{e['rel_path']}  {e.get('recorded_at') or '-'}{extra}")
+        counts = {s: sum(e["status"] == s for e in manifest["files"]) for s in ("ok", "too_short", "failed")}
+        print(f"project: {Path(a.video) / '.vhe'}  {counts}  language {manifest['language'] or '-'}  "
+              f"{hms(time.perf_counter() - t0)}")
+        return
+    out = build_index(Path(a.video), Path(a.out) if a.out else None, cfg, keep_cache=a.keep_cache, progress=say)
     meta = json.loads((out / "meta.json").read_text())
     print(f"index: {out}")
     print(format_report(meta["timings"], meta["duration"]))
@@ -81,8 +98,8 @@ def main(argv: list[str] | None = None) -> None:
     ap = argparse.ArgumentParser(prog="vhe", description="Local video highlight and search engine")
     sub = ap.add_subparsers(required=True)
 
-    p = sub.add_parser("index", help="index a video once")
-    p.add_argument("video")
+    p = sub.add_parser("index", help="index a video, or a folder of footage (incremental)")
+    p.add_argument("video", help="video file, or a folder indexed into <DIR>/.vhe/")
     p.add_argument("--out")
     p.add_argument("--no-nc", action="store_true", help="skip the non-commercial highlight model")
     p.add_argument("--asr", default="small", help="faster-whisper size, or 'none'")
