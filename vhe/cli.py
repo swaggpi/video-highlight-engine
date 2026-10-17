@@ -47,40 +47,68 @@ def cmd_index(a: argparse.Namespace) -> None:
         print("NON-COMMERCIAL components used:", ", ".join(meta["noncommercial_components"]))
 
 
+def _budget(v: str | None) -> float | tuple[float, float] | None:
+    """--budget 75 or --budget 60-90 (seconds, all clips together)."""
+    if not v:
+        return None
+    lo, _, hi = v.replace("–", "-").partition("-")
+    return (float(lo), float(hi)) if hi else float(lo)
+
+
+def edit_json(res: dict) -> dict:
+    """The edit list in edit order; start/end are seconds in each clip's own file."""
+    return {"query": res["query"]["raw"], "parsed": res["query"],
+            "clips": [{"file": c["file"], "start": c["file_start"], "end": c["file_end"], "duration": c["duration"],
+                       "score": c["score"], "reason": c["reason"], "source": c["source"]} for c in res["clips"]]}
+
+
 def cmd_search(a: argparse.Namespace) -> None:
     from vhe.engine import Engine
 
-    for r in Engine(Path(a.index), a.device).search(a.text, k=a.k):
+    for r in Engine.open(Path(a.path), a.device).search(a.text, k=a.k):
         extra = f"  \"{r['text']}\"" if "text" in r else ""
-        print(f"{_fmt(r['start'])}-{_fmt(r['end'])}  {r['score']:.3f}  {r['source']}{extra}")
+        print(f"{r['file']}  {_fmt(r['file_start'])}-{_fmt(r['file_end'])}  {r['score']:+.3f}  {r['source']}{extra}")
 
 
 def cmd_clips(a: argparse.Namespace) -> None:
     from vhe.engine import Engine
 
-    eng = Engine(Path(a.index), a.device, use_nc=not a.no_nc)
-    res = eng.clips(a.query, count=a.n, min_len=a.min_len, max_len=a.max_len, llm=a.llm, budget_s=a.budget)
+    eng = Engine.open(Path(a.path), a.device, use_nc=not a.no_nc)
+    res = eng.clips(a.query, count=a.count, min_len=a.min_len, max_len=a.max_len, llm=a.llm, budget_s=_budget(a.budget))
     q = res["query"]
-    print(f"parsed: text={q['text']!r} mood={q['mood']} n={q['count']} len={q['min_len']:.0f}-{q['max_len']:.0f}s "
-          f"weights={q['weights']}  ({res.get('candidates', 0)} candidates, ranking {res['seconds']:.2f}s, "
-          f"model load {res['load_seconds']:.1f}s)")
-    for c in res["clips"]:
-        print(f"{_fmt(c['start'])}-{_fmt(c['end'])}  score {c['score']:+.2f}  rel {c['relevance']:+.2f}  "
-              f"qual {c['quality']:+.2f}  energy {c['energy']:+.2f}  {', '.join(c['labels'])}")
+    budget = f" budget={q['budget'][0]:.0f}-{q['budget'][1]:.0f}s" if q.get("budget") else ""
+    edges = "".join(f" {k}={q[k]!r}" for k in ("opener", "closer") if q.get(k))
+    print(f"parsed: text={q['text']!r} mood={q['mood']} n={q['count']} len={q['min_len']:.0f}-{q['max_len']:.0f}s"
+          f"{budget}{edges} weights={q['weights']}")
+    print(f"{res['files']} files, {res.get('candidates', 0)} candidates ({res.get('unusable_dropped', 0)} unusable), "
+          f"ranking {res['seconds']:.2f}s, model load {res['load_seconds']:.1f}s")
+    for i, c in enumerate(res["clips"], 1):
+        said = f'  "{c["transcript"]}"' if c["transcript"] else ""
+        print(f"{i:2d}. {c['file']}  {_fmt(c['file_start'])}-{_fmt(c['file_end'])} ({c['duration']:.1f}s)  "
+              f"score {c['score']:+.2f}  {c['reason']}{said}")
+    print(f"total {sum(c['duration'] for c in res['clips']):.1f}s in {len(res['clips'])} clips")
     if res.get("noncommercial"):
         print("NON-COMMERCIAL components used:", ", ".join(res["noncommercial"]))
+    if a.json:
+        Path(a.json).write_text(json.dumps(edit_json(res), indent=1, ensure_ascii=False))
     if a.export:
         from vhe.export.clips import export_clips
 
-        paths = export_clips(eng.index.video, res["clips"], Path(a.export))
-        print(f"exported {len(paths)} clips to {a.export}")
-    if a.json:
-        Path(a.json).write_text(json.dumps(res, indent=1, ensure_ascii=False))
+        out = export_clips(res["clips"], Path(a.export), eng.corpus.source_map,
+                           with_rough_cut=a.rough_cut)
+        print(f"exported {len(out['clips'])} clips, {out['csv'].name}, {out['edl'].name}"
+              f"{', ' + out['rough_cut'].name if out['rough_cut'] else ''} to {a.export}")
 
 
 def cmd_info(a: argparse.Namespace) -> None:
+    from vhe.project import read_manifest
     from vhe.timing import format_report
 
+    manifest = read_manifest(Path(a.index))
+    if manifest is not None:
+        for e in manifest["files"]:
+            print(f"{e['status']:<10}{e['rel_path']}  {e.get('duration') or 0:.1f}s  {e.get('recorded_at') or '-'}")
+        return
     meta = json.loads((Path(a.index) / "meta.json").read_text())
     print(f"video: {meta['video']}  duration {meta['duration']:.1f}s  frames {meta['n_frames']}  "
           f"cuts {len(meta['cuts'])}  change points {len(meta['change_points'])}  encoder {meta['encoder']}")
@@ -110,26 +138,27 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--keep-cache", action="store_true", help="keep decoded frames and audio")
     p.set_defaults(func=cmd_index)
 
-    p = sub.add_parser("search", help="free-text search")
-    p.add_argument("index")
+    p = sub.add_parser("search", help="free-text search over a video or a project folder")
+    p.add_argument("path", help="project folder, video file, or per-video index dir")
     p.add_argument("text")
     p.add_argument("-k", type=int, default=10)
     p.set_defaults(func=cmd_search)
 
-    p = sub.add_parser("clips", help="ranked highlight clips for a query")
-    p.add_argument("index")
-    p.add_argument("query")
-    p.add_argument("-n", type=int, default=None)
+    p = sub.add_parser("clips", help="best clips for an editor's brief, in edit order")
+    p.add_argument("path", help="project folder, video file, or per-video index dir")
+    p.add_argument("query", help='e.g. "60-90 s energetic recap, open with an establishing shot"')
+    p.add_argument("--count", "-n", type=int, default=None, help="number of clips (default: from the brief)")
     p.add_argument("--min-len", type=float, default=None)
     p.add_argument("--max-len", type=float, default=None)
     p.add_argument("--llm", default=None, help="Ollama model for query parsing (default: rules)")
-    p.add_argument("--budget", type=float, default=None, help="total seconds for all clips together")
+    p.add_argument("--budget", default=None, help="total seconds for all clips together: 75 or 60-90")
     p.add_argument("--no-nc", action="store_true")
-    p.add_argument("--export", default=None, help="write clip files to this folder")
-    p.add_argument("--json", default=None, help="write the full result as JSON")
+    p.add_argument("--export", default=None, help="write clips, clips.csv and edit.edl to this folder")
+    p.add_argument("--rough-cut", action="store_true", help="with --export: also a joined preview rough_cut.mp4")
+    p.add_argument("--json", default=None, help="write the edit list (file-local times) as JSON")
     p.set_defaults(func=cmd_clips)
 
-    p = sub.add_parser("info", help="index summary and timings")
+    p = sub.add_parser("info", help="index summary and timings (or a project's files)")
     p.add_argument("index")
     p.set_defaults(func=cmd_info)
 

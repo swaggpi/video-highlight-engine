@@ -114,5 +114,8 @@ def generate(duration: float, cuts: list[float], change_points: list[float], min
     return out
 
 
-def cuts_inside(s: float, e: float, cuts: np.ndarray, margin: float = 0.3) -> int:
-    return int(np.count_nonzero((cuts > s + margin) & (cuts < e - margin)))
+def cuts_inside(s, e, cuts: np.ndarray, margin: float = 0.3):
+    """Cuts strictly inside (s + margin, e - margin); s and e may be arrays (cuts sorted)."""
+    cuts = np.sort(np.asarray(cuts, dtype=float))
+    n = np.searchsorted(cuts, np.asarray(e) - margin, "left") - np.searchsorted(cuts, np.asarray(s) + margin, "right")
+    return np.maximum(n, 0) if np.ndim(n) else int(max(n, 0))

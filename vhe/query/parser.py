@@ -52,7 +52,8 @@ CLIP_NOUNS = r"(?:clips?|scenes?|shots?|moments?|highlights|parts|szenen?|moment
 BUDGET_NOUNS = (r"(?:recaps?|edit|video|reel|montage|highlights?|cut|film|trailer|teaser|sizzle|summary|supercut|"
                 r"compilation|rückblick|zusammenfassung|zusammenschnitt|schnitt)")
 FORMAT = ["recap", "recaps", "edit", "reel", "montage", "highlight", "highlights", "supercut", "compilation",
-          "summary", "trailer", "teaser", "sizzle", "video", "rückblick", "zusammenfassung", "zusammenschnitt"]
+          "summary", "trailer", "teaser", "sizzle", "video", "b-roll", "broll", "rückblick", "zusammenfassung",
+          "zusammenschnitt"]
 FILLER = ["show me", "find me", "find", "give me", "i want", "i need", "make", "create", "zeig mir", "finde",
           "ich will", "ich brauche", "scenes", "scene", "clips", "clip", "shots", "shot", "moments", "moment",
           "parts", "szenen", "szene", "momente", "stellen", "aufnahmen",

@@ -26,8 +26,10 @@ def window_starts(duration: float, window: float, overlap: float) -> list[float]
     step = window - overlap
     starts = list(np.arange(0.0, duration - window, step))
     last = max(0.0, duration - window)  # last window ends exactly at the end
-    if starts and last - starts[-1] < 5.0:
-        starts[-1] = last  # avoid a near-duplicate final window
+    # Replace a near-duplicate final window only if the one before still reaches it; otherwise (a video slightly
+    # longer than one window) moving the only window would leave the start unscored.
+    if len(starts) > 1 and last - starts[-1] < 5.0 and starts[-2] + window >= last:
+        starts[-1] = last
     else:
         starts.append(last)
     return [round(float(s), 3) for s in starts]

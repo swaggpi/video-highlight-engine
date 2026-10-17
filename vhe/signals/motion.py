@@ -9,13 +9,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
-from vhe.signals import to_grid
-
-
-def _moving_average(x: np.ndarray, width: int) -> np.ndarray:
-    width = max(1, min(int(width), len(x)))  # mode="same" returns max(len, width) samples otherwise
-    kernel = np.ones(width) / width
-    return np.convolve(x, kernel, mode="same")
+from vhe.signals import smooth, to_grid
 
 
 def motion_signals(tiny: np.ndarray, src_fps: float, n_grid: int, grid_fps: float,
@@ -46,9 +40,9 @@ def motion_signals(tiny: np.ndarray, src_fps: float, n_grid: int, grid_fps: floa
     rel = shift / np.array([w, h], dtype=np.float32)  # fraction of the frame per source frame
     rel = np.nan_to_num(rel)
     cam_speed = np.hypot(rel[:, 0], rel[:, 1]) * src_fps  # frame-widths per second
-    smooth = np.stack([_moving_average(rel[:, i], src_fps * 0.5) for i in range(2)], axis=1)
-    jitter = np.hypot(*(rel - smooth).T) * src_fps
-    shake = np.sqrt(_moving_average(jitter ** 2, src_fps))
+    trend = np.stack([smooth(rel[:, i], src_fps * 0.5) for i in range(2)], axis=1)
+    jitter = np.hypot(*(rel - trend).T) * src_fps
+    shake = np.sqrt(smooth(jitter ** 2, src_fps))
 
     times = np.arange(n) / src_fps
     resid_f = np.where(bad, np.nan, resid)
