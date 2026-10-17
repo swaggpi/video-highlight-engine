@@ -15,11 +15,21 @@ Requires Python 3.11 (Lighthouse pins old numpy) and ffmpeg.
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cpu   # or the CUDA/MPS build
 uv pip install --python .venv/bin/python -e ".[nc,dev]"
-uv pip install --python .venv/bin/python --no-deps "git+https://github.com/line/lighthouse.git"
+uv pip install --python .venv/bin/python --no-deps "git+https://github.com/line/lighthouse.git" msclap
 mkdir -p ~/.cache/vhe/models
 curl -L -o ~/.cache/vhe/models/clip_cg_detr_qvhighlight.ckpt \
   https://zenodo.org/records/13960580/files/clip_cg_detr_qvhighlight.ckpt
 ```
+
+NVIDIA GPU (e.g. GTX 1660 Super, Turing): use the CUDA build of torch instead of the CPU one; `--device auto`
+then picks CUDA and runs SigLIP2 and Whisper in fp16.
+
+```bash
+uv pip install --python .venv/bin/python torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
+.venv/bin/python -c "import torch; print(torch.cuda.is_available())"   # must print True
+```
+
+On Windows the venv paths are `.venv\Scripts\python.exe` and `.venv\Scripts\vhe.exe`; ffmpeg must be on PATH.
 
 ## Use
 
