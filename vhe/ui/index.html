@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>vhe</title>
+<style>
+  body { font: 14px system-ui, sans-serif; max-width: 900px; margin: 24px auto; padding: 0 16px; }
+  input[type=text] { width: 100%; box-sizing: border-box; padding: 6px; }
+  .row { display: flex; gap: 8px; margin: 8px 0; align-items: center; }
+  .row input[type=text] { flex: 1; }
+  #status { color: #555; min-height: 1.4em; }
+  .clip { border-top: 1px solid #ddd; padding: 8px 0; }
+  video { width: 100%; max-height: 260px; background: #000; }
+  .meta { font-family: ui-monospace, monospace; font-size: 12px; }
+</style>
+
+<div class="row"><input id="video" type="text" placeholder="/path/to/video.mp4"><button id="indexBtn">Index</button></div>
+<div class="row"><input id="query" type="text" placeholder="e.g. short high-energy scenes"><input id="count" type="number" min="1" max="50" value="5" style="width:60px"><button id="clipsBtn">Find clips</button><button id="searchBtn">Search</button></div>
+<div id="status"></div>
+<div id="results"></div>
+<div class="row"><button id="exportBtn" hidden>Export selected</button></div>
+
+<script>
+const $ = id => document.getElementById(id);
+let current = [];
+const fmt = t => `${Math.floor(t / 60)}:${(t % 60).toFixed(1).padStart(4, "0")}`;
+const status = msg => { $("status").textContent = msg; };
+try { $("video").value = localStorage.getItem("vhe.video") || ""; } catch (e) {}
+
+async function post(url, body) {
+  const r = await fetch(url, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+  const data = await r.json();
+  if (!r.ok) throw new Error(data.error || r.statusText);
+  return data;
+}
+
+$("indexBtn").onclick = async () => {
+  const video = $("video").value.trim();
+  try { localStorage.setItem("vhe.video", video); } catch (e) {}
+  try { await post("/api/index", {video}); } catch (e) { return status(e.message); }
+  const poll = setInterval(async () => {
+    const s = await (await fetch("/api/status")).json();
+    status(s.state === "error" ? `Error: ${s.error}` : `Indexing: ${s.stage}`);
+    if (s.state !== "running") { clearInterval(poll); if (s.state === "done") status("Indexed. Enter a query."); }
+  }, 1000);
+};
+
+function render(items, withExport) {
+  const video = encodeURIComponent($("video").value.trim());
+  current = items;
+  $("results").innerHTML = "";
+  items.forEach((c, i) => {
+    const div = document.createElement("div");
+    div.className = "clip";
+    const label = (c.labels || []).join(", ") || c.text || c.source || "";
+    const score = c.relevance !== undefined
+      ? `score ${c.score.toFixed(2)} · rel ${c.relevance.toFixed(2)} · qual ${c.quality.toFixed(2)} · energy ${c.energy.toFixed(2)}`
+      : `score ${c.score.toFixed(3)}`;
+    div.innerHTML = `<label class="meta"><input type="checkbox" data-i="${i}" ${withExport ? "checked" : "hidden"}> ` +
+      `${fmt(c.start)}–${fmt(c.end)} · ${score} · ${label}</label>` +
+      `<video controls preload="none" src="/media?path=${video}#t=${c.start},${c.end}"></video>`;
+    $("results").appendChild(div);
+  });
+  $("exportBtn").hidden = !withExport || !items.length;
+}
+
+$("clipsBtn").onclick = async () => {
+  status("Ranking…");
+  try {
+    const r = await post("/api/clips", {video: $("video").value.trim(), query: $("query").value, count: +$("count").value});
+    render(r.clips, true);
+    status(`${r.clips.length} clips in ${r.seconds}s` + (r.noncommercial.length ? " · uses non-commercial model" : ""));
+  } catch (e) { status(e.message); }
+};
+
+$("searchBtn").onclick = async () => {
+  status("Searching…");
+  try {
+    const r = await post("/api/search", {video: $("video").value.trim(), query: $("query").value});
+    render(r.results, false);
+    status(`${r.results.length} matches`);
+  } catch (e) { status(e.message); }
+};
+
+$("exportBtn").onclick = async () => {
+  const picked = [...document.querySelectorAll("#results input:checked")].map(el => current[+el.dataset.i]);
+  status("Exporting…");
+  try {
+    const r = await post("/api/export", {video: $("video").value.trim(), clips: picked});
+    status(`Exported ${r.files.length} clips to ${r.folder}`);
+  } catch (e) { status(e.message); }
+};
+</script>
+</html>
