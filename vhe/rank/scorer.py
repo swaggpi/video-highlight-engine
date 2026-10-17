@@ -85,11 +85,12 @@ class LinearRankScorer:
     """score = w . phi(x, q), phi = [z, outer(z, q_small)], z = (x - mu) / sd. A model JSON:
     {"format": "vhe-linear-rank/1", "feature_version", "query_version", "features": [names, optional check],
      "personas": [...], "q_small": [query names, default the signal weights], "mu": [F], "sd": [F],
-     "w": [F] or [F * (1 + len(q_small))], "trained_on", "created"}."""
+     "w": [F] or [F * (1 + len(q_small))], "mask": [F] optional 0/1, "trained_on", "created"}.
+    mask: the features the model uses; a masked-out column is ignored (its z is 0), whatever its value."""
 
     def __init__(self, mu, sd, w, personas=PERSONAS, q_small=Q_SMALL, name: str = "linear",
                  feature_version: str = FEATURE_VERSION, query_version: str = QUERY_VERSION,
-                 meta: dict | None = None) -> None:
+                 meta: dict | None = None, mask=None) -> None:
         if feature_version != FEATURE_VERSION:
             raise ValueError(f"model features {feature_version!r}, this engine computes {FEATURE_VERSION!r}")
         if query_version != QUERY_VERSION:
@@ -106,6 +107,9 @@ class LinearRankScorer:
         self._qi = [names.index(n) for n in self.q_small]
         if self.mu.shape != (F,) or self.sd.shape != (F,):
             raise ValueError(f"mu and sd need {F} entries (features {FEATURE_VERSION})")
+        self.mask = None if mask is None else np.asarray(mask, dtype=float)
+        if self.mask is not None and (self.mask.shape != (F,) or not np.isin(self.mask, (0.0, 1.0)).all()):
+            raise ValueError(f"mask needs {F} entries of 0 or 1")
         if len(self.w) not in (F, F * (1 + len(self.q_small))):
             raise ValueError(f"w needs {F} or {F * (1 + len(self.q_small))} entries, got {len(self.w)}")
         self.name, self.feature_version, self.query_version = name, feature_version, query_version
@@ -122,15 +126,18 @@ class LinearRankScorer:
         return cls(m["mu"], m["sd"], m["w"], m.get("personas", PERSONAS), m.get("q_small", Q_SMALL),
                    name=f"linear:{path.name}", feature_version=m.get("feature_version"),
                    query_version=m.get("query_version"),
-                   meta={k: m.get(k) for k in ("trained_on", "created")})
+                   meta={k: m.get(k) for k in ("trained_on", "created")}, mask=m.get("mask"))
 
     def to_json(self) -> dict:
         return {"format": LINEAR_FORMAT, "feature_version": self.feature_version, "query_version": self.query_version,
                 "features": list(FEATURES), "personas": list(self.personas), "q_small": list(self.q_small),
-                "mu": self.mu.tolist(), "sd": self.sd.tolist(), "w": self.w.tolist(), **self.meta}
+                "mu": self.mu.tolist(), "sd": self.sd.tolist(), "w": self.w.tolist(),
+                **({} if self.mask is None else {"mask": self.mask.astype(int).tolist()}), **self.meta}
 
     def phi(self, X: np.ndarray, q: np.ndarray) -> np.ndarray:
         z = np.nan_to_num((np.asarray(X, dtype=float) - self.mu) / np.where(self.sd > 0, self.sd, 1.0))
+        if self.mask is not None:
+            z = z * self.mask
         if len(self.w) == z.shape[1]:
             return z
         qs = np.asarray(q, dtype=float)[self._qi]
