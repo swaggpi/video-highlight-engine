@@ -1,6 +1,8 @@
-"""Index a video once: decode, signals, embeddings, tags, transcript, non-commercial highlight features."""
+"""Index a video once: decode, signals, embeddings, tags, shot scale, on-screen text, faces, transcript,
+non-commercial highlight features."""
 from __future__ import annotations
 
+import logging
 import shutil
 import time
 from pathlib import Path
@@ -13,12 +15,15 @@ from vhe.index.store import default_index_dir, save_index
 from vhe.ingest.decode import decode, frame_paths, load_tiny
 from vhe.signals.audio import audio_signals, load_audio, speech_mask, voice_activity
 from vhe.signals.changes import change_points
+from vhe.signals.faces import approach
 from vhe.signals.frames import Encoder
 from vhe.signals.motion import motion_signals
 from vhe.signals.quality import frame_quality, usable_mask
 from vhe.signals.shots import detect_cuts, frame_diffs
-from vhe.signals.tags import LABELS, defect_scores, defect_texts, label_texts, tag_probs
+from vhe.signals.tags import LABELS, defect_scores, defect_texts, label_texts, scale_scores, scale_texts, tag_probs
 from vhe.timing import Counter, Timings
+
+log = logging.getLogger("vhe")
 
 
 def build_index(video: Path, out_dir: Path | None = None, cfg: Config | None = None,
@@ -98,9 +103,13 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
         scale, bias = encoder.logit_params()
         grid["tags"] = tag_probs(emb, encoder.texts(label_texts()), scale, bias)
         grid.update(defect_scores(emb, encoder.texts(defect_texts()), scale, bias))
+        grid.update(scale_scores(emb, encoder.texts(scale_texts()), scale, bias))
     say("frame quality")
     with timings.stage("quality", items=len(paths)):
         grid.update(frame_quality(paths))
+    ocr, faces_meta = _ocr(paths, grid, cfg, say, timings), _faces(paths, grid, cfg, say, timings)
+    # Without faces (detector unavailable) approach follows the close-up margin alone.
+    grid["approach"] = approach(grid.get("face_area_max", np.zeros(n, np.float32)), grid["scale_close"], fps, cuts)
     grid["usable"], grid["unusable"] = usable_mask(grid["luma"], grid["contrast"], grid["blown"],
                                                    grid["blur_ratio"], grid["shake"], grid["obstruction"],
                                                    grid["framing"])
@@ -114,10 +123,12 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
         "language": transcript["language"] if transcript else None,
         "usable_fraction": round(float(grid["usable"].mean()), 4),
         "noncommercial_components": [],
+        "ocr": None if ocr is None else {k: v for k, v in ocr.items() if k != "items"},
+        "faces": faces_meta,
         "timings": timings.stages, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     # Save before the optional stage so a failure there never loses the expensive work above.
-    save_index(out, meta, grid, transcript)
+    save_index(out, meta, grid, transcript, ocr)
 
     if cfg.use_nc_highlight:
         say("non-commercial highlight features")
@@ -135,6 +146,53 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
         except Exception as exc:  # optional stage: keep the index without it
             say(f"skipping non-commercial highlight model: {exc}")
         meta["timings"] = timings.stages
-        save_index(out, meta, grid, transcript)
+        save_index(out, meta, grid, transcript, ocr)
     say("done")
     return out
+
+
+def _skip(say, what: str, exc: Exception) -> None:
+    """An optional index-time signal is unavailable: warn, keep indexing without it."""
+    msg = f"skipping {what}: {type(exc).__name__}: {exc}"
+    log.warning(msg)
+    say(msg)
+
+
+def _ocr(paths: list[Path], grid: dict, cfg: Config, say, timings: Timings) -> dict | None:
+    """Adds text_area/text_conf to grid; returns the text store for ocr.json, or None when OCR did not run."""
+    if not cfg.use_ocr:
+        return None
+    from vhe.config import OCR_EVERY, OCR_MIN_CONF
+    from vhe.signals.ocr import ENGINE_NAME, load_engine, ocr_frames
+
+    try:  # optional: rapidocr-onnxruntime not installed, or onnxruntime broken on this machine
+        with timings.stage("load_ocr"):
+            engine = load_engine(cfg.frame_height)
+        say("on-screen text")
+        with timings.stage("ocr", items=len(range(0, len(paths), OCR_EVERY))):
+            sig, items = ocr_frames(paths, engine, progress=Counter(say, "reading text"))
+    except Exception as exc:
+        _skip(say, "on-screen text (OCR)", exc)
+        return None
+    grid.update(sig)
+    return {"engine": ENGINE_NAME, "every": OCR_EVERY, "min_conf": OCR_MIN_CONF, "items": items}
+
+
+def _faces(paths: list[Path], grid: dict, cfg: Config, say, timings: Timings) -> dict | None:
+    """Adds face_n/face_area_max/face_center to grid; returns their meta entry, or None when faces did not run."""
+    if not cfg.use_faces:
+        return None
+    from vhe.config import FACE_MIN_SCORE
+    from vhe.signals.faces import MODEL_NAME, face_signals, load_detector
+
+    try:  # optional: model not downloadable (offline, $VHE_NO_DOWNLOAD) or checksum mismatch
+        with timings.stage("load_faces"):
+            detector = load_detector()
+        say("faces")
+        with timings.stage("faces", items=len(paths)):
+            sig = face_signals(paths, detector, progress=Counter(say, "faces"))
+    except Exception as exc:
+        _skip(say, "faces", exc)
+        return None
+    grid.update(sig)
+    return {"model": MODEL_NAME, "min_score": FACE_MIN_SCORE}

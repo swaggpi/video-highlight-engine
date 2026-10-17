@@ -59,6 +59,35 @@ OBSTRUCTED_MARGIN = 0.5
 # positives are mostly whip-pan blur.
 BAD_FRAMING_MARGIN = 1.0
 
+# On-screen text (signals/ocr.py, RapidOCR PP-OCRv4 on the 360 p analysis frames). Measured 2026-10-18 on irl-event
+# (dev set; festival-commons is held out): at the native 360 p detector size recall on the named floats, banners and
+# signs matched RapidOCR's default 736 p upscale at 2.5x less time; 4 ONNX threads ran 38 ms/frame vs 93 ms with all
+# 16 (contention). Every OCR_EVERY-th step (1 fps) is read and carried to its neighbours.
+OCR_EVERY = 3
+OCR_MIN_CONF = 0.7  # a detection counts (text_area, text_conf, ocr.json) at or above this recognition confidence
+OCR_MIN_LEN = 2  # ... and with at least this many non-space characters
+OCR_THREADS = 4
+# Faces (signals/faces.py, YuNet). Detector score threshold; frames are run at most FACE_SIDE px on the long side.
+FACE_MIN_SCORE = 0.7
+FACE_SIDE = 640
+# Shot scale: zero-shot SigLIP2 margins (tags.scale_scores, logits, same construction as the defect margins).
+# Suggested query-side thresholds from irl-event: close-ups / something filling the frame read >= 1 (giant flag
+# C0019 2-12 s: 1.1..5.8; 95th percentile of all steps -0.3); wide establishing views >= 2.5 (C0001 40-45 s: 4.8..6.2,
+# C0011 76-80 s: 2.5..3.3; medium shots of people read < 0, median step 1.9 since the set is mostly street wides).
+SCALE_CLOSE_MARGIN = 1.0
+SCALE_WIDE_MARGIN = 2.5
+# Approach / looming (signals/faces.approach): growth rate of the dominant subject over APPROACH_WINDOW_S, in log
+# face area per second (doubling per second = 0.69) where the face ends >= APPROACH_FACE_MIN of the frame, or
+# APPROACH_CLOSE_WEIGHT x the close-margin rate in logits/s where the shot ends at scale_close >= APPROACH_CLOSE_MIN.
+# FACE_AREA_EPS floors the log so a 0.05 %-of-frame face flickering in and out is not growth. Without the two gates
+# 19 % of irl-event test steps (C0005, C0017, C0019) read > 0.3 (SigLIP jitter in wide shots); with them 6.6 %, while
+# the giant flag coming at the lens (C0019 2-12 s) keeps 0.3..1.2 per second.
+APPROACH_WINDOW_S = 1.0
+APPROACH_CLOSE_WEIGHT = 0.35
+APPROACH_FACE_MIN = 0.003
+APPROACH_CLOSE_MIN = 0.0
+FACE_AREA_EPS = 0.002
+
 
 @dataclass
 class Config:
@@ -76,6 +105,9 @@ class Config:
 
     asr_model: str = "small"  # faster-whisper size; Parakeet planned for v2
     asr_language: str | None = None  # None = detect
+
+    use_ocr: bool = True  # on-screen text (RapidOCR); skipped with a warning when not installed
+    use_faces: bool = True  # YuNet faces (model fetched once into MODEL_DIR); skipped with a warning when missing
 
     # Lighthouse CG-DETR trained on QVHighlights: NON-COMMERCIAL, prototype only.
     use_nc_highlight: bool = True

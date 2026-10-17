@@ -91,6 +91,12 @@ class Corpus:
                 for ix, off in zip(self.members, self.offsets) for w in ix.words]
 
     @functools.cached_property
+    def text_items(self) -> list[dict]:
+        """On-screen text (Index.text_items) on the virtual timeline: step and t shifted, plus the file index."""
+        return [dict(it, step=it["step"] + int(b), t=off + it["t"], file=k)
+                for k, (ix, b, off) in enumerate(zip(self.members, self.bounds, self.offsets)) for it in ix.text_items]
+
+    @functools.cached_property
     def segments(self) -> list[dict]:
         """Transcript segments on the virtual timeline, each with its file index."""
         return [dict(s, start=off + s["start"], end=off + s["end"], file=k,

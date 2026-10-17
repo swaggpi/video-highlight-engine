@@ -18,6 +18,11 @@ dependencies = [
     "soundfile",
     "faster-whisper",
     "silero-vad",
+    # On-screen text. Its opencv-python requirement is overridden below ([tool.uv]).
+    "rapidocr-onnxruntime==1.4.4",
+    "onnxruntime",
+    "pyclipper",
+    "shapely",
 ]
 
 [project.optional-dependencies]
@@ -39,3 +44,7 @@ vhe = ["ui/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv]
+# rapidocr-onnxruntime requires opencv-python; opencv-python-headless above already provides cv2.
+override-dependencies = ["opencv-python ; sys_platform == 'never'"]

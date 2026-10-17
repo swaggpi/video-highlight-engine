@@ -16,6 +16,8 @@ Requires Python 3.11 (Lighthouse pins old numpy) and ffmpeg.
 uv venv --python 3.11 .venv
 uv pip install --python .venv/bin/python torch==2.4.1 torchvision==0.19.1 torchaudio==2.4.1 --index-url https://download.pytorch.org/whl/cpu   # or the CUDA/MPS build
 uv pip install --python .venv/bin/python -e ".[nc,dev]"
+# run from the repo: [tool.uv] in pyproject.toml drops opencv-python, which rapidocr-onnxruntime (OCR) requires
+# although opencv-python-headless already provides cv2 (plain pip installs both; they write the same cv2 package)
 uv pip install --python .venv/bin/python --no-deps "git+https://github.com/line/lighthouse.git" msclap
 mkdir -p ~/.cache/vhe/models
 curl -L -o ~/.cache/vhe/models/clip_cg_detr_qvhighlight.ckpt \
@@ -79,7 +81,11 @@ index (once per video)
   cuts .......... adaptive frame-difference detector on the full-fps stream, flash suppression
   motion ........ phase correlation per frame pair -> camera speed, shake, subject motion
   audio ......... loudness, onset rate, Silero VAD, faster-whisper transcript with word times
-  frames ........ SigLIP2 embeddings (search index), zero-shot tags, sharpness/exposure
+  frames ........ SigLIP2 embeddings (search index), zero-shot tags, sharpness/exposure, shot scale
+                  (scale_close / scale_wide margins)
+  text .......... RapidOCR on 1 fps of the analysis frames: text_area, text_conf per step, ocr.json text store
+  faces ......... YuNet on every analysis frame: face_n, face_area_max, face_center; approach (subject growing
+                  toward the lens). OCR and faces are skipped with a warning when unavailable
   change points . content changes inside long shots (raw footage)
   nc highlight .. Lighthouse features per 148 s window with overlap (NON-COMMERCIAL)
 
@@ -108,7 +114,7 @@ query (per request; a folder is one corpus: all files on a virtual timeline, a s
 vhe/
   config.py, timing.py, models.py, pipeline.py, project.py, corpus.py, engine.py, cli.py
   ingest/decode.py
-  signals/{shots,motion,audio,speech,frames,tags,quality,changes,highlight_nc}.py
+  signals/{shots,motion,audio,speech,frames,tags,quality,changes,ocr,faces,highlight_nc}.py
   index/store.py
   query/{parser,plan,candidates,refine}.py
   rank/{signals,features,scorer,select,dump}.py
