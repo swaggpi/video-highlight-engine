@@ -88,6 +88,10 @@ APPROACH_FACE_MIN = 0.003
 APPROACH_CLOSE_MIN = 0.0
 FACE_AREA_EPS = 0.002
 
+# Query side. Candidate window lengths (s): vhe.query.candidates generates windows of these lengths that fit the
+# brief's clip limits, and the hand-weighted scorer centres scores per bucket of them (vhe.rank.scorer).
+CANDIDATE_LENGTHS = (3, 4, 6, 8, 10, 15, 20, 30, 45, 60, 90)
+
 
 @dataclass
 class Config:
@@ -122,14 +126,3 @@ class Config:
     def from_dict(cls, d: dict) -> "Config":
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
 
-
-def resolve_device(device: str) -> str:
-    if device != "auto":
-        return device
-    import torch
-
-    if torch.cuda.is_available():
-        return "cuda"
-    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
-        return "mps"
-    return "cpu"

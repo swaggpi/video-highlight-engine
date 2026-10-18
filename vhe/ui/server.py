@@ -36,7 +36,7 @@ class State:
 
 
 def _index_job(state: State, path: str) -> None:
-    from vhe.engine import MODEL_LOCK
+    from vhe.models import MODEL_LOCK
 
     def progress(msg: str) -> None:
         if msg.startswith("["):  # "[k/N] file (...)" from the project indexer

@@ -8,10 +8,11 @@ parsed query of every case gained the five visual-cue keys at their defaults, ev
 identical; the cue_* cases were appended), and for the r3 speech padding (only the speech-index cases topics,
 speaks_every and soundbite moved: speech-clip edges sit SPEECH_LEAD before the first and SPEECH_TAIL after the last
 word, in the pause; every other case stayed identical): any other change to it is a regression. The cases cover the
-paths the hand-weighted total runs through: length buckets, cut and length priors, the speech bonus, the usable and live-sound
-gates, opener/closer pools, shot lists (per-item pool extras, round robin, exhaustive per-item), avoid items, spoken
-topics, the non-commercial saliency blend (mocked: NaN on one file), and the visual cues (close / wide framing,
-faces, centring, the hook slot, readable text) on index v3 signals."""
+paths the hand-weighted total runs through: length buckets, cut and length priors, the speech bonus, the usable and
+live-sound gates, opener/closer pools, shot lists (per-item pool extras, round robin, exhaustive per-item), avoid
+items, spoken topics, the non-commercial saliency blend (mocked: NaN on one file), and the visual cues (close / wide
+framing, faces, centring, the hook slot, readable text) on index v3 signals. The module-layout pass (vhe/query,
+vhe/rank split into one module per job) kept it byte-identical."""
 from __future__ import annotations
 
 import json
@@ -23,7 +24,7 @@ import numpy as np
 from test_corpus import DIM, FPS, make_index, make_project
 from vhe.engine import Engine
 from vhe.index.store import save_index
-from vhe.query import plan
+from vhe.query import topics
 
 TIMING = ("seconds", "load_seconds")
 
@@ -157,7 +158,7 @@ def _cue_project(root: Path) -> Path:
 def cue_engine(root: Path) -> Engine:
     """The cue project's engine: every text the rules parse from CUE_BRIEFS (and the hook/opener slots) matches the
     parade direction, so the cue signals decide between otherwise equal footage."""
-    from vhe.query.parser import parse
+    from vhe.query.rules import parse
 
     (parade,) = _dirs(1, seed=9)
     texts = {"parade"}
@@ -255,9 +256,9 @@ def strip(res: dict, tmp: Path) -> dict:
 
 def run_all(tmp: Path, **clips_kw) -> dict:
     """{case name: Engine.clips result without timings}; rules parser, keyword topic matching (no servers)."""
-    embed = plan.embed
-    plan.embed = lambda texts, **kw: None
+    embed = topics.embed
+    topics.embed = lambda texts, **kw: None
     try:
         return {name: strip(eng.clips(query, llm=None, **kw, **clips_kw), tmp) for name, eng, query, kw in cases(tmp)}
     finally:
-        plan.embed = embed
+        topics.embed = embed

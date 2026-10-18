@@ -20,11 +20,6 @@ INDEX_VERSION = 3
 OCR_VERSION = 1
 
 
-def usable_mask(grid: dict, n: int) -> np.ndarray:
-    """bool per grid step; all True when an older index has no 'usable' array. Shared by Index and Corpus."""
-    return grid["usable"].astype(bool) if "usable" in grid else np.ones(n, dtype=bool)
-
-
 def default_index_dir(video: Path) -> Path:
     return video.parent / (video.name + ".vhe")
 
@@ -95,24 +90,24 @@ class Index:
 
     @property
     def has_audio(self) -> bool:
-        # Indexes before the project format also kept a copy in grid.npz.
-        return bool(self.meta.get("has_audio", self.grid.get("has_audio", True)))
+        return bool(self.meta.get("has_audio", True))
 
     @property
     def usable(self) -> np.ndarray:
-        """bool per grid step: no absolute defect (signals/quality.usable_mask). All True for older indexes."""
-        return usable_mask(self.grid, self.n)
-
-    @property
-    def unusable_reasons(self) -> np.ndarray:
-        """uint8 bits per grid step; bit i = signals.quality.REASONS[i] (decode with quality.reason_names)."""
-        return self.grid["unusable"] if "unusable" in self.grid else np.zeros(self.n, dtype=np.uint8)
+        """bool per grid step: no absolute defect (signals/quality.usable_mask; the reasons are grid["unusable"],
+        decoded with quality.reason_names / reason_mask)."""
+        return self.grid["usable"].astype(bool)
 
     @functools.cached_property
     def ocr(self) -> dict | None:
         """The text store (ocr.json, see the module docstring), read on first use; None when OCR did not run."""
         path = self.root / "ocr.json"
-        return json.loads(path.read_text()) if path.exists() else None
+        if not path.exists():
+            return None
+        ocr = json.loads(path.read_text())
+        if ocr.get("version") != OCR_VERSION:
+            raise ValueError(f"{path}: text store version {ocr.get('version')} != {OCR_VERSION}; re-index the video")
+        return ocr
 
     @property
     def text_items(self) -> list[dict]:

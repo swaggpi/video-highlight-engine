@@ -10,10 +10,27 @@ from heuristic_cases import _dirs, _emb, _engine, _nc_mock, run_all
 from test_corpus import make_project
 from vhe.cli import main
 from vhe.engine import Engine
+from vhe.query import topics
+from vhe.query.model import ParsedQuery
 from vhe.rank import dump as dumps
-from vhe.rank.features import FEATURE_VERSION, FEATURES, INDEX, PERSONAS, featurize, query_names, query_vector
+from vhe.rank.features import (
+    FEATURE_VERSION,
+    FEATURES,
+    INDEX,
+    PERSONAS,
+    featurize,
+    query_names,
+    query_vector,
+)
 from vhe.rank.scorer import HeuristicScorer, LinearRankScorer, Scorer, load_scorer
-from vhe.rank.signals import blend_nc, nc_signal, span_max, span_mean, span_min, span_top_mean
+from vhe.rank.signals import (
+    blend_nc,
+    nc_signal,
+    span_max,
+    span_mean,
+    span_min,
+    span_top_mean,
+)
 
 DATA = Path(__file__).parent / "data"
 ENTRY_KEYS = {"file", "start", "end", "source", "stage", "score", "features", "selected", "rank", "role", "item"}
@@ -90,7 +107,7 @@ def test_span_statistics_match_the_per_span_definitions():
         seg = x[i0[j]:i1[j]]
         assert top[j] == float(np.sort(seg)[-max(1, int(np.ceil(0.6 * len(seg)))):].mean())  # bit-exact
         assert span_min(x, i0, i1)[j] == seg.min() and span_max(x, i0, i1)[j] == seg.max()
-    np.testing.assert_allclose(span_mean(x, i0, i1), [x[a:b].mean() for a, b in zip(i0, i1)])
+    np.testing.assert_allclose(span_mean(x, i0, i1), [x[a:b].mean() for a, b in zip(i0, i1, strict=True)])
 
 
 # ---- features --------------------------------------------------------------------------------------------------
@@ -163,9 +180,7 @@ def _linear(w_index: dict, **kw) -> LinearRankScorer:
 def test_linear_one_hot_on_rel_mean_ranks_by_rel_mean(tmp_path):
     rng = np.random.default_rng(3)
     X = rng.normal(size=(50, len(FEATURES)))
-    q = query_vector(type("P", (), dict(weights={"relevance": 1.0}, min_len=3.0, max_len=10.0, mood=None,
-                                        exhaustive=False, text="dogs", budget=None, shots=[], avoid=[], topics=[],
-                                        need_live_audio=False))())
+    q = query_vector(ParsedQuery(raw="", text="dogs", weights={"relevance": 1.0}, min_len=3.0, max_len=10.0))
     m = _linear({"rel_mean": 1.0})
     s = m.score(X, q)
     assert list(np.argsort(-s)) == list(np.argsort(-X[:, INDEX["rel_mean"]]))
@@ -250,16 +265,15 @@ def test_dump_schema_and_selected_spans_match_the_clips(tmp_path, monkeypatch):
 
 def test_dump_for_a_spoken_topic_brief(tmp_path):
     from heuristic_cases import _speech_index
-    from vhe.query import plan
 
     root = _speech_index(tmp_path / "talk.mp4.vhe")
-    plan_embed = plan.embed
-    plan.embed = lambda texts, **kw: None
+    plan_embed = topics.embed
+    topics.embed = lambda texts, **kw: None
     try:
         res = _engine(root).clips("Find every moment where the host talks about where he is (Madison Avenue).",
                                   llm=None, dump=tmp_path / "t.json")
     finally:
-        plan.embed = plan_embed
+        topics.embed = plan_embed
     cands = dumps.read(tmp_path / "t.json")["candidates"]
     assert [c["stage"] for c in cands] == ["topic"] * len(res["clips"]) and res["clips"]
     assert [(c["start"], c["item"]) for c in cands] == [(c["file_start"], c["item"]) for c in res["clips"]]

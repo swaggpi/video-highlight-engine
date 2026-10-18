@@ -16,8 +16,9 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from vhe.config import MIN_DURATION_S, VIDEO_EXTENSIONS, Config, resolve_device
+from vhe.config import MIN_DURATION_S, VIDEO_EXTENSIONS, Config
 from vhe.index.store import INDEX_VERSION, Index
+from vhe.models import resolve_device
 from vhe.timing import hms
 
 PROJECT_VERSION = 1
@@ -88,8 +89,8 @@ def detect_file_language(video: Path, cfg: Config, device: str) -> tuple[str | N
 
     with tempfile.TemporaryDirectory() as tmp:
         wav = Path(tmp) / "audio.wav"
-        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-t", str(LANG_DETECT_DECODE_S), "-vn", "-map", "0:a:0", "-ac", "1",
-                        "-ar", "16000", str(wav)], check=True)
+        subprocess.run(["ffmpeg", "-v", "error", "-y", "-i", str(video), "-t", str(LANG_DETECT_DECODE_S), "-vn",
+                        "-map", "0:a:0", "-ac", "1", "-ar", "16000", str(wav)], check=True)
         y = load_audio(wav)
     return detect_language(y, voice_activity(y), cfg.asr_model, device)
 
@@ -183,7 +184,8 @@ def index_project(root: Path, cfg: Config | None = None, progress: Callable[[str
         try:
             indexer(path, out, file_cfg, progress=lambda m: say(f"  {m}"), keep_cache=keep_cache)
             meta = json.loads((out / "meta.json").read_text())
-            entry.update(status="ok", index_version=INDEX_VERSION, language=meta.get("language"), usable_fraction=meta.get("usable_fraction"),
+            entry.update(status="ok", index_version=INDEX_VERSION, language=meta.get("language"),
+                         usable_fraction=meta.get("usable_fraction"),
                          has_audio=meta.get("has_audio", entry["has_audio"]))
             entry.pop("error", None)
         except Exception as exc:

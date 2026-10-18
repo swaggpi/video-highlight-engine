@@ -2,12 +2,17 @@
 and a disk cache; coverage-aware selection; and the CLIP context crash."""
 import io
 import json
+import urllib.request
 
 import numpy as np
 import pytest
 
-from vhe.query import parser, plan
-from vhe.query.parser import parse, parse_brief, parse_with_llm
+from vhe.query import llm, topics
+from vhe.query.llm import parse_with_llm
+from vhe.query.parser import parse_brief
+from vhe.query.rules import parse
+from vhe.query.topics import topic_scores
+from vhe.rank.items import AVOID_MAX, assign, combine
 from vhe.rank.select import select, select_for
 
 # The irl-event field-test briefs (vhe-field-test/eval/sets/irl-event/briefs.json, B1-B5).
@@ -116,7 +121,7 @@ def _mock_ollama(monkeypatch, answer):
         calls.append(json.loads(req.data))
         return io.BytesIO(json.dumps({"message": {"content": json.dumps(answer)}}).encode())
 
-    monkeypatch.setattr(parser.urllib.request, "urlopen", urlopen)
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     return calls
 
 
@@ -135,7 +140,7 @@ def test_llm_plan_is_grounded_and_cached(monkeypatch):
     # keep_alive 0: the model unloads as soon as it answers, before SigLIP / CG-DETR load on the same GPU.
     assert body["think"] is False and body["options"]["temperature"] == 0 and body["keep_alive"] == 0
     assert body["options"]["num_ctx"] >= 4096  # the prompt and its worked examples fit
-    assert body["format"]["required"] == parser.LLM_SCHEMA["required"] and body["messages"][-1]["content"] == B1
+    assert body["format"]["required"] == llm.LLM_SCHEMA["required"] and body["messages"][-1]["content"] == B1
     # Numbers the brief does not contain (10-30 s per clip, 7 clips) are ignored; the budget is in it.
     assert p.budget == (60.0, 90.0) and (p.min_len, p.max_len) == (2.0, 4.0) and not p.count_explicit
     assert not p.need_live_audio  # the brief asks for no sound at all
@@ -161,7 +166,7 @@ def test_llm_unreachable_falls_back_to_rules(monkeypatch):
     def down(req, timeout):
         raise OSError("connection refused")
 
-    monkeypatch.setattr(parser.urllib.request, "urlopen", down)
+    monkeypatch.setattr(urllib.request, "urlopen", down)
     p = parse_with_llm(B4, model="qwen3:4b")
     assert p.parser == "rules" and "unavailable" in p.parser_note and p.count == 5 and len(p.shots) == 5
 
@@ -170,7 +175,7 @@ def test_default_parser_is_llm_unless_disabled(monkeypatch):
     calls = _mock_ollama(monkeypatch, _answer(content="dogs"))
     assert parse_brief("dogs").parser == "rules" and not calls  # conftest: VHE_LLM=none
     monkeypatch.delenv("VHE_LLM")
-    assert parser.default_llm() == parser.DEFAULT_LLM == "qwen3:4b"
+    assert llm.default_llm() == llm.DEFAULT_LLM == "qwen3:4b"
     assert parse_brief("dogs").parser == "llm:qwen3:4b" and calls[0]["model"] == "qwen3:4b"
     assert parse_brief("dogs", llm=None).parser == "rules"
 
@@ -179,19 +184,19 @@ def test_default_parser_is_llm_unless_disabled(monkeypatch):
 def test_avoid_penalty_is_bounded_and_spares_clear_matches():
     want = np.array([[3.0, 0.5, 0.5, -2.0]])
     avoid = np.array([[3.0, 3.0, 0.8, 3.0]])
-    rel = plan.combine(want, avoid)
+    rel = combine(want, avoid)
     assert rel[0] == 3.0  # clearly relevant: the avoid match does not beat it
-    assert rel[1] == pytest.approx(0.5 - plan.AVOID_MAX)  # avoid dominates a weak match, by at most AVOID_MAX
+    assert rel[1] == pytest.approx(0.5 - AVOID_MAX)  # avoid dominates a weak match, by at most AVOID_MAX
     assert rel[2] == 0.5  # avoid below its floor is noise
-    assert rel[3] == pytest.approx(-2.0 - plan.AVOID_MAX)
-    np.testing.assert_array_equal(plan.combine(np.array([[1.0, 2.0], [3.0, 0.0]])), [3.0, 2.0])
+    assert rel[3] == pytest.approx(-2.0 - AVOID_MAX)
+    np.testing.assert_array_equal(combine(np.array([[1.0, 2.0], [3.0, 0.0]])), [3.0, 2.0])
 
 
 def test_item_assignment_is_centred_per_item():
     # Item 0 is generic (matches everything at +1.8), item 1 specific: a +2.5 match for item 1 serves item 1.
     scores = np.array([[2.0, 2.5], [2.0, -1.0], [0.2, 0.3]])
     centre = np.array([1.8, -2.0])
-    assert list(plan.assign(scores, centre)) == [1, 0, -1]
+    assert list(assign(scores, centre)) == [1, 0, -1]
 
 
 # ---- coverage-aware selection ---------------------------------------------------------------------------------------
@@ -237,9 +242,9 @@ def test_topic_scores_with_embeddings_and_keyword_fallback():
                       for t in texts], dtype=float)
         return v / np.linalg.norm(v, axis=1, keepdims=True)
 
-    score, best, method, thresh = plan.topic_scores(spans, topics, embed_fn=fake_embed)
+    score, best, method, thresh = topic_scores(spans, topics, embed_fn=fake_embed)
     assert method == "bge-m3" and list(score >= thresh) == [True, False, True] and best[0] == 0 and best[2] == 1
-    score, best, method, thresh = plan.topic_scores(spans, topics, embed_fn=lambda texts: None)
+    score, best, method, thresh = topic_scores(spans, topics, embed_fn=lambda texts: None)
     assert method == "keywords" and list(score >= thresh) == [True, False, True] and best[2] == 1
 
 
@@ -247,8 +252,8 @@ def test_embed_unreachable_returns_none(monkeypatch):
     def down(*a, **k):
         raise OSError("refused")
 
-    monkeypatch.setattr(plan.urllib.request, "urlopen", down)
-    assert plan.embed(["a"]) is None
+    monkeypatch.setattr(urllib.request, "urlopen", down)
+    assert topics.embed(["a"]) is None
 
 
 # ---- CLIP context crash (CG-DETR query path) -------------------------------------------------------------------------
@@ -358,8 +363,8 @@ def test_engine_need_live_audio_drops_muted(tmp_path, monkeypatch):
 
 
 def test_engine_topics_match_transcript_spans(tmp_path, monkeypatch):
-    from vhe.engine import Engine
     from test_corpus import make_index
+    from vhe.engine import Engine
     from vhe.index.store import save_index
 
     lines = [(30.0, "I'm on Madison Avenue right now."), (80.0, "The weather is nice today."),
@@ -375,7 +380,7 @@ def test_engine_topics_match_transcript_spans(tmp_path, monkeypatch):
     meta = dict(ix.meta, vad=[[s["start"], s["end"]] for s in segs])
     meta.pop("version", None)
     save_index(root, meta, ix.grid, {"language": "en", "segments": segs})
-    monkeypatch.setattr(plan, "embed", lambda texts, **kw: None)  # keyword fallback, no server
+    monkeypatch.setattr(topics, "embed", lambda texts, **kw: None)  # keyword fallback, no server
     res = Engine(root, device="cpu", use_nc=False).clips(
         "Find every moment where the host talks about where he is (Madison Avenue), and why he mutes the music "
         "(copyright).")
@@ -385,3 +390,19 @@ def test_engine_topics_match_transcript_spans(tmp_path, monkeypatch):
     assert 28.0 <= clips[0]["start"] <= 30.0 and 148.0 <= clips[1]["start"] <= 150.0
     assert "Madison" in clips[0]["transcript"] and "copyright" in clips[1]["transcript"]
     assert all(c["item"] in res["query"]["topics"] for c in clips)
+
+
+# ---- topic embeddings unload -----------------------------------------------------------------------------------------
+def test_topic_embeddings_unload_unless_another_client_holds_the_model(monkeypatch):
+    import io
+
+    bodies = []
+
+    def urlopen(req, timeout):
+        if isinstance(req, str):  # /api/ps: nothing loaded
+            return io.BytesIO(json.dumps({"models": []}).encode())
+        bodies.append(json.loads(req.data))
+        return io.BytesIO(json.dumps({"embeddings": [[1.0, 0.0]]}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    assert topics.embed(["a sentence"]) is not None and bodies[0]["keep_alive"] == "0s"

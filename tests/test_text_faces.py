@@ -103,6 +103,16 @@ def test_text_store_round_trip_and_corpus(tmp_path):
     assert not (a / "ocr.json").exists() and Index(a).text_items == []
 
 
+def test_text_store_of_another_version_is_refused(tmp_path):
+    video = tmp_path / "a.mp4"
+    video.write_bytes(b"x")
+    save_index(tmp_path, _meta(video, 3), _grid(3), None, {"engine": "fake", "every": 3, "min_conf": 0.7, "items": []})
+    stored = json.loads((tmp_path / "ocr.json").read_text())
+    (tmp_path / "ocr.json").write_text(json.dumps({**stored, "version": 2}))
+    with pytest.raises(ValueError, match="re-index"):
+        _ = Index(tmp_path).text_items
+
+
 def test_corpus_fills_missing_new_keys(tmp_path):
     video = tmp_path / "a.mp4"
     video.write_bytes(b"x")

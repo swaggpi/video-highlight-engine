@@ -13,14 +13,15 @@ from __future__ import annotations
 import numpy as np
 
 from vhe.config import BLOWN_FRAC
-from vhe.signals import robust_z, smooth  # noqa: F401  (re-exported: engine and tests import them from here)
-from vhe.signals.quality import REASONS
+from vhe.signals import robust_z, smooth
+from vhe.signals.quality import reason_mask
 
 # log-odds -> relevance: odds of e^-8 (p ~ 3e-4) is 0, every REL_WIDTH nats one unit, clipped to +-3 like the
 # z-scored signals. SigLIP2 logits: unrelated frames ~ -15..-10, partial matches ~ -6..-2, clear matches > 0.
 REL_MID, REL_WIDTH = -8.0, 2.5
 FRAMING_PENALTY = 1.0  # quality units off a step with the soft bad_framing reason (detail is 0.6 per z unit)
 TOP_FRAC = 0.6  # a span is as relevant as the mean of its best 60 % of steps
+LIVE_MIN_DB = -60.0  # loudness (dBFS) below this is muted: phone mutes are digital silence at -120 dB
 
 
 def per_file(fn, x: np.ndarray, file_id: np.ndarray | None) -> np.ndarray:
@@ -30,17 +31,17 @@ def per_file(fn, x: np.ndarray, file_id: np.ndarray | None) -> np.ndarray:
         return fn(x)
     out = np.empty_like(x)
     edges = np.flatnonzero(np.diff(file_id)) + 1
-    for a, b in zip(np.r_[0, edges], np.r_[edges, len(x)]):
+    for a, b in zip(np.r_[0, edges], np.r_[edges, len(x)], strict=True):
         out[a:b] = fn(x[a:b])
     return out
 
 
-def relevance(sim: np.ndarray, fps: float, logit: tuple[float, float] | None = None,
+def relevance(sim: np.ndarray, fps: float, logit: tuple[float, float],
               file_id: np.ndarray | None = None) -> np.ndarray:
-    """SigLIP relevance per step. sim: cosine similarity of every step's frame embedding with the text. logit:
-    SigLIP (scale, bias) from the index meta; without it (older indexes) relevance falls back to a pooled robust z."""
+    """SigLIP relevance per step. sim: cosine similarity of every step's frame embedding with the text, smoothed per
+    file. logit: SigLIP (scale, bias) from the index meta."""
     sim = per_file(lambda s: smooth(s, fps), sim, file_id)
-    return robust_z(sim) if logit is None else np.clip((logit[0] * sim + logit[1] - REL_MID) / REL_WIDTH, -3, 3)
+    return np.clip((logit[0] * sim + logit[1] - REL_MID) / REL_WIDTH, -3, 3)
 
 
 def nc_signal(saliency: np.ndarray | None) -> np.ndarray | None:
@@ -96,19 +97,21 @@ def span_max(x: np.ndarray, i0: np.ndarray, i1: np.ndarray) -> np.ndarray:
     return out
 
 
+def muted_steps(loudness: np.ndarray, has_audio: np.ndarray) -> np.ndarray:
+    """True where there is no usable live sound: no audio track, or digital silence (a streamer's mute)."""
+    loud = np.nan_to_num(np.asarray(loudness, dtype=float), nan=-120.0)
+    return ~np.asarray(has_audio, dtype=bool) | (loud < LIVE_MIN_DB)
+
+
 def _quality(grid: dict, usable: np.ndarray) -> np.ndarray:
     """Technical quality from defects only: detail (content-invariant re-blur ratio), blown highlights, shake, and
     the soft bad-framing reason (camera at the ground or straight up). Mean brightness is not used: a dark concert is
     not bad footage. Unusable steps get the floor."""
-    if "blur_ratio" in grid:
-        r = np.asarray(grid["blur_ratio"], dtype=float)
-        detail = robust_z(np.log(np.where(np.isfinite(r) & (r > 0), r, np.nan)))
-    else:  # indexes before the usable mask
-        detail = robust_z(grid["sharpness"])
+    r = np.asarray(grid["blur_ratio"], dtype=float)
+    detail = robust_z(np.log(np.where(np.isfinite(r) & (r > 0), r, np.nan)))
     blown = np.clip(np.nan_to_num(np.asarray(grid.get("blown", 0.0), dtype=float)) / BLOWN_FRAC, 0, 1)
     shaky = np.clip(robust_z(grid["shake"]), 0, None) / 3
-    bits = np.asarray(grid.get("unusable", 0), dtype=np.uint8)
-    framing = (bits & np.uint8(1 << REASONS.index("bad_framing"))) > 0
+    framing = reason_mask(grid["unusable"], "bad_framing")
     q = 0.6 * detail - 1.5 * blown - 0.6 * shaky - FRAMING_PENALTY * framing
     return np.where(usable, np.clip(q, -3, 3), -3.0)
 
@@ -140,7 +143,7 @@ def timestep_signals(grid: dict, fps: float, rel: np.ndarray | None = None, has_
     weighted signals: the energy components, and per-step audio, unusable and blown-pixel fractions (features)."""
     n = len(grid["t"])
     audio = np.broadcast_to(np.asarray(has_audio, dtype=bool), (n,))
-    usable = np.asarray(grid["usable"], dtype=bool) if "usable" in grid else np.ones(n, dtype=bool)
+    usable = np.asarray(grid["usable"], dtype=bool)
     parts = _energy_parts(grid, audio, file_id)
     return {"relevance": np.zeros(n) if rel is None else rel, "quality": _quality(grid, usable),
             "energy": _energy(parts, audio), "steady": -robust_z(grid["shake"]),

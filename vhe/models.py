@@ -1,5 +1,7 @@
 """Process-wide model cache: each model is loaded once per (name, device) and shared by indexing and queries.
-Indexing a folder of 40 files would otherwise reload SigLIP2, Whisper and VAD 40 times."""
+Indexing a folder of 40 files would otherwise reload SigLIP2, Whisper and VAD 40 times. Also the device choice, the
+one lock that serialises inference across UI requests and indexing, and the CPU fallback after a GPU out-of-memory
+error (on_device)."""
 from __future__ import annotations
 
 import hashlib
@@ -7,11 +9,61 @@ import os
 import shutil
 import threading
 import urllib.request
+import warnings
 from pathlib import Path
 from typing import Any, Callable
 
 _CACHE: dict[tuple, Any] = {}
 _LOCK = threading.RLock()
+# One model lock per process: UI requests and indexing must not run inference concurrently (MPS/CUDA memory).
+MODEL_LOCK = threading.RLock()
+
+
+def resolve_device(device: str) -> str:
+    """'auto' -> 'cuda', 'mps' or 'cpu' (whatever torch finds); anything else as given."""
+    if device != "auto":
+        return device
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    if getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def is_oom(exc: BaseException) -> bool:
+    """A CUDA (or MPS) out-of-memory error."""
+    try:
+        import torch
+
+        if isinstance(exc, torch.cuda.OutOfMemoryError):
+            return True
+    except Exception:  # torch missing or without CUDA support
+        pass
+    return "out of memory" in str(exc).lower()
+
+
+def on_device(device: str, what: str, fn: Callable[[], Any], to_cpu: Callable[[str], None]) -> Any:
+    """fn() on `device`. On a GPU out-of-memory error (another process holds the memory, e.g. a resident LLM): warn,
+    call to_cpu(message) (the caller switches to the CPU and drops the models it holds), clear the cache and run fn()
+    again, so a query never fails for memory. fn must fetch its models through the caller, not hold them."""
+    try:
+        return fn()
+    except Exception as exc:
+        if device == "cpu" or not is_oom(exc):
+            raise
+        msg = f"{what}: out of GPU memory on {device}; running on the CPU instead (slower)"
+        warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        to_cpu(msg)
+        try:
+            clear()  # the cached GPU copies would keep holding the memory
+            import torch
+
+            torch.cuda.empty_cache()
+        except Exception:
+            pass
+        return fn()
 
 
 def cached(key: tuple, load: Callable[[], Any]) -> Any:

@@ -58,14 +58,14 @@ def design(ds: Dataset, mu: np.ndarray, sd: np.ndarray, interactions: bool = Tru
     return out
 
 
-def fit_ranknet(Phi: np.ndarray, I: np.ndarray, J: np.ndarray, W: np.ndarray, l2: float, iters: int = 100,
+def fit_ranknet(Phi: np.ndarray, win: np.ndarray, lose: np.ndarray, W: np.ndarray, l2: float, iters: int = 100,
                 tol: float = 1e-10) -> np.ndarray:
-    """argmin_w  sum_k Wn_k log(1 + exp(-(phi_I - phi_J) w)) + l2 |w|^2,  Wn = W / sum W  (damped Newton)."""
+    """argmin_w  sum_k Wn_k log(1 + exp(-(phi_win - phi_lose) w)) + l2 |w|^2,  Wn = W / sum W  (damped Newton)."""
     d = Phi.shape[1]
     w = np.zeros(d)
-    if not len(I):
+    if not len(win):
         return w
-    Dm = Phi[I] - Phi[J]
+    Dm = Phi[win] - Phi[lose]
     Wn = W / W.sum()
 
     def loss(v):
@@ -107,8 +107,8 @@ def fit(ds: Dataset, learner: str, l2: float, seed: int = 0, meta: dict | None =
     mu, sd = standardise(ds.X)
     Phi = design(ds, mu, sd, interactions)
     if learner == "ranknet":
-        I, J, W = pairs(ds, seed=seed)
-        w = fit_ranknet(Phi, I, J, W, l2)
+        win, lose, W = pairs(ds, seed=seed)
+        w = fit_ranknet(Phi, win, lose, W, l2)
     elif learner == "ridge":
         lab = ds.labelled
         w = fit_ridge(Phi[lab], ds.y[lab], ds.w[lab], l2)

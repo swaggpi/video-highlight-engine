@@ -20,7 +20,7 @@ from vhe.config import (
 )
 
 # Bit i of grid["unusable"] set = reason REASONS[i] applies at that step. New reasons are appended, so older indexes
-# decode the same. SOFT reasons are recorded but do not make a step unusable (score.py penalises quality instead).
+# decode the same. SOFT reasons are recorded but do not make a step unusable (vhe.rank.signals lowers quality instead).
 REASONS = ("covered", "uniform", "blown_out", "blurry", "shaky", "obstructed", "bad_framing")
 SOFT = ("bad_framing",)
 SOFT_BITS = sum(1 << REASONS.index(r) for r in SOFT)
@@ -79,4 +79,10 @@ def usable_mask(luma: np.ndarray, contrast: np.ndarray, blown: np.ndarray, ratio
 
 
 def reason_names(bits: int) -> list[str]:
+    """The REASONS set in one step's bits."""
     return [r for i, r in enumerate(REASONS) if int(bits) >> i & 1]
+
+
+def reason_mask(bits: np.ndarray, *names: str) -> np.ndarray:
+    """bool per step: any of the named REASONS set in `bits` (grid["unusable"])."""
+    return (np.asarray(bits, dtype=np.uint8) & np.uint8(sum(1 << REASONS.index(r) for r in names))) > 0

@@ -14,9 +14,10 @@ from vhe.engine import Engine
 from vhe.index.store import Index, save_index
 from vhe.project import PROJECT_DIR, slug, write_manifest
 from vhe.query.candidates import cuts_inside
-from vhe.query.parser import ParsedQuery
-from vhe.rank.signals import relevance, robust_z, timestep_signals
+from vhe.query.model import ParsedQuery
 from vhe.rank.select import per_file_cap, select_for
+from vhe.rank.signals import relevance, timestep_signals
+from vhe.signals import robust_z
 
 FPS = 3.0
 DIM = 64
@@ -40,6 +41,7 @@ def make_index(root, dur, seed=0, has_audio=True, emb=None, **overrides):
             # scale-free, and clip edges are clean (vhe.query.refine.clean_steps) unless a case makes them swing
             "onset": rng.random(n) if has_audio else np.zeros(n), "cam_speed": 0.05 * rng.random(n),
             "shake": 0.05 * rng.random(n), "speech": np.zeros(n), "usable": np.ones(n, bool),
+            "unusable": np.zeros(n, np.uint8),
             "tags": np.zeros((n, 2), np.float16)}
     grid.update(overrides)
     meta = {"video": str(root / "v.mp4"), "fps": FPS, "duration": dur,

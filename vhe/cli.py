@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from vhe.config import Config
-from vhe.query.parser import DASHES
+from vhe.query.lexicon import DASHES
 
 
 def _fmt(t: float) -> str:

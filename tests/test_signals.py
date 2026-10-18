@@ -1,7 +1,9 @@
+import itertools
+
 import numpy as np
 
-from vhe.signals.changes import change_points
 from vhe.signals import fill_nan, to_grid
+from vhe.signals.changes import change_points
 from vhe.signals.highlight_nc import window_starts
 from vhe.signals.shots import detect_cuts, shots_from_cuts
 
@@ -38,7 +40,7 @@ def test_to_grid_and_fill():
 def test_window_starts_cover_video():
     starts = window_starts(400.0, 148.0, 30.0)
     assert starts[0] == 0.0 and abs(starts[-1] + 148.0 - 400.0) < 1e-6
-    assert all(b - a <= 118.0 + 1e-6 for a, b in zip(starts, starts[1:]))
+    assert all(b - a <= 118.0 + 1e-6 for a, b in itertools.pairwise(starts))
     assert window_starts(100.0, 148.0, 30.0) == [0.0]
 
 

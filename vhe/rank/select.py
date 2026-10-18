@@ -10,11 +10,13 @@ of each item, strong_matches, and never two back-to-back takes of one view). Can
 per-file cap keeps one take from dominating; it defers rather than forbids, so a budget can still be filled."""
 from __future__ import annotations
 
-import numpy as np
-
 import math
 
-from vhe.query.parser import MAX_CLIPS
+import numpy as np
+
+from vhe.query.model import MAX_CLIPS
+from vhe.query.refine import refine
+from vhe.rank.items import ITEM_MARGIN, eligible
 
 EXHAUSTIVE_MIN_TOTAL = 0.5  # in score units (about half a robust z above the length-bucket median)
 # Near-duplicates, calibrated on the irl-event judge's "redundant with" labels (r2 report, 114 flagged pairs out of
@@ -39,7 +41,7 @@ EXHAUSTIVE_MIN_SPEECH = 0.5  # speech-intent exhaustive queries: fraction of the
 #   margins 2.0 / 3.0: 14 / 2.21 / 0.79 / 11 of 11 and 29 / 2.45 / 0.86 / 25 of 36  (recall: more, weaker)
 # The fit-3 dancers sat 0.6-1.3 below their item's best match, the fit-3 float names of the fact-check list down
 # to 2.5 score units below their item's best: larger margins buy recall (a fact-check list) with precision.
-EXHAUSTIVE_MIN_REL = 0.5  # = vhe.query.plan.ITEM_MIN_REL: below it a span serves no item at all
+EXHAUSTIVE_MIN_REL = 0.5  # = vhe.rank.items.ITEM_MIN_REL: below it a span serves no item at all
 EXHAUSTIVE_ITEM_MARGIN = 1.5  # relevance units below the item's best match
 EXHAUSTIVE_SCORE_MARGIN = 2.5  # score units below the item's best clean span
 EXHAUSTIVE_MAX_UNUSABLE = 0.05  # fraction of unusable steps (the candidate gate allows 0.2)
@@ -50,6 +52,7 @@ EXHAUSTIVE_VISUAL_CAP = 20  # at most this many picks for a visual "every X" lis
 EXHAUSTIVE_DUP_GAP_S = 10.0
 EXHAUSTIVE_DUP_SIM = 0.9
 CAP_MIN_FILES = 4  # the per-file cap applies from this many files on
+EXTEND_STEP_S = 0.5  # budget fill: picks grow in steps of this many seconds
 
 
 def per_file_cap(count: int, n_files: int) -> int | None:
@@ -57,9 +60,10 @@ def per_file_cap(count: int, n_files: int) -> int | None:
     return max(2, math.ceil(count / 3)) if n_files >= CAP_MIN_FILES else None
 
 
-def overlap_fraction(a: tuple[float, float], b: tuple[float, float]) -> float:
-    inter = max(0.0, min(a[1], b[1]) - max(a[0], b[0]))
-    return inter / max(1e-9, min(a[1] - a[0], b[1] - b[0]))
+def disjoint(o: dict, others) -> bool:
+    """True if span `o` overlaps none of `others` (touching is fine). Spans are in virtual seconds, so spans of
+    different files never overlap."""
+    return all(min(o["end"], t["end"]) <= max(o["start"], t["start"]) for t in others)
 
 
 def duplicates(cands: list[dict], vectors: np.ndarray, o: dict, v: np.ndarray, gap: float = DUP_GAP_S,
@@ -115,7 +119,7 @@ def select(cands: list[dict], vectors: np.ndarray, n: int, lam: float = 1.0, sim
     alive = np.ones(len(cands), dtype=bool) if min_total is None else totals >= min_total
     alive &= lengths <= hi + 1e-6
     max_sim = np.full(len(cands), -1.0)
-    for t, tv in zip(taken, taken_vectors if taken_vectors is not None else [None] * len(taken)):
+    for t, tv in zip(taken, taken_vectors if taken_vectors is not None else [None] * len(taken), strict=True):
         inter = np.clip(np.minimum(ends, t["end"]) - np.maximum(starts, t["start"]), 0.0, None)
         alive &= ~((np.array([c.get("file", 0) for c in cands]) == t.get("file", 0)) & (inter > 0))
         if tv is not None:
@@ -169,8 +173,6 @@ def select_per_item(cands: list[dict], item_rel: np.ndarray, p, item_centre: np.
     clip. A clip's score for item i is its score with the relevance part replaced by its relevance to i; (item,
     clip) pairs are taken best first, clips never overlap or duplicate one another (with vectors), and the budget
     (if any) caps the total."""
-    from vhe.query.plan import ITEM_MARGIN, eligible
-
     if not cands:
         return []
     w = p.weights.get("relevance", 1.0)
@@ -184,8 +186,7 @@ def select_per_item(cands: list[dict], item_rel: np.ndarray, p, item_centre: np.
         j, i = np.unravel_index(int(np.argmax(score)), score.shape)
         c = cands[j]
         score[j, :] = -np.inf
-        if used + c["end"] - c["start"] > hi + 1e-6 or \
-                any(min(c["end"], o["end"]) > max(c["start"], o["start"]) for o in picked):
+        if used + c["end"] - c["start"] > hi + 1e-6 or not disjoint(c, picked):
             continue
         picked.append(dict(c, item=int(i), rank=len(picked)))
         used += c["end"] - c["start"]
@@ -228,7 +229,7 @@ def strong_matches(cands: list[dict], items: np.ndarray | None = None, item_rel:
 def select_for(cands: list[dict], vectors: np.ndarray, p, groups: np.ndarray | None = None,
                item_rel: np.ndarray | None = None, item_centre: np.ndarray | None = None,
                taken: list[dict] = (), taken_vectors: np.ndarray | None = None) -> list[dict]:
-    """Selection for a parsed query (vhe.query.parser.ParsedQuery) over refined, final-edge candidates: clips
+    """Selection for a parsed query (vhe.query.model.ParsedQuery) over refined, final-edge candidates: clips
     never overlap or repeat a moment (duplicates()); a budget is filled to at least its minimum when the pool allows,
     and never past its maximum. groups: file index per candidate, for the per-file cap (not applied to exhaustive
     queries). item_rel: (candidates, shot items) relevance to each item of p.shots. With two or more items, selection
@@ -262,3 +263,49 @@ def select_for(cands: list[dict], vectors: np.ndarray, p, groups: np.ndarray | N
     cap = None if groups is None else per_file_cap(p.count, len(set(groups.tolist())))
     return select(cands, vectors, p.count, max_overlap=0.0, budget_s=p.budget, n_max=n_max, groups=groups, cap=cap,
                   items=items, taken=taken, taken_vectors=taken_vectors, talk_track=talk)
+
+
+def fill_budget(body: list[dict], edges: list[dict], p, corpus, context, keep, other_s: float = 0.0) -> list[dict]:
+    """Below the budget minimum once the pool is used up: lengthen the visual picks (best first) toward the
+    brief's per-clip maximum, in EXTEND_STEP_S steps forward then backward, within their shot (no cut crossed),
+    keeping DUP_GAP_S from other picks in the file, passing the gates (keep(S, E, K) -> bool per span: vhe.rank.gate)
+    and ending on clean frames. context(k): file k's refine Context. other_s: runtime already taken outside body and
+    edges (a soundbite)."""
+    lo, hi = p.budget
+    used = sum(o["end"] - o["start"] for o in [*body, *edges]) + other_s
+    if used >= lo - 1e-6 or not body:
+        return body
+    c = corpus
+    others = [*body, *edges]
+    for o in sorted(body, key=lambda o: -o["total"]):
+        if used >= lo - 1e-6:
+            break
+        if o.get("source") == "speech":  # sentences are already whole
+            continue
+        k, off = o["file"], c.offsets[o["file"]]
+        ctx = context(k)
+        cuts = [off + x for x in ctx.cuts]
+        near = [x for x in others if x is not o and x["file"] == k]
+        limit_hi = min([off + ctx.duration] + [x["start"] - DUP_GAP_S for x in near if x["start"] >= o["end"]]
+                       + [x for x in cuts if x > o["end"] + 1e-6])
+        limit_lo = max([off] + [x["end"] + DUP_GAP_S for x in near if x["end"] <= o["start"]]
+                       + [x for x in cuts if x < o["start"] - 1e-6])
+        s, e = o["start"], o["end"]
+        base = used - (e - s)  # runtime without this clip
+        for direction in (1, -1):
+            while base + (e - s) < lo and e - s + EXTEND_STEP_S <= p.max_len + 1e-6 \
+                    and base + (e - s) + EXTEND_STEP_S <= hi + 1e-6:
+                s2, e2 = (s, e + EXTEND_STEP_S) if direction > 0 else (s - EXTEND_STEP_S, e)
+                if e2 > limit_hi + 1e-6 or s2 < limit_lo - 1e-6:
+                    break
+                if not keep(np.array([s2]), np.array([e2]), np.array([k]))[0]:
+                    break
+                s, e = s2, e2
+        if (s, e) == (o["start"], o["end"]):
+            continue
+        ls, le = refine(s - off, e - off, ctx, p.min_len, p.max_len)  # back onto clean frames and word gaps
+        ls, le = max(ls, limit_lo - off), min(le, limit_hi - off)
+        if le - ls > o["end"] - o["start"]:
+            used = base + (le - ls)
+            o["start"], o["end"], o["extended"] = off + ls, off + le, True
+    return body

@@ -6,9 +6,10 @@ from __future__ import annotations
 
 import numpy as np
 
+from vhe.config import CANDIDATE_LENGTHS
+from vhe.signals import smooth
 from vhe.signals.shots import shots_from_cuts
 
-LENGTHS = (3, 4, 6, 8, 10, 15, 20, 30, 45, 60, 90)
 SPEECH_GAP = 0.6  # utterances closer than this belong to one clip
 SPEECH_PAD = 0.15  # lead-in/out around speech, never more than half the pause to the neighbour
 SENTENCE_END = (".", "!", "?", "…", "。")
@@ -163,7 +164,7 @@ def fit_utterances(spans: list[tuple[float, float]], lo: float, hi: float, durat
 def generate(duration: float, cuts: list[float], change_points: list[float], min_len: float, max_len: float,
              peaks: list[float] = (), proposals: list[tuple] = (),
              speech: list[tuple[float, float]] = ()) -> list[tuple[float, float, str]]:
-    lengths = [L for L in LENGTHS if min_len <= L <= max_len] or [float(np.clip(8.0, min_len, max_len))]
+    lengths = [L for L in CANDIDATE_LENGTHS if min_len <= L <= max_len] or [float(np.clip(8.0, min_len, max_len))]
     seen: set[tuple[float, float]] = set()
     out: list[tuple[float, float, str]] = []
 
@@ -200,6 +201,24 @@ def generate(duration: float, cuts: list[float], change_points: list[float], min
         start = min(max(0.0, c - L / 2), max(0.0, duration - L))
         add(start, start + L, "model")
     return out
+
+
+def corpus_candidates(corpus, per_step: np.ndarray, p, proposals: list[list]) -> tuple:
+    """generate() per file of a corpus, on the file's own timeline (peaks of its part of per_step, its cuts, change
+    points and utterances; proposals: the highlight model's, per file), then shifted: (start, end, file, source)
+    arrays in virtual seconds. p: the ParsedQuery (min_len, max_len)."""
+    c, fps = corpus, corpus.fps
+    out = []
+    for k, ix in enumerate(c.members):
+        speech = speech_spans((ix.transcript or {}).get("segments", []), ix.vad, p.max_len)
+        peaks = peak_times(smooth(per_step[c.bounds[k]:c.bounds[k + 1]], fps), fps)
+        out += [(c.offsets[k] + s, c.offsets[k] + e, k, src)
+                for s, e, src in generate(float(c.durations[k]), ix.cuts, ix.change_points, p.min_len, p.max_len,
+                                          peaks=peaks, proposals=proposals[k], speech=speech)]
+    if not out:
+        return np.zeros(0), np.zeros(0), np.zeros(0, int), []
+    S, E, K, src = zip(*out, strict=True)
+    return np.array(S), np.array(E), np.array(K), list(src)
 
 
 def cuts_inside(s, e, cuts: np.ndarray, margin: float = 0.3):

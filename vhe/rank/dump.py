@@ -24,7 +24,15 @@ from pathlib import Path
 
 import numpy as np
 
-from vhe.rank.features import FEATURE_VERSION, FEATURES, QUERY_VERSION
+from vhe.query.model import ParsedQuery, item_name
+from vhe.rank.features import (
+    FEATURE_VERSION,
+    FEATURES,
+    QUERY_VERSION,
+    featurize,
+    query_names,
+    query_vector,
+)
 
 FORMAT = "vhe-candidates/1"
 STAGES = ("candidate", "shortlist", "edge", "topic", "external")
@@ -60,7 +68,7 @@ def build(*, scorer: str, corpus_root: str, n_files: int, brief: str, parsed: di
                     "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "corpus_root": corpus_root, "n_files": int(n_files)},
             "query": {"brief": brief, "parsed": parsed, "persona": persona,
-                      "q": {n: float(v) for n, v in zip(q_names, q)}},
+                      "q": {n: float(v) for n, v in zip(q_names, q, strict=True)}},
             "feature_names": list(FEATURES), "candidates": candidates}
 
 
@@ -87,3 +95,69 @@ def load_spans(path: Path | str) -> list[dict]:
     if not isinstance(d, list) or not all(isinstance(s, dict) and {"file", "start", "end"} <= s.keys() for s in d):
         raise ValueError(f"{path}: expected a list of {{file, start, end}} spans")
     return d
+
+
+# ---- a run's dump, built from the engine's state ---------------------------------------------------------------------
+def span_label(corpus, k: int, s: float, e: float) -> tuple[str, float, float]:
+    """(file label, file-local start, end) of virtual span s..e in file k, exactly as an output clip has it."""
+    hit = corpus.locate(int(k), round(float(s), 3), round(float(e), 3))
+    return hit["file"], hit["file_start"], hit["file_end"]
+
+
+def document(corpus, scorer, brief: str, p: ParsedQuery, persona: str | None, candidates: list[dict]) -> dict:
+    """build() for a run of `scorer` on `corpus`."""
+    c = corpus
+    personas = scorer.personas
+    return build(scorer=scorer.name, corpus_root=str(c.root or c.members[0].root), n_files=len(c.members),
+                 brief=brief, parsed=p.to_dict(), persona=persona, q=query_vector(p, persona, personas),
+                 q_names=query_names(personas), candidates=candidates)
+
+
+def write_run(path: Path | str, corpus, scorer, brief: str, p: ParsedQuery, persona: str | None, sig: dict,
+              pool: list[dict] = (), edges: dict[str, dict] | None = None, body: list[dict] = (),
+              topic: list[dict] = (), trace: dict | None = None) -> None:
+    """Write the run's candidates: with a trace every gated candidate as generated, the shortlist with its refined
+    edges and final totals (selected ones with their selection rank and item), the opener/closer and topic clips.
+    Every feature vector uses the brief's signals."""
+    c = corpus
+    out = []
+    if trace:
+        for j in range(len(trace["S"])):
+            out.append(entry(*span_label(c, trace["K"][j], trace["S"][j], trace["E"][j]), trace["src"][j],
+                             "candidate", trace["s"][j], trace["X"][j]))
+    picked = {o["cid"]: o for o in body}
+    for o in pool:
+        b = picked.get(o["cid"])
+        out.append(entry(*span_label(c, o["file"], o["start"], o["end"]), o["source"], "shortlist", o["total"],
+                         o["x"], selected=b is not None, rank=None if b is None else b["rank"],
+                         item=item_name(p, (b or o).get("item"))))
+    extra = [(o, "edge", role) for role, o in (edges or {}).items()] + \
+        [({"file": c.files.index(t["file"]), "start": t["start"], "end": t["end"], "source": t["source"],
+           "total": t["score"], "item": t["item"]}, "topic", t["role"]) for t in topic]
+    if extra:
+        S, E, K = (np.array([o[key] for o, _, _ in extra]) for key in ("start", "end", "file"))
+        X = featurize(c, sig, S, E, K, [o["source"] for o, _, _ in extra], p)
+        for (o, stage, role), x in zip(extra, X, strict=True):
+            out.append(entry(*span_label(c, o["file"], o["start"], o["end"]), o["source"], stage, o["total"],
+                             x, selected=True, role=role, item=item_name(p, o.get("item"))))
+    write(path, document(c, scorer, brief, p, persona, out))
+
+
+def external_spans(corpus, scorer, brief: str, p: ParsedQuery, persona: str | None, sig: dict,
+                   spans: list[dict]) -> dict:
+    """The dump document (stage "external") for spans picked outside the engine (an editor, another model):
+    {"file", "start", "end"} in file-local seconds; "source", "selected", "rank", "role" and "item" are carried over
+    when given. sig: the brief's signals; the score is the scorer's score() over these spans."""
+    c = corpus
+    K = np.array([c.file_index(sp["file"]) for sp in spans], dtype=int)
+    S = np.array([c.offsets[k] + min(max(float(sp["start"]), 0.0), c.durations[k])
+                  for sp, k in zip(spans, K, strict=True)])
+    E = np.array([c.offsets[k] + min(max(float(sp["end"]), 0.0), c.durations[k])
+                  for sp, k in zip(spans, K, strict=True)])
+    src = [str(sp.get("source") or "external") for sp in spans]
+    X = featurize(c, sig, S, E, K, src, p)
+    scores = scorer.score(X, query_vector(p, persona, scorer.personas)) if len(X) else []
+    out = [entry(*span_label(c, k, s, e), source, "external", sc, x, selected=bool(sp.get("selected", False)),
+                 rank=sp.get("rank"), role=sp.get("role"), item=sp.get("item"))
+           for sp, k, s, e, source, sc, x in zip(spans, K, S, E, src, scores, X, strict=True)]
+    return document(c, scorer, brief, p, persona, out)

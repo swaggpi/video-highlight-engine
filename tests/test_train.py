@@ -74,16 +74,16 @@ def test_pairs_within_query_with_label_and_pool_weights():
     rows = make_rows(n_queries=2, per_query=4, n_pool=3)
     rows[1]["label_kind"], rows[1]["weight"] = "label_transfer", 0.5
     ds = bd.build(rows)
-    I, J, W = bd.pairs(ds, seed=1)
-    assert len(I) and np.all(ds.query[I] == ds.query[J])
+    win, lose, W = bd.pairs(ds, seed=1)
+    assert len(win) and np.all(ds.query[win] == ds.query[lose])
     lab = ds.labelled
-    for i, j, w in zip(I, J, W):
+    for i, j, w in zip(win, lose, W, strict=True):
         if ds.kind[j] == "pool_negative":
             assert ds.y[i] >= 2 / 3 - 1e-9 and w == pytest.approx(0.3 * ds.w[i])
         else:
             assert lab[i] and lab[j] and ds.y[i] - ds.y[j] >= 1 / 3 - 1e-9 and w == min(ds.w[i], ds.w[j])
     assert 0.5 in W                                              # the transferred row's pairs are half weight
-    assert np.sum(ds.kind[J] == "pool_negative") <= 5 * np.sum(lab & (ds.y >= 2 / 3 - 1e-9))
+    assert np.sum(ds.kind[lose] == "pool_negative") <= 5 * np.sum(lab & (ds.y >= 2 / 3 - 1e-9))
 
 
 def test_ranknet_recovers_the_true_direction_and_ignores_masked_columns():

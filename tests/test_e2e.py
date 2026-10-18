@@ -66,7 +66,7 @@ def test_index_folder_end_to_end(tmp_path):
     manifest, (idx,) = load_project(tmp_path)
     assert idx.meta["tiny_fps"] == 25.0 and idx.meta["tiny_frames"] == 100
     assert idx.has_audio and "has_audio" not in idx.grid
-    assert idx.n == 12 and idx.usable.shape == (12,) and idx.unusable_reasons.dtype == np.uint8
+    assert idx.n == 12 and idx.usable.shape == (12,) and idx.grid["unusable"].dtype == np.uint8
     assert manifest["files"][0]["usable_fraction"] == idx.meta["usable_fraction"]
     assert idx.meta["source_size"] == (tmp_path / "A001.mov").stat().st_size
     assert not (tmp_path / manifest["files"][0]["index_dir"] / "frames").exists()  # cache removed

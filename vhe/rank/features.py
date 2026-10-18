@@ -15,8 +15,9 @@ import re
 import numpy as np
 
 from vhe.query.candidates import cuts_inside
-from vhe.query.plan import OCR_GENERIC, assign, item_scores, muted_steps, ocr_item_scores
-from vhe.rank.signals import span_max, span_mean, span_min, span_top_mean
+from vhe.query.text_match import OCR_GENERIC, ocr_item_scores
+from vhe.rank.items import assign, item_scores
+from vhe.rank.signals import muted_steps, span_max, span_mean, span_min, span_top_mean
 from vhe.signals.tags import LABELS
 
 # v2 (2026-10-18): the index v3 framing, face, approach and on-screen text columns appended (FEATURES_V2) and the
@@ -93,7 +94,7 @@ def target_len(p) -> float:
 
 def query_vector(p, persona: str | None = None, personas: tuple[str, ...] | list[str] = PERSONAS,
                  weights: dict | None = None) -> np.ndarray:
-    """(len(query_names(personas)),) float64 for a parsed brief (vhe.query.parser.ParsedQuery). weights: the signal
+    """(len(query_names(personas)),) float64 for a parsed brief (vhe.query.model.ParsedQuery). weights: the signal
     weights to score with when they are not the brief's (the opener/closer pools). An unknown persona is all zeros."""
     w = p.weights if weights is None else weights
     target = target_len(p)
@@ -102,9 +103,8 @@ def query_vector(p, persona: str | None = None, personas: tuple[str, ...] | list
          float(p.budget is not None), target, math.log(max(target, 1e-3)),
          float(bool(p.shots)), float(len(p.shots)), float(bool(p.avoid)), float(bool(p.topics)),
          float(p.need_live_audio)]
-    framing = getattr(p, "framing", "none")
-    v += [float(framing == x) for x in FRAMINGS]
-    v += [float(bool(getattr(p, k, False))) for k in ("want_faces", "hook", "legible_text", "centered")]
+    v += [float(p.framing == x) for x in FRAMINGS]
+    v += [float(bool(x)) for x in (p.want_faces, p.hook, p.legible_text, p.centered)]
     v += [float(persona == x) for x in personas]
     return np.array(v, dtype=np.float64)
 

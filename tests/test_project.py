@@ -7,7 +7,13 @@ import pytest
 from vhe import project
 from vhe.config import Config
 from vhe.ingest.decode import Probe
-from vhe.project import discover_videos, index_project, load_project, natural_key, order_key
+from vhe.project import (
+    discover_videos,
+    index_project,
+    load_project,
+    natural_key,
+    order_key,
+)
 
 
 def _touch(path: Path, data: bytes = b"x") -> Path:
@@ -144,3 +150,28 @@ def test_load_project_returns_ok_indexes(tmp_path, monkeypatch):
     assert len(manifest["files"]) == 2 and len(indexes) == 1 and loaded[0].startswith("a.mp4-")
     with pytest.raises(FileNotFoundError):
         load_project(tmp_path / "nothing")
+
+
+# ---- index freshness and language detection --------------------------------------------------------------------------
+def test_index_version_bump_triggers_reindex(tmp_path, monkeypatch):
+    _touch(tmp_path / "a.mp4")
+    monkeypatch.setattr("vhe.ingest.decode.probe", _fake_probe({}))
+    cfg = Config(asr_language="en")
+    index_project(tmp_path, cfg, indexer=FakeIndexer())
+    same = FakeIndexer()
+    index_project(tmp_path, cfg, indexer=same)
+    assert same.calls == []
+    monkeypatch.setattr(project, "INDEX_VERSION", project.INDEX_VERSION + 1)
+    bumped = FakeIndexer()
+    index_project(tmp_path, cfg, indexer=bumped)
+    assert [c[0] for c in bumped.calls] == ["a.mp4"]
+
+
+def test_language_detection_decodes_only_the_start(tmp_path, monkeypatch):
+    cmds = []
+    monkeypatch.setattr(project.subprocess, "run", lambda cmd, **kw: cmds.append(cmd))
+    monkeypatch.setattr("vhe.signals.audio.load_audio", lambda p: None)
+    monkeypatch.setattr("vhe.signals.audio.voice_activity", lambda y: [])
+    monkeypatch.setattr("vhe.signals.speech.detect_language", lambda *a: ("de", 0.9))
+    assert project.detect_file_language(tmp_path / "a.mp4", Config(), "cpu") == ("de", 0.9)
+    assert cmds[0][cmds[0].index("-t") + 1] == str(project.LANG_DETECT_DECODE_S)

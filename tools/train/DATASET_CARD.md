@@ -76,8 +76,9 @@ function of the features); the mask travels in the model file.
 - **Few, correlated sources.** Each footage set is one shoot by one person (irl-event: one handheld livestream;
   festival-commons: one uploader's phone), so camera, location and style are shared by every row of a set. Briefs
   were written for the set by one author; two runs of the same brief are not independent (folds are by brief).
-- **Small.** Tens of briefs, hundreds of labelled rows: the 426-weight interaction model (`phi = [z, outer(z,
-  q_small)]`) can overfit; CV picks the L2 and `--no-interactions` fits 71 weights.
+- **Small.** Tens of briefs, hundreds of labelled rows: the 492-weight interaction model (`phi = [z, outer(z,
+  q_small)]`: 82 features x (1 + 5 signal weights)) can overfit; CV picks the L2 and `--no-interactions` fits 82
+  weights.
 - **Parse noise.** The brief is parsed by a local LLM; app and Opus rows of one brief can carry different `q` if the
   parse differs between calls (`eval_rank.py` reports how many queries are affected).
 - **Code-version mix.** `vhe features` should run the same app code as the run; for runs whose app snapshot predates

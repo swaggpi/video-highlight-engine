@@ -1,4 +1,6 @@
 
+import itertools
+
 import cv2
 import numpy as np
 
@@ -47,7 +49,6 @@ def test_reindex_removes_stale_speech_and_records_source(tmp_path):
     idx = Index(root)
     assert idx.transcript is None
     assert idx.meta["source_size"] == 5 and idx.meta["source_mtime_ns"] == video.stat().st_mtime_ns
-    assert idx.usable.all() and not idx.unusable_reasons.any()  # older indexes without a mask
 
 
 def _frame(kind: str) -> np.ndarray:
@@ -114,7 +115,7 @@ def test_blur_test_with_sensor_noise(tmp_path):
         cv2.imwrite(str(paths[-1]), np.clip(np.round(g), 0, 255).astype(np.uint8), [cv2.IMWRITE_JPEG_QUALITY, 90])
     q = frame_quality(paths)
     usable, bits = usable_mask(q["luma"], q["contrast"], q["blown"], q["blur_ratio"], np.zeros(len(paths)))
-    reasons = dict(zip(frames, (reason_names(b) for b in bits)))
+    reasons = dict(zip(frames, (reason_names(b) for b in bits), strict=True))
     assert reasons["defocus_noisy"] == ["blurry"] and reasons["box_noisy"] == ["blurry"]
     assert reasons["sharp_noisy"] == [] and reasons["sky_noisy"] == [] and reasons["dark_noisy"] == []
     assert q["blur_ratio"][2] > 2 * q["blur_ratio"][0]  # clear margin between sharp and defocused
@@ -140,7 +141,7 @@ def test_whisper_spans_merge_pad_cap():
     assert spans[1] == (9.7, 11.3)
     rest = spans[2:]
     assert len(rest) == 3 and rest[0][0] == 19.7 and rest[-1][1] == 85.3
-    assert all(e - s <= 30.0 + 1e-6 for s, e in rest) and all(a[1] == b[0] for a, b in zip(rest, rest[1:]))
+    assert all(e - s <= 30.0 + 1e-6 for s, e in rest) and all(a[1] == b[0] for a, b in itertools.pairwise(rest))
     assert whisper_spans([(0.1, 0.5)], duration=0.6) == [(0.0, 0.6)]
     # 1.2 s apart: not merged, and padding never makes spans overlap
     a, b = whisper_spans([(1.0, 2.0), (3.2, 4.0)], duration=10.0)

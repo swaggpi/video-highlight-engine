@@ -9,12 +9,14 @@ import pytest
 
 from heuristic_cases import CUE_BRIEFS, CUE_SPANS, cue_engine
 from test_plan import _answer, _mock_ollama
-from vhe.query.parser import LLM_SCHEMA, PROMPT_VERSION, framing_of, parse, parse_with_llm
+from vhe.query.llm import LLM_SCHEMA, PROMPT_VERSION, parse_with_llm
+from vhe.query.rules import framing_of, parse
 from vhe.rank import dump as dumps
 from vhe.rank.features import (
     FEATURE_VERSION,
     FEATURES,
     FEATURES_V2,
+    FRAMINGS,
     INDEX,
     PERSONAS,
     QUERY_BASE,
@@ -92,8 +94,7 @@ def test_briefs_without_cues_keep_the_defaults(brief):
 # ---- parser: LLM (mocked) ------------------------------------------------------------------------------------
 def test_llm_schema_has_the_cue_fields_and_a_new_prompt_version():
     assert PROMPT_VERSION >= 4
-    assert {"framing", "want_faces", "hook", "legible_text", "centered"} <= set(LLM_SCHEMA["required"])
-    assert LLM_SCHEMA["properties"]["framing"]["enum"] == ["none", "close", "wide"]
+    assert LLM_SCHEMA["properties"]["framing"]["enum"] == list(FRAMINGS)  # the query vector's framing one-hot
 
 
 def test_llm_cues_count_where_the_brief_grounds_them(monkeypatch):

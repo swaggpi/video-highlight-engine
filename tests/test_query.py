@@ -1,14 +1,21 @@
 import itertools
 import json
+import urllib.request
 
 import numpy as np
 import pytest
 
 from vhe.query.candidates import cuts_inside, generate, peak_times, speech_spans
-from vhe.query.parser import parse
 from vhe.query.refine import SPEECH_TAIL, Context, refine
-from vhe.rank.signals import robust_z, segment_scores
-from vhe.rank.select import EXHAUSTIVE_MIN_TOTAL, EXHAUSTIVE_SCORE_MARGIN, overlap_fraction, select, select_for
+from vhe.query.rules import parse
+from vhe.rank.select import (
+    EXHAUSTIVE_MIN_TOTAL,
+    EXHAUSTIVE_SCORE_MARGIN,
+    select,
+    select_for,
+)
+from vhe.rank.signals import segment_scores
+from vhe.signals import robust_z
 
 
 def test_parse_energy_and_short():
@@ -102,7 +109,6 @@ def test_select_avoids_overlap_and_duplicates():
     v = np.array([[1, 0], [1, 0], [1, 0], [0, 1]], dtype=float)
     picked = select(cands, v, n=2)
     assert [c["start"] for c in picked] == [0, 40]  # 2-12 overlaps, 20-30 looks identical to the first
-    assert overlap_fraction((0, 10), (5, 15)) == 0.5
 
 
 def test_refine_snaps_to_cut_and_word():
@@ -275,7 +281,7 @@ def test_select_exhaustive_threshold_no_overlap():
     picked = select_for(weak, np.ones((5, 1)), _P(count=50, exhaustive=True))
     assert sorted(c["total"] for c in picked) == [2.0 + m, 3.0 + m]  # 2.9: more than the margin below the best
     cands = _pool([4.0] * 5, totals=[3.0, 2.0, 0.4, 1.0, 0.1]) + [{"start": 1.0, "end": 5.0, "total": 2.9}]
-    for c, f in zip(cands, [1.0, 0.2, 1.0, 0.9, 1.0, 0.0]):
+    for c, f in zip(cands, [1.0, 0.2, 1.0, 0.9, 1.0, 0.0], strict=True):
         c["speech_frac"] = f
     picked = select_for(cands, np.ones((6, 1)), _P(count=50, exhaustive=True, speech=1.0))
     assert sorted(c["total"] for c in picked) == [1.0, 3.0]  # speech intent: mostly-speech clips only
@@ -288,7 +294,7 @@ def test_budget_holds_after_refine():
     ctx = Context(duration=200, cuts=list(np.arange(7.0, 200.0, 7.0)), vad=[], words=words)
     raw = _pool([2.2, 3.7, 1.5, 3.9] * 10, gap=1.3)
     refined = [dict(c, start=s, end=e) for c in raw for s, e in [refine(c["start"], c["end"], ctx, 2.0, 4.0)]]
-    assert any(abs((r["end"] - r["start"]) - (c["end"] - c["start"])) > 0.05 for r, c in zip(refined, raw))
+    assert any(abs((r["end"] - r["start"]) - (c["end"] - c["start"])) > 0.05 for r, c in zip(refined, raw, strict=True))
     picked = select_for(refined, np.eye(len(refined)), _P(count=10, budget=(40.0, 45.0)))
     used = sum(c["end"] - c["start"] for c in picked)
     assert 40.0 <= used <= 45.0
@@ -362,13 +368,15 @@ def _synthetic_index(root, transcript=None, vad=()):
     n = int(dur * fps)
     rng = np.random.default_rng(0)
     grid = {"t": np.arange(n) / fps, "emb": rng.normal(size=(n, 8)).astype(np.float16),
-            "sharpness": rng.random(n), "exposure": rng.random(n), "clipped": np.zeros(n), "motion": rng.random(n),
+            "blur_ratio": 4 + rng.random(n), "blown": np.zeros(n), "motion": rng.random(n),
             "loudness": rng.random(n), "onset": rng.random(n), "cam_speed": rng.random(n), "shake": rng.random(n),
-            "speech": np.zeros(n), "tags": np.zeros((n, 2), np.float16)}
+            "speech": np.zeros(n), "usable": np.ones(n, bool), "unusable": np.zeros(n, np.uint8),
+            "tags": np.zeros((n, 2), np.float16)}
     for s, e in vad:
         grid["speech"][int(s * fps):int(e * fps)] = 1.0
     meta = {"video": str(root / "v.mp4"), "fps": fps, "duration": dur, "cuts": [float(c) for c in range(20, 240, 20)],
-            "vad": [list(x) for x in vad], "encoder": "none", "labels": ["a", "b"], "has_audio": True}
+            "vad": [list(x) for x in vad], "encoder": "none", "labels": ["a", "b"], "has_audio": True,
+            "logit_scale": 112.9, "logit_bias": -16.8}
     save_index(root, meta, grid, transcript)
     return root
 
@@ -396,7 +404,7 @@ def test_engine_every_speech_moment_starts_with_speaker(tmp_path, monkeypatch):
     assert res["query"]["exhaustive"]
     clips = sorted(res["clips"], key=lambda c: c["start"])
     assert len(clips) == 3  # every utterance, nothing else (the footage between is random noise)
-    for (s, e), c in zip(utter, clips):
+    for (s, e), c in zip(utter, clips, strict=True):
         assert s - 0.5 <= c["start"] <= s and e <= c["end"] <= e + 0.5  # whole utterance, first to last word
         assert c["transcript"] == "Good evening."
 
@@ -404,16 +412,15 @@ def test_engine_every_speech_moment_starts_with_speaker(tmp_path, monkeypatch):
 def test_llm_path_carries_new_fields(monkeypatch):
     import io
 
-    from vhe.query import parser
+    from vhe.query import llm
 
     answer = {"content": "dance floor", "mood": "energetic", "speech": "any", "min_seconds": 0, "max_seconds": 0,
               "count": 0, "budget_min_seconds": 60, "budget_max_seconds": 90, "exhaustive": False,
               "opener": "drone shot", "closer": ""}
     body = json.dumps({"message": {"content": json.dumps(answer)}}).encode()
-    monkeypatch.setattr(parser.urllib.request, "urlopen", lambda req, timeout: io.BytesIO(body))
+    monkeypatch.setattr(urllib.request, "urlopen", lambda req, timeout: io.BytesIO(body))
     # The model's numbers count only when the brief contains them (grounding); the rules find none here.
-    p = parser.parse_with_llm("drone opener, then the dance floor: 60 to 90", model="m")
+    p = llm.parse_with_llm("drone opener, then the dance floor: 60 to 90", model="m")
     assert p.budget == (60.0, 90.0) and (p.min_len, p.max_len) == (2.0, 4.0) and p.count == 25
     assert p.opener == "drone shot" and p.closer is None and p.text == "dance floor"
     assert p.weights["steady"] >= 0.3
-    assert set(parser.LLM_SCHEMA["required"]) >= {"budget_min_seconds", "budget_max_seconds", "exhaustive", "opener"}

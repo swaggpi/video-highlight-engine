@@ -14,7 +14,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from vhe.query.candidates import LENGTHS
+from vhe.config import CANDIDATE_LENGTHS
 from vhe.rank.features import (
     FEATURE_VERSION,
     FEATURES,
@@ -53,10 +53,6 @@ CENTER_BONUS = 0.3  # centered: the largest face near the frame centre (subjects
 WIDE_BONUS = 0.8  # framing wide: shot scale
 WIDE_CLOSE_PENALTY = 0.6  # framing wide: a close-up costs this at full close score
 OCR_MATCH_BONUS = 0.6  # legible_text: an item's words read by OCR in the span (the legibility prior is in relevance)
-# The hook slot (vhe.engine): the opener is drawn from a pool scored with these weights and framing "close". No
-# steadiness weight: a hook moves (the flag swept at the lens reads steady -3 from the motion it causes); the
-# usable gate still drops covered, blurred and very shaky spans, and EDGE_PENALTY unclean edges.
-HOOK_WEIGHTS = {"relevance": 0.5, "energy": 0.8, "steady": 0.0, "quality": 0.3}
 
 
 def _ramp(x, lo: float, hi: float):
@@ -136,7 +132,7 @@ class HeuristicScorer:
                  "speech": _col(X, "speech_frac") * 2 - 1}
         total = sum(self._w(q, k) * means[k] for k in SIGNALS)
         length = _col(X, "length_s")
-        bucket = np.searchsorted(np.asarray(LENGTHS, dtype=float), length - 1e-6)
+        bucket = np.searchsorted(np.asarray(CANDIDATE_LENGTHS, dtype=float), length - 1e-6)
         for b in np.unique(bucket):
             if np.count_nonzero(bucket == b) >= BUCKET_MIN:
                 total[bucket == b] -= np.median(total[bucket == b])

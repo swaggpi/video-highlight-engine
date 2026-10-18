@@ -8,6 +8,8 @@ establishing shot" or "every moment the host talks to camera". Runs locally (CPU
 > checkpoint is trained on QVHighlights (CC BY-NC-SA). It is for prototyping only and is switched off with
 > `--no-nc`. Everything else uses commercially usable licences; see `LICENSES.md`.
 
+Module map, data flow and where a learned ranker plugs in: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+
 ## Setup
 
 Requires Python 3.11 (Lighthouse pins old numpy) and ffmpeg.
@@ -23,6 +25,10 @@ mkdir -p ~/.cache/vhe/models
 curl -L -o ~/.cache/vhe/models/clip_cg_detr_qvhighlight.ckpt \
   https://zenodo.org/records/13960580/files/clip_cg_detr_qvhighlight.ckpt
 ```
+
+torchvision, torchaudio and msclap are only needed by the non-commercial component (OpenAI CLIP and Lighthouse
+import them); vhe itself does not. Optional: a local [Ollama](https://ollama.com) server with `qwen3:4b` (brief
+parsing) and `bge-m3` (spoken-topic matching); without it the rules parse the brief and topics match by keywords.
 
 NVIDIA GPU (e.g. GTX 1660 Super, Turing): use the CUDA build of torch instead of the CPU one; `--device auto`
 then picks CUDA and runs SigLIP2 and Whisper in fp16.
@@ -48,58 +54,67 @@ vhe info footage/                   # project files and status (or a video's ind
 vhe ui                              # http://127.0.0.1:8765: folder or file, Index, brief, Find clips, Search, Export
 ```
 
-Briefs: a total runtime ("60-90 s recap") or per-clip lengths ("3-6 s each"), a count, a mood (energetic/calm),
-speech ("talks to camera", "every moment ... speaks"), "every/all ..." for exhaustive lists (visual ones keep only
-strong, distinct matches of each item, at most 20 without a count), and "open with ..." /
-"end with ..." for the first and last shot. A multi-sentence brief becomes a plan: a list of wanted shots ("build
-through the mounted police, the band, dancers ..."; relevance is the best item, and selection takes every item once
-before any twice; "every float: A, B, C" gives the best clip per named item and skips items with no footage), things
-to leave out ("leave out shots where ...", "no whip-pans"; a bounded relevance penalty), spoken topics ("talks
-about ...", "explains ...", "sums up ..."; transcript sentences matched with Ollama bge-m3 embeddings, or keyword
-overlap without it), live sound ("with natural sound (not muted)": muted stretches are dropped) and a soundbite next
-to the visual clips ("the best 5-8 s soundbite where ..."). Forbidden things are dropped, not penalised; an excluded
-item about text or politics ("nothing with 'executed' on it", "no protest signs", "nothing political") also drops
-every clip whose on-screen text (OCR) holds one of its quoted words or a political term. A montage whose sound comes
-later ("music bed to be added", "it goes under music", "to sit under a voice-over") gets speech-free clips only.
-Speech clips hold their first and last word whole (lead-in 0.25 s, tail 0.4 s, at most to the middle of the pause).
-Visual cues: framing close ("close-ups", "faces", "fills
-the frame", "right at the camera", "centred", "vertical"/"9:16", "POV", "hook") or wide ("establishing", "wide view",
-"the street as the main character") weights the index's shot scale, largest face and approach (wide also penalises
-close-ups); "faces" and "centred" add the face size and centring terms; "hook" / "the first clip has to grab in the
-first second" makes the first clip the best hook candidate (close, approaching, energetic, usable, within the clip
-length); "names / text readable" adds an OCR legibility prior to the items that ask for it and prefers spans where an
-item's name is read. Cues in the opener/closer description or in avoid clauses do not count for the whole edit.
-The brief is parsed by a local Ollama model (`qwen3:4b`,
-or `--llm MODEL` / `$VHE_LLM`; answers cached in `~/.cache/vhe/parse/`) when the server is reachable, else by the
-rules; numbers the model returns that are not in the brief are ignored. `--no-llm` forces the rules.
+What a brief can say (English or German):
+
+- **Length and count**: a total runtime ("60-90 s recap") or per-clip lengths ("3-6 s each"), a count ("5 clips").
+- **Mood and speech**: energetic / calm; "talks to camera", "every moment ... speaks"; "no talking".
+- **Exhaustive lists**: "every / all ...". Visual ones keep only strong, distinct matches of each item (at most 20
+  without a count); "every float: A, B, C" gives the best clip per named item and skips items with no footage.
+- **First and last shot**: "open with ..." / "end with ...".
+- **A shot list**: "build through the mounted police, the band, dancers ...": relevance is the best item, and
+  selection takes every item once before any twice.
+- **Things to leave out**: "avoid ..." is a bounded relevance penalty; "no / never / leave out ..." drops the clip.
+  Camera defects ("no whip-pans", "camera at the ground", "something blocks the lens") use the index's defect
+  signals; an excluded item about text or politics ("nothing with 'executed' on it", "no protest signs", "nothing
+  political") also drops every clip whose on-screen text (OCR) holds one of its quoted words or a political term.
+- **Spoken topics**: "talks about ...", "explains ...", "sums up ...": transcript sentences matched with bge-m3
+  embeddings (keyword overlap without Ollama); "the best 5-8 s soundbite where ..." adds one next to the visual clips.
+- **Sound**: "with natural sound (not muted)" drops muted stretches; a montage whose sound comes later ("music bed
+  to be added", "it goes under music") gets speech-free clips only.
+- **Visual cues**: framing close ("close-ups", "faces", "fills the frame", "right at the camera", "vertical",
+  "9:16", "POV") or wide ("establishing", "wide view", "the street as the main character") weights the index's shot
+  scale, largest face and approach (wide also penalises close-ups); "centred" adds face centring; "hook" / "the first
+  clip has to grab in the first second" makes the first clip the best hook candidate; "names / text readable" adds an
+  OCR legibility prior and prefers spans where an item's name is read. Cues inside the opener/closer description or
+  an avoid clause do not count for the whole edit.
+
+Every clip starts and ends on clean frames (visual) or holds whole sentences with the first and last word whole
+(speech: lead-in 0.25 s, tail 0.4 s, at most to the middle of the pause); no moment is picked twice. The brief is
+parsed by a local Ollama model (`qwen3:4b`, or `--llm MODEL` / `$VHE_LLM`; answers cached in `~/.cache/vhe/parse/`)
+when the server is reachable, else by the rules; numbers the model returns that are not in the brief are ignored.
+`--no-llm` forces the rules.
 
 Output: `--json` writes `{"query", "parser", "parsed", "clips": [{"file", "start", "end", "duration", "score",
-"reason", "source", "role", "item"}]}` in edit order with file-local seconds; `item` is the shot item (or spoken
-topic) a clip serves, `role` is opener/closer/soundbite. `--export DIR` writes one preview file per clip, `clips.csv`
-(order, file, start, end, duration) and `edit.edl` (CMX3600, references the original files for relinking in
-Resolve/Premiere); `--rough-cut` adds `rough_cut.mp4`, all clips joined at 1280x720.
+"reason", "source", "role", "item"}], "warnings"}`, clips in edit order with file-local seconds; `item` is the shot
+item (or spoken topic) a clip serves, `role` is opener/closer/soundbite, and `warnings` says what the edit could not
+deliver (a runtime below the budget, fewer clips than asked for, a model moved to the CPU after a GPU out-of-memory
+error). `--export DIR` writes one preview file per clip, `clips.csv` (order, file, start, end, duration) and
+`edit.edl` (CMX3600, references the original files for relinking in Resolve/Premiere); `--rough-cut` adds
+`rough_cut.mp4`, all clips joined at 1280x720.
 
 Ranking data: `--dump-candidates OUT.json` writes every candidate the run scored (`vhe-candidates/1`: the run, the
 parsed brief and its query vector, `feature_names`, and per candidate file, file-local start/end as in the clips,
 source, stage, score, features, selected, rank, role, item); `--dump-all` adds every gated candidate before
 refinement. `vhe features footage/ --brief TEXT --spans spans.json --out OUT.json` featurises spans picked elsewhere
 (`[{"file", "start", "end"}]` or a `--json` edit list) the same way. `--persona ID` records who the edit is for;
-`--scorer model.json` ranks with a learned model (`vhe-linear-rank/1`) instead of the hand-weighted total. Features
-v2 (`feature_version`/`query_version` "v2" in dumps and model files): v1's 71 columns, then scale_close/scale_wide,
+`--scorer model.json` ranks with a learned model (`vhe-linear-rank/1`, trained with `tools/train`) instead of the
+hand-weighted total. Features v2 (`feature_version`/`query_version` "v2"): 82 columns, v1's 71 then shot scale,
 face size/centring/count, approach, OCR text area/confidence and `ocr_item_match`; the query vector adds the cue
-one-hots (framing none/close/wide, want_faces, hook, legible_text, centered) before the personas. v1 model files are
-refused (retrain with `tools/train` on v2 dumps).
+one-hots (framing none/close/wide, want_faces, hook, legible_text, centered) before the personas. v1 model files
+are refused (retrain on v2 dumps).
 
 ## How it works
 
 ```
-index (once per video)
+index (once per video; vhe/pipeline.py, vhe/project.py for folders)
   decode ........ one ffmpeg pass: 3 fps frames, tiny full-fps grey stream, 16 kHz audio (proxy files, HDR tone-map)
   cuts .......... adaptive frame-difference detector on the full-fps stream, flash suppression
   motion ........ phase correlation per frame pair -> camera speed, shake, subject motion
   audio ......... loudness, onset rate, Silero VAD, faster-whisper transcript with word times
-  frames ........ SigLIP2 embeddings (search index), zero-shot tags, sharpness/exposure, shot scale
-                  (scale_close / scale_wide margins)
+  frames ........ SigLIP2 embeddings (search index), zero-shot tags, defect margins (obstructed, bad framing),
+                  shot scale (scale_close / scale_wide margins)
+  quality ....... re-blur sharpness ratio, luma and contrast, blown highlights; the usable mask and its reason bits
+                  (covered, uniform, blown out, blurry, shaky, obstructed; bad framing as a soft reason)
   text .......... RapidOCR on 1 fps of the analysis frames: text_area, text_conf per step, ocr.json text store
   faces ......... YuNet on every analysis frame: face_n, face_area_max, face_center; approach (subject growing
                   toward the lens). OCR and faces are skipped with a warning when unavailable
@@ -107,22 +122,24 @@ index (once per video)
   nc highlight .. Lighthouse features per 148 s window with overlap (NON-COMMERCIAL)
 
 query (per request; a folder is one corpus: all files on a virtual timeline, a single video is a corpus of one)
-  parse ......... LLM (cached, grounded) or rules: mood -> signal weights, runtime budget vs clip length, count,
-                  opener/closer, content text, plan (shots, avoid, topics, live sound, soundbite length)
-  candidates .... per file: utterances, sub-shots, multi-length windows, peak windows, model proposals
-  gate .......... drop candidates with > 20 % unusable steps (covered, blown out, blurry, very shaky), any mood;
-                  with live sound asked for, > 10 % muted steps
-  signals ....... relevance = SigLIP sigmoid probability (absolute across files), the best shot item minus the
-                  avoid penalty; highlight saliency (NON-COMMERCIAL) as its own signal; other signals z-scored over
-                  the pooled corpus (loudness centred per file first); quality from blur/blown/shake, not brightness
-  score ......... per candidate a versioned feature vector (rank/features.py) and a Scorer (rank/scorer.py): the
-                  hand-weighted total (relevance averaged with the saliency, length-bucket centring, length and
-                  cut priors, speech bonus, visual-cue bonus) or a learned model file; refined spans are featurised
-                  and rescored
-  refine ........ per file: snap edges to cuts, word boundaries, speech pauses, steady frames; enforce lengths
-  select ........ opener (or the hook) / closer first, then shot items round robin, MMR with no overlap, runtime
-                  budget, per-file cap for variety; spoken topics: transcript sentences above a similarity threshold, time order
-  order ......... opener, then files in recording order and time within each file, then closer
+  parse ......... LLM (cached, grounded) or rules -> ParsedQuery: signal weights, runtime budget vs clip length,
+                  count, opener/closer, content text, plan (shots, avoid/exclude, topics, live sound, soundbite),
+                  visual cues
+  signals ....... per grid step: relevance = SigLIP sigmoid probability (absolute across files), the best shot item
+                  minus the avoid penalty, averaged with the highlight saliency (NON-COMMERCIAL, also kept as its
+                  own signal); quality from blur/blown/shake, not brightness; energy, steadiness, speech z-scored
+                  over the pooled corpus (loudness centred per file first); the cue bonus; the exclusion masks
+  candidates .... per file: utterances, sub-shots, multi-length windows, windows on signal peaks, model proposals
+  gate .......... drop candidates with > 20 % unusable steps, any mood; with live sound asked for > 10 % muted;
+                  excluded items, defects, forbidden words on screen, speech when the brief wants none
+  score ......... a versioned feature vector per candidate and a Scorer: the hand-weighted total (length-bucket
+                  centring, length and cut priors, speech bonus, visual-cue bonus) or a learned model file
+  refine ........ the best candidates: speech to whole sentences, visual edges onto clean frames, cuts, word gaps;
+                  gated again, featurised again and rescored
+  select ........ opener (or the hook) / closer from their own pools first, then shot items round robin, MMR with
+                  no overlap or near-duplicates, runtime budget (lengthening picks when the pool runs out), per-file
+                  cap; spoken topics: transcript sentences above a similarity threshold
+  order ......... opener, then files in recording order and time within each file, then closer, then a soundbite
   export ........ re-encoded preview cuts (downscaled before HDR tone-map), clips.csv, CMX3600 EDL, rough cut
 ```
 
@@ -130,15 +147,23 @@ query (per request; a folder is one corpus: all files on a virtual timeline, a s
 
 ```
 vhe/
-  config.py, timing.py, models.py, pipeline.py, project.py, corpus.py, engine.py, cli.py
-  ingest/decode.py
-  signals/{shots,motion,audio,speech,frames,tags,quality,changes,ocr,faces,highlight_nc}.py
-  index/store.py
-  query/{parser,plan,candidates,refine}.py
-  rank/{signals,features,scorer,select,dump}.py
-  export/clips.py
-  ui/{server.py,index.html}
-tests/
+  cli.py, ui/{server.py,index.html}    commands and the local web UI
+  engine.py                            the query entry point: models, caches, clips() and search() orchestration
+  results.py                           result clips (times, scores, labels, reason, transcript) and warnings
+  models.py                            model cache, device choice, inference lock, GPU out-of-memory fallback
+  config.py, timing.py                 thresholds and Config; stage timings
+  pipeline.py, project.py              index one video; index a folder incrementally (manifest)
+  ingest/decode.py                     ffmpeg decode and probe
+  signals/                             index-time signals (shots, motion, audio, speech, frames, tags, quality,
+                                       changes, ocr, faces, highlight_nc)
+  index/store.py, corpus.py            the on-disk index; many indexes on one virtual timeline
+  query/                               brief -> ParsedQuery (parser, rules, lexicon, llm, model) and what the
+                                       brief matches (text_match, exclusions, topics); candidates, refine
+  rank/                                brief_signals, gate, features, scorer, pool, select, items, signals, dump
+  export/clips.py                      preview cuts, CSV, EDL, rough cut
+tools/train/                           learned ranker: build_dataset, train_linear, eval_rank, DATASET_CARD.md
+tests/                                 pytest; tests/data/heuristic_clips.json pins Engine.clips on synthetic cases
+docs/ARCHITECTURE.md                   module map, data flow, the learnable seam, the training loop
 ```
 
 ## Not in v1

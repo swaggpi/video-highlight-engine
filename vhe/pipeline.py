@@ -10,9 +10,10 @@ from typing import Callable
 
 import numpy as np
 
-from vhe.config import Config, resolve_device
+from vhe.config import Config
 from vhe.index.store import default_index_dir, save_index
 from vhe.ingest.decode import decode, frame_paths, load_tiny
+from vhe.models import resolve_device
 from vhe.signals.audio import audio_signals, load_audio, speech_mask, voice_activity
 from vhe.signals.changes import change_points
 from vhe.signals.faces import approach
@@ -20,7 +21,15 @@ from vhe.signals.frames import Encoder
 from vhe.signals.motion import motion_signals
 from vhe.signals.quality import frame_quality, usable_mask
 from vhe.signals.shots import detect_cuts, frame_diffs
-from vhe.signals.tags import LABELS, defect_scores, defect_texts, label_texts, scale_scores, scale_texts, tag_probs
+from vhe.signals.tags import (
+    LABELS,
+    defect_scores,
+    defect_texts,
+    label_texts,
+    scale_scores,
+    scale_texts,
+    tag_probs,
+)
 from vhe.timing import Counter, Timings
 
 log = logging.getLogger("vhe")

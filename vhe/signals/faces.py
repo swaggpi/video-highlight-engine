@@ -65,7 +65,8 @@ def face_stats(faces: np.ndarray, h: int, w: int, min_score: float = FACE_MIN_SC
     return len(faces), float(areas[j]), centre
 
 
-def face_signals(paths: list[Path], detector, min_score: float = FACE_MIN_SCORE, progress=None) -> dict[str, np.ndarray]:
+def face_signals(paths: list[Path], detector, min_score: float = FACE_MIN_SCORE,
+                 progress=None) -> dict[str, np.ndarray]:
     n = len(paths)
     count = np.zeros(n, np.int16)
     area = np.zeros(n, np.float32)

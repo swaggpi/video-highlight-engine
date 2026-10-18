@@ -60,7 +60,7 @@ def ndcg(y: np.ndarray, s: np.ndarray, k: int = K_NDCG) -> float | None:
 def q_groups(ds: Dataset, per_query: bool) -> list[np.ndarray]:
     """Row indices sharing one query vector (and, with per_query, one query)."""
     groups: dict = {}
-    for i, (qid, row) in enumerate(zip(ds.query, ds.Q)):
+    for i, (qid, row) in enumerate(zip(ds.query, ds.Q, strict=True)):
         groups.setdefault((qid if per_query else None, row.tobytes()), []).append(i)
     return [np.array(v) for v in groups.values()]
 

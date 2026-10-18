@@ -123,7 +123,7 @@ def pairs(ds: Dataset, seed: int = 0, n_pool: int = N_POOL, pool_w: float = W_PO
     min_dy (weight: the smaller row weight: 1 judged, 0.5 transferred), and each positive labelled row (y >=
     positive_y) against up to n_pool random unlabelled pool rows of the same query (weight pool_w x its row weight)."""
     rng = np.random.default_rng(seed)
-    I, J, W = [], [], []
+    win, lose, W = [], [], []
     lab = ds.labelled
     pool = ds.kind == "pool_negative"
     for q in np.unique(ds.query):
@@ -132,26 +132,26 @@ def pairs(ds: Dataset, seed: int = 0, n_pool: int = N_POOL, pool_w: float = W_PO
         if len(L) > 1:
             dy = ds.y[L][:, None] - ds.y[L][None, :]
             a, b = np.nonzero(dy >= min_dy - 1e-9)
-            I += L[a].tolist()
-            J += L[b].tolist()
+            win += L[a].tolist()
+            lose += L[b].tolist()
             W += np.minimum(ds.w[L[a]], ds.w[L[b]]).tolist()
         if len(P):
             for i in L[ds.y[L] >= positive_y - 1e-9]:
                 for j in rng.choice(P, size=min(n_pool, len(P)), replace=False):
-                    I.append(i)
-                    J.append(j)
+                    win.append(i)
+                    lose.append(j)
                     W.append(pool_w * ds.w[i])
-    return np.array(I, dtype=int), np.array(J, dtype=int), np.array(W, dtype=float)
+    return np.array(win, dtype=int), np.array(lose, dtype=int), np.array(W, dtype=float)
 
 
 def summary(ds: Dataset) -> dict:
     lab = ds.labelled
-    I, _, _ = pairs(ds)
+    win, _, _ = pairs(ds)
     return {"rows": len(ds), "queries": int(len(np.unique(ds.query))), "briefs": int(len(np.unique(ds.group))),
             "label_kind": dict(Counter(ds.kind.tolist())), "origin": dict(Counter(ds.origin.tolist())),
             "split": dict(Counter(ds.split.tolist())),
             "y_point": {f"{k:.3f}": v for k, v in sorted(Counter(np.round(ds.y[lab], 3).tolist()).items())},
-            "pairs": int(len(I)), "learned_features": int(ds.mask.sum()), "skipped": ds.source.get("skipped", {})}
+            "pairs": int(len(win)), "learned_features": int(ds.mask.sum()), "skipped": ds.source.get("skipped", {})}
 
 
 def main() -> None:

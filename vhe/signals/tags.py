@@ -2,6 +2,8 @@
 No extra model."""
 from __future__ import annotations
 
+import itertools
+
 import numpy as np
 
 LABELS = [
@@ -98,5 +100,5 @@ def scale_scores(emb: np.ndarray, text_emb: np.ndarray, scale: float, bias: floa
     """{'scale_close', 'scale_wide'} margins per frame (float32, logits). text_emb: embeddings of scale_texts()."""
     logits = emb.astype(np.float32) @ np.asarray(text_emb, dtype=np.float32).T * scale + bias
     edges = np.cumsum([0] + [len(g) for g in _SCALE_SETS])
-    close, close_ref, wide, wide_ref = (_logsumexp(logits[:, a:b]) for a, b in zip(edges[:-1], edges[1:]))
+    close, close_ref, wide, wide_ref = (_logsumexp(logits[:, a:b]) for a, b in itertools.pairwise(edges))
     return {"scale_close": (close - close_ref).astype(np.float32), "scale_wide": (wide - wide_ref).astype(np.float32)}
