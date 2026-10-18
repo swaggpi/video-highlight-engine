@@ -6,9 +6,9 @@ import pytest
 
 from vhe.query.candidates import cuts_inside, generate, peak_times, speech_spans
 from vhe.query.parser import parse
-from vhe.query.refine import Context, refine
+from vhe.query.refine import SPEECH_TAIL, Context, refine
 from vhe.rank.signals import robust_z, segment_scores
-from vhe.rank.select import EXHAUSTIVE_MIN_TOTAL, overlap_fraction, select, select_for
+from vhe.rank.select import EXHAUSTIVE_MIN_TOTAL, EXHAUSTIVE_SCORE_MARGIN, overlap_fraction, select, select_for
 
 
 def test_parse_energy_and_short():
@@ -110,7 +110,7 @@ def test_refine_snaps_to_cut_and_word():
                   words=[{"start": 24.5, "end": 25.2, "word": "hello"}])
     s, e = refine(10.4, 25.0, ctx, min_len=3, max_len=30)
     assert abs(s - 10.04) < 1e-6  # just after the cut
-    assert abs(e - 25.3) < 1e-6  # after the word, not mid-word
+    assert abs(e - (25.2 + SPEECH_TAIL)) < 1e-6  # after the word with its tail pad, not mid-word
 
 
 def test_refine_extension_respects_cuts():
@@ -264,10 +264,17 @@ def test_select_explicit_count_with_budget_is_a_cap():
 
 
 def test_select_exhaustive_threshold_no_overlap():
-    cands = _pool([4.0] * 5, totals=[3.0, 2.0, 0.4, 1.0, 0.1]) + [{"start": 1.0, "end": 5.0, "total": 2.9}]
+    # visual "every X": above the absolute threshold and within EXHAUSTIVE_SCORE_MARGIN of the best (strong matches
+    # only since r3), no overlap, no MMR cut
+    m = EXHAUSTIVE_SCORE_MARGIN
+    cands = _pool([4.0] * 5, totals=[3.0, 2.0, 0.4, 3.0 - m + 0.1, 0.1]) + [{"start": 1.0, "end": 5.0, "total": 2.9}]
     picked = select_for(cands, np.ones((6, 1)), _P(count=50, exhaustive=True))
-    assert sorted(c["total"] for c in picked) == [1.0, 2.0, 3.0]  # all above threshold, no overlap, no MMR cut
+    assert sorted(c["total"] for c in picked) == [3.0 - m + 0.1, 2.0, 3.0]
     assert all(c["total"] >= EXHAUSTIVE_MIN_TOTAL for c in picked)
+    weak = _pool([4.0] * 5, totals=[3.0 + m, 2.0 + m, 0.4, 3.0 - 0.1, 0.1])
+    picked = select_for(weak, np.ones((5, 1)), _P(count=50, exhaustive=True))
+    assert sorted(c["total"] for c in picked) == [2.0 + m, 3.0 + m]  # 2.9: more than the margin below the best
+    cands = _pool([4.0] * 5, totals=[3.0, 2.0, 0.4, 1.0, 0.1]) + [{"start": 1.0, "end": 5.0, "total": 2.9}]
     for c, f in zip(cands, [1.0, 0.2, 1.0, 0.9, 1.0, 0.0]):
         c["speech_frac"] = f
     picked = select_for(cands, np.ones((6, 1)), _P(count=50, exhaustive=True, speech=1.0))

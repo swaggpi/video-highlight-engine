@@ -37,13 +37,36 @@ def _ends(word: str, marks: tuple) -> bool:
     return word.strip().rstrip("\"')»”").endswith(marks)
 
 
+# A pause does not end a sentence on a word that leaves it hanging ("... and", "... I'm going to") or before one that
+# cannot open one ("of music I don't know"): the r3 judge heard talking-track clips end on "and" / "so" / "but" and
+# start on "of". Up to DANGLING_PAUSE the sentence runs on; punctuation still ends it.
+DANGLING_END = {"and", "or", "but", "so", "because", "cause", "the", "a", "an", "to", "of", "with", "for", "that",
+                "than", "if", "i", "we", "you", "he", "she", "they", "my", "your", "our", "his", "her", "their", "i'm",
+                "we're", "you're", "they're", "gonna", "going", "is", "are", "was", "were", "like", "um", "uh", "this",
+                "these", "in", "on", "at", "from", "about", "as", "let", "let's", "just"}
+DANGLING_START = {"of", "to", "for", "with", "than", "from", "and", "or", "but"}
+DANGLING_PAUSE = 3.0
+
+
+def _bare(word: str) -> str:
+    return word.strip().strip("\"'»”“,").lower()
+
+
 def sentence_spans(words: list[dict], pause: float = SENTENCE_PAUSE) -> list[tuple[int, int]]:
     """Sentences as (first, last) word indices over start-sorted words: a sentence ends at a word ending in . ! ? …
-    or before a pause of at least `pause` seconds."""
+    or before a pause of at least `pause` seconds, unless the pause leaves it hanging (DANGLING_END / DANGLING_START,
+    pauses under DANGLING_PAUSE)."""
     out, a = [], 0
     for k, w in enumerate(words):
         last = k == len(words) - 1
-        if last or _ends(w["word"], SENTENCE_END) or words[k + 1]["start"] - w["end"] >= pause:
+        if last or _ends(w["word"], SENTENCE_END):
+            out.append((a, k))
+            a = k + 1
+            continue
+        gap = words[k + 1]["start"] - w["end"]
+        hanging = gap < DANGLING_PAUSE and (_bare(w["word"]) in DANGLING_END
+                                             or _bare(words[k + 1]["word"]) in DANGLING_START)
+        if gap >= pause and not hanging:
             out.append((a, k))
             a = k + 1
     return out

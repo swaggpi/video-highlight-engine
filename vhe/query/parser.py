@@ -110,10 +110,14 @@ EXHAUSTIVE = (rf"\bevery(?:\s+single)?(?:\s+{GENERIC})?\b|\b(?:all(?: the)?|any|
 # "every shot where ...", "every usable shot of ...": all distinct matches; "every float: A, B, C": one per item.
 ALL_MATCHES = (rf"\b(?:every|all(?: the)?|any|each|jede[nrs]?|alle)(?:\s+single)?\s+(?:[^\W\d][\w-]*\s+){{0,2}}?"
                rf"{GENERIC}\b|\bwhenever\b|\bimmer wenn\b")
-# "the best moments", "die besten Momente", "highlights" (with no shot list): a generic highlight prior.
+# "the best moments", "die besten Momente", "highlights" (with no shot list): a generic highlight prior; also "which
+# ones should I keep" / "welche ... behalten" (the keepers of a pile of clips).
 HIGHLIGHT = (r"\b(?:best|top|greatest|coolest|nicest|beste[nmrs]?|schönste[nmrs]?|coolste[nmrs]?|tollste[nmrs]?)\s+"
              r"(?:[^\W\d][\w-]*\s+)?(?:moments?|bits|parts|highlights|scenes|clips|shots|momente|szenen|stellen)\b|"
-             r"\bhighlights?\b")
+             r"\bhighlights?\b|\bkeepers\b|\bworth\s+keeping\b|\b(?:which|welche)\b[^.?!]{0,60}?\b(?:keep|behalten)\b")
+# A count with no clip noun, before a relative clause: "die 5 die ich behalten soll", "the 3 that I should keep".
+COUNT_RELATIVE = (r"\b(?:the|die|der|das|den|top)\s+(\d+)\s+(?=(?:die|that|which|i|ich|you|du|we|wir|worth|to\s+keep)"
+                  r"\b)")
 
 
 @dataclass
@@ -213,11 +217,19 @@ def _normalise(q: str) -> str:
     return re.sub(rf"\b({words})\b(?=\s*(?:-|to|bis|or|oder)\s*\d)", lambda m: str(NUMBER_WORDS[m.group(1)]), q)
 
 
+# A duration that describes what to leave out or delete, not a length: "2 minutes of nothing", "2 minuten nix".
+NOTHING_AFTER = (r"\s*(?:(?:of|lang|long)\s+)?(?:nix|nichts|nothing|gar\s+nichts|garnichts|where\s+nothing|"
+                 r"wo\s+(?:nix|nichts)|in\s+denen\s+nichts|of\s+(?:dead\s+air|empty))\b")
+
+
 def _durations(rest: str, q: str) -> tuple[str, dict, dict]:
     """Find every duration, decide whether it is the total runtime or a per-clip length, and remove it."""
     budget: dict = {}
     clip: dict = {}
     while (m := re.search(VALUE, rest)):
+        if re.match(NOTHING_AFTER, rest[m.end():]):  # "2 minutes of nothing", "einfach 2 minuten nix": content
+            rest = _cut(rest, m.start(), m.end())
+            continue
         a = _seconds(m.group("a"), m.group("ua") or m.group("u"))
         b = _seconds(m.group("b"), m.group("u")) if m.group("b") else None
         pre, post = rest[:m.start()], rest[m.end():]
@@ -304,6 +316,17 @@ HARD_CUE = (r"\b(?:no|not|never|none|nothing|without|exclude|excluding|leave out
 # An avoid item about speech ("the host's talking", "no voice-over") is not a picture: it drops speech-heavy clips.
 SPEECH_ITEM = (r"\b(?:talk|talks|talking|speak|speaks|speaking|speech|voice|voices|voice-?over|narration|commentary|"
                r"chatter|dialogue|sprache|reden|redet|stimme|stimmen|gerede|kommentar)\b")
+# A montage whose sound is laid on later: "the host's talking (it goes under music)", "music bed to be added
+# later", "to sit under a voice-over", "I will lay music over ...". Clips with speech in them would fight that
+# track, so they are gated like "no host talking over it" (ParsedQuery.no_speech), unless the brief wants speech.
+SPEECH_FREE = (r"\b(?:goes|go|going|sits?|sitting|runs?|plays?|lay|laid|put|placed)\s+under\s+(?:the\s+|a\s+|some\s+)?"
+               r"(?:music|song|track|voice-?over|vo|narration)\b|\bmusic\s+bed\b|"
+               r"\b(?:lay|laying|put|putting|add|adding)\s+(?:the\s+|some\s+|my\s+)?music\s+(?:over|on|under)\b|"
+               r"\b(?:music|voice-?over|vo)\s+(?:will\s+be|is\s+going\s+to\s+be|to\s+be|gets|goes)\s+"
+               r"(?:added|laid|recorded|put|on)\b|"
+               r"\bunder\s+(?:a\s+|the\s+)?(?:voice-?over|vo|music)\b|"
+               r"\bno\s+(?:host\s+|one\s+)?(?:talking|speaking|speech|voices?)\s+over\b|"
+               r"\bmusik\s+(?:drunter|darunter|drüber|darüber)\b|\bunter\s+(?:die\s+|der\s+)?musik\b")
 # Spoken topics: "talks (directly to his viewers) about ...", "explains ...", "sums up ...", "says that ...".
 TOPIC = (r"\b(?:(?:talks?|talking|speaks?|speaking|chats?|chatting)\s+(?:directly\s+|briefly\s+)?"
          r"(?:(?:to|with)\s+(?:the\s+|his\s+|her\s+|their\s+)?[\w-]+\s+)?(?:about|on the subject of)|"
@@ -597,10 +620,14 @@ def _categorise(items: list[str], raw: str) -> list[str]:
     return out
 
 
+# Nothing to see: "has to work with no context", "no slow build" (a pacing rule, not a picture).
+ABSTRACT = {"something", "anything", "any", "context", "build", "buildup", "build-up", "intro", "setup", "explanation"}
+
+
 def _nameable(item: str) -> bool:
     """An avoid item names something visible: a content word besides clip nouns, camera style and connectives ("no
     clip under 3 s" leaves just "clip")."""
-    return any(len(w) > 2 and w not in STYLE | GENERIC_HEAD | ITEM_EDGE | {"something", "anything", "any"}
+    return any(len(w) > 2 and w not in STYLE | GENERIC_HEAD | ITEM_EDGE | ABSTRACT
                for w in re.findall(r"[^\W\d_][\w'-]*", item.lower()))
 
 
@@ -680,6 +707,9 @@ def _parse_rules(query: str) -> tuple[ParsedQuery, bool, str | None]:
         rest = _cut(rest, m.start(1), m.end(1))
     elif not p.exhaustive and (m := re.search(SINGLE, rest)):
         p.count, p.count_explicit = 1, True
+    elif not p.exhaustive and (m := re.search(COUNT_RELATIVE, rest)):  # "die 5 die ich behalten soll"
+        p.count, p.count_explicit = max(1, min(MAX_COUNT, int(m.group(1)))), True
+        rest = _cut(rest, m.start(1), m.end(1))
 
     m = re.search(r"\b(?:without|no|ohne|kein|keine)\s+(?:[^\W\d][\w-]*\s+){0,2}?"
                   r"(?:talking|speaking|speech|voices?|dialogue|narration|sprache|reden|gespräch|stimmen?)\b", rest)
@@ -690,6 +720,8 @@ def _parse_rules(query: str) -> tuple[ParsedQuery, bool, str | None]:
     if p.weights["speech"] == 0.0 and any(_contains(rest, w) for w in SPEECH_ON):
         p.weights["speech"] = 1.0
     rest = _plan(rest, q, p)
+    if re.search(SPEECH_FREE, q) and not p.topics and p.weights["speech"] <= 0:
+        p.no_speech, p.weights["speech"] = True, -1.0
     _set_cues(p, p._cue_text)
     for w in SPEECH_VERBS:
         rest = _strip(rest, w)
@@ -766,6 +798,8 @@ def _finalise(p: ParsedQuery, explicit_len: bool, hint: str | None, count: int |
     if spoken:
         p.weights["speech"] = min(p.weights["speech"], -1.0)
         p.no_speech = p.no_speech or any(x in p.exclude for x in spoken)
+    if p.no_speech:  # gated (engine) and preferred
+        p.weights["speech"] = min(p.weights["speech"], -1.0)
     # Forbidden items first, so a soft restatement of one ("camera pointing at the ground" next to "camera points at
     # the ground") cannot make it soft; every exclude item is also an avoid item (the soft penalty applies too).
     p.exclude = _dedupe([x for x in p.exclude if x not in spoken and _nameable(x)])
@@ -955,6 +989,35 @@ def is_english(text: str) -> bool:
     return sum(w in EN_WORDS for w in words) >= sum(w in DE_WORDS for w in words)
 
 
+# Words of an instruction to the editor or the tool, not of a shot ("dont cut anything yet", "tell me the clip and
+# the exact seconds", "mein handy ist voll", "welche sind die 5 die ich behalten soll").
+INSTRUCTION_WORDS = {"i", "i'm", "im", "me", "my", "we", "we're", "our", "us", "you", "your", "you're", "dont", "don't",
+                     "do", "does", "give", "tell", "rank", "ranked", "ranking", "list", "mark", "send", "need", "want",
+                     "bonus", "cut", "let", "let's", "please", "lol", "ich", "mein", "meine", "meinen", "mir", "mich",
+                     "du", "dein", "deine", "welche", "welcher", "welches", "soll", "sollte", "kann", "kannst", "sind",
+                     "ist", "bitte", "behalten", "löschen", "loeschen"}
+NOT_SHOT = {"max", "min", "yet", "exact", "exactly", "seconds", "second", "sec", "secs", "ranked", "context",
+            "possible", "actually", "really", "right", "there", "here"}
+
+
+def _instruction(item: str) -> bool:
+    """A clause the rules took for a shot that is an instruction (a pronoun or instruction verb), or that names
+    nothing visible (only style, cue and filler words: "ranked", "max")."""
+    words = re.findall(r"[^\W\d_][\w'-]*", item.lower())
+    if any(w in INSTRUCTION_WORDS for w in words):
+        return True
+    return not any(len(w) > 2 and w not in STYLE | ITEM_EDGE | CUE_FILLER | GENERIC_HEAD | NOT_SHOT for w in words)
+
+
+def _shot_fallback(rules_shots: list[str]) -> list[str]:
+    """The rules' shot list when the LLM's items are gone (none given, or every one invented: grounding dropped
+    them): its clauses that name something visible, but no shot list at all when instruction clauses are the
+    majority (p2-tiktok-2: "dont cut anything yet; ...; tell me the clip and the exact seconds ..."), so relevance
+    falls back to the content text and the brief's framing / hook cues instead of clauses read as pictures."""
+    keep = [x for x in rules_shots if not _instruction(x)]
+    return keep if len(keep) >= 2 and 2 * len(keep) > len(rules_shots) else []
+
+
 def _grounded(item: str, vocab: set[str]) -> bool:
     """More than half of the item's content words (4-letter stems) occur in the brief: drops invented items."""
     stems = [w[:4] for w in re.findall(r"[^\W\d_]+", item.lower()) if len(w) > 2 and w not in EDGE_STOP]
@@ -1010,7 +1073,7 @@ def _from_llm(data: dict, base: ParsedQuery, explicit_len: bool) -> tuple[Parsed
                                                  re.search(LIVE_CUE, p.raw.lower()) is not None)
     p.opener = " ".join(str(data.get("opener") or "").split()) or base.opener
     p.closer = " ".join(str(data.get("closer") or "").split()) or base.closer
-    p.shots = items("shots") or base.shots
+    p.shots = items("shots") or _shot_fallback(base.shots)
     # Forbidden items stay hard only when the brief has a word that forbids ("no", "never", "keine", ...).
     ex = items("exclude")
     hard = re.search(HARD_CUE, low) is not None

@@ -49,14 +49,20 @@ vhe ui                              # http://127.0.0.1:8765: folder or file, Ind
 ```
 
 Briefs: a total runtime ("60-90 s recap") or per-clip lengths ("3-6 s each"), a count, a mood (energetic/calm),
-speech ("talks to camera", "every moment ... speaks"), "every/all ..." for exhaustive lists, and "open with ..." /
+speech ("talks to camera", "every moment ... speaks"), "every/all ..." for exhaustive lists (visual ones keep only
+strong, distinct matches of each item, at most 20 without a count), and "open with ..." /
 "end with ..." for the first and last shot. A multi-sentence brief becomes a plan: a list of wanted shots ("build
 through the mounted police, the band, dancers ..."; relevance is the best item, and selection takes every item once
 before any twice; "every float: A, B, C" gives the best clip per named item and skips items with no footage), things
 to leave out ("leave out shots where ...", "no whip-pans"; a bounded relevance penalty), spoken topics ("talks
 about ...", "explains ...", "sums up ..."; transcript sentences matched with Ollama bge-m3 embeddings, or keyword
 overlap without it), live sound ("with natural sound (not muted)": muted stretches are dropped) and a soundbite next
-to the visual clips ("the best 5-8 s soundbite where ..."). Visual cues: framing close ("close-ups", "faces", "fills
+to the visual clips ("the best 5-8 s soundbite where ..."). Forbidden things are dropped, not penalised; an excluded
+item about text or politics ("nothing with 'executed' on it", "no protest signs", "nothing political") also drops
+every clip whose on-screen text (OCR) holds one of its quoted words or a political term. A montage whose sound comes
+later ("music bed to be added", "it goes under music", "to sit under a voice-over") gets speech-free clips only.
+Speech clips hold their first and last word whole (lead-in 0.25 s, tail 0.4 s, at most to the middle of the pause).
+Visual cues: framing close ("close-ups", "faces", "fills
 the frame", "right at the camera", "centred", "vertical"/"9:16", "POV", "hook") or wide ("establishing", "wide view",
 "the street as the main character") weights the index's shot scale, largest face and approach (wide also penalises
 close-ups); "faces" and "centred" add the face size and centring terms; "hook" / "the first clip has to grab in the

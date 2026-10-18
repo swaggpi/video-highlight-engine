@@ -5,8 +5,10 @@ exactly. First written at 138dcd6 (before the ranking seam, vhe/rank); regenerat
 fixes changed the selection itself (near-duplicates are never picked, visual edges move onto clean frames, speech
 clips are whole sentences, "leave out X" is a hard gate, a short budget is reported), and again for features v2 (the
 parsed query of every case gained the five visual-cue keys at their defaults, every clip and every other key stayed
-identical; the cue_* cases were appended): any other change to it is a regression. The cases cover the paths the
-hand-weighted total runs through: length buckets, cut and length priors, the speech bonus, the usable and live-sound
+identical; the cue_* cases were appended), and for the r3 speech padding (only the speech-index cases topics,
+speaks_every and soundbite moved: speech-clip edges sit SPEECH_LEAD before the first and SPEECH_TAIL after the last
+word, in the pause; every other case stayed identical): any other change to it is a regression. The cases cover the
+paths the hand-weighted total runs through: length buckets, cut and length priors, the speech bonus, the usable and live-sound
 gates, opener/closer pools, shot lists (per-item pool extras, round robin, exhaustive per-item), avoid items, spoken
 topics, the non-commercial saliency blend (mocked: NaN on one file), and the visual cues (close / wide framing,
 faces, centring, the hook slot, readable text) on index v3 signals."""

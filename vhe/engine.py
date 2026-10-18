@@ -9,11 +9,13 @@ clips() orchestrates: parse the brief -> per-step signals -> candidates -> usabl
 The scorer is the hand-weighted one unless a learned model is given (vhe.rank.scorer); a run can dump every
 candidate's features, score and selection (vhe.rank.dump).
 
-Hard rules on top of the scores: excluded content and camera defects ("no protest signs", "no whip-pans") and, when
-the brief says so, speech drop candidates; visual clips start and end on clean frames (else they are penalised);
-speech clips are whole sentences; selection never repeats a moment (vhe.rank.select.duplicates); a budget minimum is
-filled by lengthening picks when the pool runs out, and a result says in `warnings` when it still falls short. A
-model that runs out of GPU memory is moved to the CPU (with a warning) instead of failing the query."""
+Hard rules on top of the scores: excluded content and camera defects ("no protest signs", "no whip-pans"), forbidden
+words read on screen ("nothing with 'executed' on it", "nothing political") and, when the brief says so ("no host
+talking", "it goes under music"), speech drop candidates; visual clips start and end on clean frames (else they are
+penalised); speech clips are whole sentences, their first and last word whole; selection never repeats a moment
+(vhe.rank.select.duplicates); a budget minimum is filled by lengthening picks when the pool runs out, and a result
+says in `warnings` when it still falls short. A model that runs out of GPU memory is moved to the CPU (with a
+warning) instead of failing the query."""
 from __future__ import annotations
 
 import bisect
@@ -45,15 +47,17 @@ from vhe.query.plan import (
     defect_kind,
     defect_steps,
     exclusion_steps,
+    exclusion_text,
     item_centre,
     item_scores,
     legibility_steps,
     legible_items,
     muted_steps,
     ocr_item_scores,
+    ocr_term_steps,
     topic_scores,
 )
-from vhe.query.refine import Context, clean_steps, edges_clean, refine, refine_speech
+from vhe.query.refine import TALK_MAX_SILENCE, Context, clean_steps, edges_clean, refine, refine_speech
 from vhe.rank import dump as dumps
 from vhe.rank.features import INDEX, featurize, grid_steps, query_names, query_vector
 from vhe.rank.scorer import HOOK_WEIGHTS, Scorer, cue_bonus, load_scorer
@@ -270,8 +274,10 @@ class Engine:
 
     def _exclusions(self, p: ParsedQuery) -> dict:
         """Per-step masks for the hard gates: 'excluded' where an exclude item shows (SigLIP, per-item calibrated
-        threshold), 'defect' where an excluded camera defect shows (whip-pan, shake, blocked lens, ground/sky). An
-        exclude item that names only what a wanted shot asks for stays a soft penalty (plan.conflicts)."""
+        threshold; items about politics or victims add their prompts), 'excluded_text' where on-screen text holds one
+        of the exclude items' terms (plan.exclusion_text: quoted words, political terms; any sighting drops a clip),
+        'defect' where an excluded camera defect shows (whip-pan, shake, blocked lens, ground/sky). An exclude item
+        that names only what a wanted shot asks for stays a soft penalty (plan.conflicts)."""
         c = self.corpus
         wanted = [*p.shots, p.text, p.opener or "", p.closer or ""]
         content, defect = [], np.zeros(c.n, dtype=bool)
@@ -281,8 +287,11 @@ class Engine:
                 defect |= defect_steps(c.grid, kind, c.n)
             elif not conflicts(x, wanted):
                 content.append(x)
-        excluded = exclusion_steps(self._relevances(content))[0] if content else None
-        return {"excluded": excluded, "defect": defect if defect.any() else None, "exclude_items": content}
+        terms, prompts, visual = exclusion_text(content, p.raw, wanted)
+        siglip = list(dict.fromkeys(visual + prompts))
+        excluded = exclusion_steps(self._relevances(siglip))[0] if siglip else None
+        return {"excluded": excluded, "excluded_text": ocr_term_steps(c, terms),
+                "defect": defect if defect.any() else None, "exclude_items": siglip, "exclude_terms": terms}
 
     def _avoided(self, rel: np.ndarray, p: ParsedQuery) -> np.ndarray:
         """Opener/closer relevance with the brief's avoid penalty too."""
@@ -409,6 +418,8 @@ class Engine:
         if sig is not None:
             if sig.get("excluded") is not None:
                 keep &= self._unusable(S, E, K, sig["excluded"]) <= EXCLUDE_MAX_FRAC
+            if sig.get("excluded_text") is not None:  # a forbidden word read on screen: any sighting
+                keep &= self._unusable(S, E, K, sig["excluded_text"]) <= 0.0
             if sig.get("defect") is not None:
                 keep &= self._unusable(S, E, K, sig["defect"]) <= DEFECT_MAX_FRAC
             if p.no_speech:
@@ -448,9 +459,13 @@ class Engine:
         for j in chosen:
             k, off = int(K[j]), c.offsets[K[j]]
             ctx = self._context(k)
-            # speech clips are whole sentences; visual clips move onto clean frames
-            fix = refine_speech if src[j] == "speech" else refine
-            s, e = fix(float(S[j] - off), float(E[j] - off), ctx, p.min_len, p.max_len)
+            # speech clips are whole sentences (a talking track without long silent tails); visual clips move onto
+            # clean frames
+            if src[j] == "speech":
+                s, e = refine_speech(float(S[j] - off), float(E[j] - off), ctx, p.min_len, p.max_len,
+                                     TALK_MAX_SILENCE if p.weights.get("speech", 0.0) > 0 else None)
+            else:
+                s, e = refine(float(S[j] - off), float(E[j] - off), ctx, p.min_len, p.max_len)
             clean = src[j] == "speech" or edges_clean(s, e, ctx)
             out.append({"start": off + s, "end": off + e, "file": k, "source": src[j],
                         "cuts_inside": int(X0[j, INDEX["n_cuts_inside"]]),
@@ -478,7 +493,7 @@ class Engine:
         X1 = featurize(c, sig, S1, E1, K1, [o["source"] for o in out], p, item_rel=scores)
         totals = self.scorer.rescore(s0[rows], X0[rows], X1, q)
         for o, t, x in zip(out, totals, X1):
-            o["total"], o["x"] = float(t), x
+            o["total"], o["x"], o["unusable_frac"] = float(t), x, float(x[INDEX["unusable_frac"]])
         return out
 
     def _edge_clip(self, text: str | None, sig: dict, cands: tuple, p: ParsedQuery, taken: list[dict],
@@ -759,7 +774,7 @@ class Engine:
             dur = float(c.durations[k])
             for s, e in fit_utterances(speech_spans((ix.transcript or {}).get("segments", []), ix.vad, hi), lo, hi,
                                        dur):
-                s, e = refine_speech(s, e, self._context(k), lo, hi)  # whole sentences
+                s, e = refine_speech(s, e, self._context(k), lo, hi, TALK_MAX_SILENCE)  # whole sentences
                 text = self._words_between(c.offsets[k] + s, c.offsets[k] + e)
                 if text:
                     spans.append({"start": c.offsets[k] + s, "end": c.offsets[k] + e, "file": k, "text": text})

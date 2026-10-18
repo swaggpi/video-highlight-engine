@@ -21,7 +21,17 @@ EDGE_STEPS = 2
 EDGE_MAX_SPEED = 0.1
 EDGE_MAX_SHAKE = 0.1
 EDGE_SEARCH_S = 1.5  # how far outward an edge may move to find clean frames when trimming inward leaves too little
-SPEECH_PAD = 0.15  # lead-in/out around a sentence, never into the neighbouring word
+# Clip edges near speech sit in the pause between words, so a clip's audio holds its first and last word whole. The
+# r3 judge heard talking-track clips "cut mid-word" whose edges were 0.05-0.15 s off Whisper's word times: Whisper's
+# word ends are often early and onsets soft, so the lead-in is SPEECH_LEAD and the tail a more conservative
+# SPEECH_TAIL, each at most to the middle of the pause (never into the neighbouring word). WORD_GUARD: no edge lies
+# inside a word extended by this much (or by half the pause, when the pause is shorter): word_clear().
+SPEECH_LEAD = 0.25
+SPEECH_TAIL = 0.4
+WORD_GUARD = 0.15
+# A talking-track clip (the brief wants speech) shorter than its minimum length grows into the pauses around it by at
+# most this much per side beyond its lead/tail: a long silent tail is dead air in a talking track (r3 B2).
+TALK_MAX_SILENCE = 0.35
 
 
 @dataclass
@@ -82,19 +92,52 @@ def _word_at(ctx: Context, t: float) -> dict | None:
     return ctx.words[i] if i >= 0 and ctx.words[i]["start"] < t < ctx.words[i]["end"] else None
 
 
-def _before_word(ctx: Context, w: dict, pad: float) -> float:
-    """Just before word w, but not inside the previous word."""
-    i = _word_index(ctx, w["start"] - 1e-9)
-    prev_end = ctx.words[i]["end"] if i >= 0 else 0.0
-    return max(0.0, prev_end, w["start"] - pad) if prev_end <= w["start"] else max(0.0, w["start"] - pad)
+def _pauses(words: list[dict], j: int) -> tuple[float, float]:
+    """(pause before word j, pause after it) in seconds; inf at the ends, 0 where ASR words overlap."""
+    before = words[j]["start"] - words[j - 1]["end"] if j > 0 else np.inf
+    after = words[j + 1]["start"] - words[j]["end"] if j + 1 < len(words) else np.inf
+    return max(0.0, before), max(0.0, after)
 
 
-def _after_word(ctx: Context, w: dict, pad: float) -> float:
-    """Just after word w, but not inside the next word."""
-    i = _word_index(ctx, w["start"])
-    nxt = ctx.words[i + 1]["start"] if 0 <= i + 1 < len(ctx.words) and ctx.words[i + 1]["start"] >= w["end"] \
-        else ctx.duration
-    return min(ctx.duration, nxt, w["end"] + pad)
+def _index_of(ctx: Context, w: dict) -> int:
+    i = bisect.bisect_left(ctx._starts, w["start"])
+    while i + 1 < len(ctx.words) and ctx.words[i] is not w and ctx.words[i + 1]["start"] == w["start"]:
+        i += 1
+    return i
+
+
+def _before_word(ctx: Context, w: dict, pad: float = SPEECH_LEAD) -> float:
+    """A clip start that holds word w whole: `pad` before it, at most to the middle of the pause before it (never
+    into the previous word)."""
+    gap, _ = _pauses(ctx.words, _index_of(ctx, w))
+    return max(0.0, w["start"] - min(pad, gap / 2))
+
+
+def _after_word(ctx: Context, w: dict, pad: float = SPEECH_TAIL) -> float:
+    """A clip end that holds word w whole: `pad` after it, at most to the middle of the pause after it (never into
+    the next word)."""
+    _, gap = _pauses(ctx.words, _index_of(ctx, w))
+    return min(ctx.duration, w["end"] + min(pad, gap / 2))
+
+
+def word_near(words: list[dict], t: float, guard: float = WORD_GUARD, starts: list[float] | None = None) -> dict | None:
+    """The word (start-sorted `words`) that t lies inside, each word extended by `guard` seconds on either side (by at
+    most half the pause to its neighbour); None when t is clear of every word. 1 ms tolerance: edges are rounded."""
+    starts = [w["start"] for w in words] if starts is None else starts
+    i = bisect.bisect_right(starts, t) - 1
+    for j in (i, i + 1):
+        if 0 <= j < len(words):
+            before, after = _pauses(words, j)
+            lo = words[j]["start"] - min(guard, before / 2)
+            hi = words[j]["end"] + min(guard, after / 2)
+            if lo + 1e-3 < t < hi - 1e-3:
+                return words[j]
+    return None
+
+
+def word_clear(words: list[dict], t: float, guard: float = WORD_GUARD) -> bool:
+    """True when a clip edge at t cuts no word (word_near is None): the check every speech-aware edge passes."""
+    return word_near(sorted(words, key=lambda w: w["start"]), t, guard) is None
 
 
 def _in_speech(vad: list[tuple[float, float]], t: float) -> tuple[float, float] | None:
@@ -124,7 +167,7 @@ def snap_start(t: float, ctx: Context, radius: float = 1.0, pad: float = 0.2) ->
         return cut + FRAME_GUARD
     w = _word_at(ctx, t)
     if w is not None:
-        return _before_word(ctx, w, 0.1)
+        return _before_word(ctx, w)
     seg = _in_speech(ctx.vad, t)
     if seg is not None and seg[0] >= t - radius:
         return max(0.0, seg[0] - 0.15)
@@ -137,7 +180,7 @@ def snap_end(t: float, ctx: Context, radius: float = 1.0, pad: float = 0.2) -> f
         return cut - FRAME_GUARD
     w = _word_at(ctx, t)
     if w is not None:
-        return _after_word(ctx, w, 0.1)
+        return _after_word(ctx, w)
     seg = _in_speech(ctx.vad, t)
     if seg is not None and seg[1] <= t + radius:
         return min(ctx.duration, seg[1] + 0.15)
@@ -165,14 +208,19 @@ def refine(start: float, end: float, ctx: Context, min_len: float, max_len: floa
             e = cut - FRAME_GUARD
     if ctx.clean is not None:
         s, e = trim_edges(s, e, ctx, min_len, max_len)
-    # Never start or end inside a word: start before it; end after it, or before it if that would overrun max_len.
-    w = _word_at(ctx, s)
+    return _clear_of_words(s, e, ctx, min_len, max_len)
+
+
+def _clear_of_words(s: float, e: float, ctx: Context, min_len: float, max_len: float) -> tuple[float, float]:
+    """Never start or end in a word (WORD_GUARD around it): start before it (or after it, when the start is past its
+    end); end after it, or before it if that would overrun max_len."""
+    w = word_near(ctx.words, s, starts=ctx._starts)
     if w is not None:
-        s = _before_word(ctx, w, 0.05)
-    w = _word_at(ctx, e)
+        s = _before_word(ctx, w) if s < w["end"] else _after_word(ctx, w)
+    w = word_near(ctx.words, e, starts=ctx._starts)
     if w is not None:
-        after, before = _after_word(ctx, w, 0.05), _before_word(ctx, w, 0.05)
-        e = after if after - s <= max_len or before - s < min_len else before
+        after, before = _after_word(ctx, w), _before_word(ctx, w)
+        e = after if e > w["start"] and (after - s <= max_len or before - s < min_len) else before
     return round(max(0.0, s), 3), round(min(ctx.duration, e), 3)
 
 
@@ -228,17 +276,20 @@ def trim_edges(s: float, e: float, ctx: Context, min_len: float, max_len: float)
 
 
 # ---- whole sentences -------------------------------------------------------------------------------------------------
-def refine_speech(start: float, end: float, ctx: Context, min_len: float, max_len: float) -> tuple[float, float]:
-    """A speech clip on sentence boundaries: it starts just before the first word of a sentence and ends just after
-    the last word of one (never inside a neighbouring word), keeping the sentences that lie mostly inside
-    start..end. A sentence cut by start or end is taken whole if the clip stays within max_len, else left out; a
-    single sentence longer than max_len keeps its piece inside start..end, between words. Without word timings the
-    span is returned as it is."""
+def refine_speech(start: float, end: float, ctx: Context, min_len: float, max_len: float,
+                  max_silence: float | None = None) -> tuple[float, float]:
+    """A speech clip on sentence boundaries: it starts SPEECH_LEAD before the first word of a sentence and ends
+    SPEECH_TAIL after the last word of one (each at most to the middle of the pause, never inside a neighbouring
+    word), keeping the sentences that lie mostly inside start..end. A sentence cut by start or end is taken whole if
+    the clip stays within max_len, else left out; a single sentence longer than max_len keeps its piece inside
+    start..end, between words. A clip shorter than min_len grows into the pauses around it, by at most max_silence
+    per side when given (a talking track: no long silent tails). Without word timings the span is returned as it
+    is."""
     words = ctx.words
     mids = [0.5 * (w["start"] + w["end"]) for w in words]
     inside = [k for k, m in enumerate(mids) if start <= m <= end]
-    if not inside:
-        return round(max(0.0, start), 3), round(min(ctx.duration, end), 3)
+    if not inside:  # no word in it: only kept clear of the words around it
+        return _clear_of_words(start, end, ctx, min_len, max_len)
     first_s, last_s = int(ctx._sent_of[inside[0]]), int(ctx._sent_of[inside[-1]])
     sents = ctx._sentences
 
@@ -265,11 +316,14 @@ def refine_speech(start: float, end: float, ctx: Context, min_len: float, max_le
         ws, we = words[first]["start"], words[last]["end"]
     prev_end = words[first - 1]["end"] if first > 0 else 0.0
     next_start = words[last + 1]["start"] if last + 1 < len(words) else ctx.duration
-    s = max(prev_end + 0.02, ws - SPEECH_PAD, 0.0) if prev_end <= ws else ws
-    e = min(next_start - 0.02, we + SPEECH_PAD, ctx.duration) if next_start >= we else we
-    if e - s < min_len:  # pad into the surrounding pauses, never into a word
+    s, e = _before_word(ctx, words[first]), _after_word(ctx, words[last])
+    if e - s < min_len:  # pad into the surrounding pauses, never into a word (nor past its guard)
         need = min_len - (e - s)
-        room_l, room_r = max(0.0, s - max(prev_end + 0.02, 0.0)), max(0.0, min(next_start - 0.02, ctx.duration) - e)
+        lo = prev_end + min(WORD_GUARD, max(0.0, ws - prev_end) / 2) if first > 0 else 0.0
+        hi = next_start - min(WORD_GUARD, max(0.0, next_start - we) / 2) if last + 1 < len(words) else ctx.duration
+        room_l, room_r = max(0.0, s - lo), max(0.0, hi - e)
+        if max_silence is not None:
+            room_l, room_r = min(room_l, max_silence), min(room_r, max_silence)
         grow_l = min(room_l, max(need / 2, need - room_r))
         s, e = s - grow_l, e + min(room_r, need - grow_l)
     return round(max(0.0, s), 3), round(min(ctx.duration, e), 3)

@@ -187,7 +187,10 @@ EXCLUDE_CLEAR_REL = 1.5  # a clear match (log-odds about -4.3) always counts, al
 EXCLUDE_MIN_RUN = 2  # grid steps (0.67 s at 3 fps)
 EXCLUDE_MAX_FRAC = 0.1  # a clip with more of its steps showing an excluded item is dropped
 DEFECT_MAX_FRAC = 0.1  # ... or with more of its steps showing an excluded camera defect ("no whip-pans")
-NO_SPEECH_MAX_FRAC = 0.3  # "no host talking over it": clips with more voice activity are dropped
+# "no host talking over it", "it goes under music", "music bed to be added": clips with more voice activity are
+# dropped. 0.3 let the r3 judge hear host speech under p3-newsedit-2's and p1-videographer-2's picks; on the
+# irl-event pools 81-99 % of candidates have no voice-activity step at all, so a near-zero bar costs little.
+NO_SPEECH_MAX_FRAC = 0.05
 WHIP_SPEED = 0.15  # cam_speed of a whip-pan (follow pans are 0.02-0.06; vhe.query.refine EDGE_MAX_SPEED)
 # Exclude items about the camera, not the content: the index's own defect signals answer them, not SigLIP.
 DEFECTS = {
@@ -256,6 +259,100 @@ def exclusion_steps(rel_excl: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
         if b - a < EXCLUDE_MIN_RUN:
             hit[a:b] = False
     return hit, thr
+
+
+# ---- exclusions read on screen --------------------------------------------------------------------------------------
+# "absolutely no protest signs, no portraits of victims, nothing with 'executed' or 'killed' on it", "nothing
+# political": SigLIP alone missed what the r3 judge failed (an "Executed by IRGC" poster behind the giant flag scored
+# -0.4..0.0 for "protest signs", far under its gate), but the index read the text (ocr.json). So an exclude item about
+# text or politics also excludes every span whose on-screen text holds one of its terms:
+#   - words quoted in the brief inside an exclude item ('executed', "killed") are literal terms;
+#   - an item about politics, protest or victims ("political", "protest signs", "portraits of victims") adds
+#     POLITICAL_TERMS, the words protest and memorial signs are made of, and its SigLIP prompts (POLITICAL_PROMPTS,
+#     PORTRAIT_PROMPTS) join the SigLIP exclusion (exclusion_steps, its calibrated thresholds). Measured on the
+#     irl-event footage: "a banner with a printed photo of a face" is in its top decile on 70-100 % of the "killed",
+#     "executed" and "WOMAN LIFE FREEDOM" sign spans and on none of the floats, band or dancers; "protest sign" also
+#     put the Gate of the Nations float (flags) over its gate, so it is not added (an item that says "protest signs"
+#     still is one). The victim portraits on the SHIRAZ float are under every prompt's floor and carry no text: missed.
+# Terms match the OCR text with spaces and punctuation removed, case-insensitive, and as a fragment of at least
+# OCR_TERM_FRAGMENT of the term (from 6 letters on): RapidOCR loses letters at a sign's edge ("tecutedby",
+# "r50.000killed"). Any OCR sighting within OCR_HOLD_S of a span's steps drops the span (text is read once a second).
+# A long-text rule ("signs with paragraphs") was measured and left out: on the irl-event footage multi-line blocks of
+# text are as common on the floats' labels, shop signs and the police band banner as on protest signs.
+POLITICAL_ITEM = (r"\b(?:politic\w*|protest\w*|propaganda|activis\w*|slogans?|demonstrat\w*|victims?|martyrs?|"
+                  r"memorials?)\b")
+PORTRAIT_ITEM = r"\b(?:portraits?|victims?|martyrs?|memorials?|photos? of (?:the )?(?:dead|victims?))\b"
+POLITICAL_TERMS = ("killed", "killing", "executed", "execution", "murder", "murdered", "martyr", "regime", "dictator",
+                   "freedom", "revolution", "protest", "genocide", "massacre", "prisoner", "political", "terrorist",
+                   "terrorism", "torture", "slavery", "humanrights", "oppression")
+POLITICAL_PROMPTS = ("a banner with a printed photo of a face",)
+PORTRAIT_PROMPTS = ("a poster with a portrait photo of a person", "a banner with a printed photo of a face")
+OCR_TERM_FRAGMENT = 0.75
+OCR_HOLD_S = 0.5
+QUOTED = r"(?<![\w])['‘\"“„]([^'‘’\"“”„]{2,40}?)['’\"”](?![\w])"
+TERM_FILLER = {"something", "anything", "nothing", "with", "on", "it", "them", "that", "says", "saying", "written",
+               "the", "a", "an", "or", "and", "word", "words", "text", "content", "any", "in", "of", "at", "to", "for",
+               "from", "all", "every", "each", "no", "not", "never"}
+
+
+def quoted_terms(text: str) -> list[str]:
+    """Phrases in quotes ('executed', "killed"); apostrophes inside words ("host's") are not quotes."""
+    return [q.strip() for q in re.findall(QUOTED, text) if q.strip()]
+
+
+def exclusion_text(exclude: list[str], raw: str = "", wanted: list[str] = ()) -> tuple[list[str], list[str], list[str]]:
+    """(OCR terms, extra SigLIP prompts, items left to SigLIP) for the brief's exclude items. OCR terms: the brief's
+    quoted words that an exclude item contains, plus POLITICAL_TERMS for an item about politics, protest or victims.
+    Prompts: POLITICAL_PROMPTS / PORTRAIT_PROMPTS for such items, unless a wanted shot asks for the same thing. An
+    item that is only a quoted term ("'killed' on it") is matched on screen only, not by SigLIP."""
+    quotes = quoted_terms(raw)
+    terms, prompts, visual = [], [], []
+    for x in exclude:
+        low = x.lower()
+        mine = [q for q in quotes + quoted_terms(x) if q.lower() in low]
+        terms += mine
+        political = re.search(POLITICAL_ITEM, low) is not None
+        if political:
+            terms += POLITICAL_TERMS
+            prompts += POLITICAL_PROMPTS
+        if re.search(PORTRAIT_ITEM, low):
+            prompts += PORTRAIT_PROMPTS
+        rest = low
+        for q in mine:
+            rest = rest.replace(q.lower(), " ")
+        words = [w for w in re.findall(r"[^\W\d_][\w'-]*", rest) if w not in TERM_FILLER and w not in STOPWORDS]
+        if words and not (political and all(re.fullmatch(POLITICAL_ITEM, w) or w in GENERIC_WORDS for w in words)):
+            visual.append(x)  # "nothing political in any of them" names nothing to look for besides its prompts
+    prompts = [x for x in dict.fromkeys(prompts) if not conflicts(x, list(wanted))]
+    return list(dict.fromkeys(t for t in terms if len(_squash(t)) >= 3)), prompts, visual
+
+
+def _term_hit(term: str, text: str) -> bool:
+    """A squashed term in squashed OCR text, whole or (from 6 letters on) as a fragment of OCR_TERM_FRAGMENT of it."""
+    if term in text:
+        return True
+    if len(term) < 6:
+        return False
+    k = math.ceil(OCR_TERM_FRAGMENT * len(term))
+    return any(term[a:a + k] in text for a in range(len(term) - k + 1))
+
+
+def ocr_term_steps(corpus, terms: list[str]) -> np.ndarray | None:
+    """bool per corpus grid step: on-screen text holding one of `terms` read within OCR_HOLD_S (never across a file
+    boundary); None without OCR text or terms, or when no term is read anywhere."""
+    texts = getattr(corpus, "text_items", None)
+    sq = [t for t in (_squash(x) for x in terms) if t]
+    if not texts or not sq:
+        return None
+    mask = np.zeros(corpus.n, dtype=bool)
+    hold = int(round(OCR_HOLD_S * corpus.fps))
+    for it in texts:
+        text = _squash(str(it.get("text", "")))
+        if text and any(_term_hit(t, text) for t in sq):
+            k, step = int(it.get("file", 0)), int(it["step"])
+            lo, hi = int(corpus.bounds[k]), int(corpus.bounds[k + 1])
+            mask[max(lo, step - hold):min(hi, step + hold + 1)] = True
+    return mask if mask.any() else None
 
 
 # ---- on-screen text (hook) ------------------------------------------------------------------------------------------
