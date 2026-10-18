@@ -1,4 +1,4 @@
-# Dataset card: vhe ranking rows (features v1)
+# Dataset card: vhe ranking rows (features v2)
 
 Training data for the learned candidate scorer (`vhe/rank/scorer.py`, `LinearRankScorer`). Built outside this
 repository by the field-test harness (`vhe-field-test/eval/`), consumed by `tools/train/`. Not shipped with the
@@ -24,21 +24,21 @@ package.
 |---|---|
 | `row_id` | `set/run_id/brief_id/origin/index` |
 | `set`, `run_id`, `brief_id` | the query: rows are only ever compared within one (set, run, brief) |
-| `persona`, `brief_kind`, `brief_text`, `parsed`, `q` | who the edit is for, `"reject"` briefs, the brief, the app's parse of it, the query vector (`query_names()`, v1) |
+| `persona`, `brief_kind`, `brief_text`, `parsed`, `q` | who the edit is for, `"reject"` briefs, the brief, the app's parse of it (with the visual cues framing, want_faces, hook, legible_text, centered), the query vector (`query_names()`, v2: v1 plus the cue entries before the personas) |
 | `file`, `start`, `end` | the span, file-local seconds (3 dp) |
 | `source`, `stage` | candidate generator (`window`, `peak`, ..., `external`) and dump stage |
 | `origin` | `app_dump` (the app's own dump), `app_picks` (app picks featurised afterwards), `opus` |
 | `selected_by` | `app`, `opus` or `none` (an unselected pool row) |
 | `app_rank`, `role` | selection order / opener-closer-soundbite in the app's run |
 | `dump_score` | the score recorded with the features (the run's scorer; for `external` rows: `score()` over that file's spans only) |
-| `f_<name>` | the 71 features v1 (`vhe/rank/features.py: FEATURES`) |
+| `f_<name>` | the 82 features v2 (`vhe/rank/features.py: FEATURES`): the 71 of v1, then the 11 index v3 columns `FEATURES_V2` (shot scale, faces, approach, OCR text, `ocr_item_match`) |
 | `judge_clip`, `label_iou` | the judged clip the label came from, and the overlap (1.0 for an exact match) |
 | `judge_fit`, `judge_usable`, `judge_redundant` | the judge's clip scores; redundant = repeats an earlier clip of the same system's set |
 | `set_pref`, `set_margin` | +1 / -1 if the judge preferred / rejected the set this row was selected into; margin slight/clear/strong/forfeit |
 | `label_kind` | `judged`, `label_transfer`, `pool_negative`, `unjudged` |
 | `y_point`, `weight` | the target and row weight (below) |
 | `split` | `heldout` for set `festival-commons`, else `train` |
-| `feature_version`, `scorer_at_dump`, `app_sha` | provenance; rows of another feature version are refused by `build_dataset.py` |
+| `feature_version`, `scorer_at_dump`, `app_sha` | provenance; rows of another feature version (v1 rows included: retrain on v2 dumps) are refused by `build_dataset.py` |
 
 ## Labels
 

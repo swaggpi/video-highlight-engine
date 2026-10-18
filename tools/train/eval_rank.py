@@ -1,6 +1,6 @@
 """Offline ranking metrics of learned models against the hand-weighted scorer, on any split of the training rows.
 
-  python tools/train/eval_rank.py ROWS.jsonl --model models/linear_v1.json [--model ...] [--split heldout|train|all]
+  python tools/train/eval_rank.py ROWS.jsonl --model models/linear_v2.json [--model ...] [--split heldout|train|all]
                                   [--boot 2000] [--json OUT]
 
 Per query (set, run, brief) over its labelled rows (judged and label_transfer; unlabelled pool rows carry no y and

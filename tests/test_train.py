@@ -12,7 +12,7 @@ import build_dataset as bd  # noqa: E402
 import eval_rank as er  # noqa: E402
 import train_linear as tl  # noqa: E402
 
-from vhe.rank.features import FEATURES, INDEX, PERSONAS, query_names  # noqa: E402
+from vhe.rank.features import FEATURE_VERSION, FEATURES, INDEX, PERSONAS, query_names  # noqa: E402
 from vhe.rank.scorer import HeuristicScorer, LinearRankScorer, load_scorer  # noqa: E402
 
 F = len(FEATURES)
@@ -49,7 +49,7 @@ def make_rows(n_queries=40, per_query=20, seed=0, split="train", set_name="syn",
                          "selected_by": "none" if pool else ("app" if i % 2 else "opus"),
                          "dump_score": float(lat[i]) if i % 2 else 0.0,
                          "label_kind": "pool_negative" if pool else "judged", "y_point": None if pool else float(y[i]),
-                         "weight": 0.3 if pool else 1.0, "split": split, "feature_version": "v1",
+                         "weight": 0.3 if pool else 1.0, "split": split, "feature_version": FEATURE_VERSION,
                          **{f"f_{n}": float(X[i, j]) for j, n in enumerate(FEATURES)}})
     return rows
 
@@ -114,7 +114,9 @@ def test_without_interactions_the_model_has_one_weight_per_feature():
 
 def test_train_cli_writes_a_model_the_engine_loads_and_ranks_with(tmp_path, monkeypatch, capsys):
     rows_path = tmp_path / "rows.jsonl"
-    rows = make_rows(n_queries=8) + make_rows(n_queries=3, seed=9, split="heldout", set_name="festival-commons")
+    # per_query 30 (was the default 20): features v2 adds 11 noise columns (x 6 with interactions) to fit
+    rows = make_rows(n_queries=8, per_query=30) + make_rows(n_queries=3, seed=9, split="heldout",
+                                                            set_name="festival-commons")
     rows_path.write_text("".join(json.dumps(r) + "\n" for r in rows))
     monkeypatch.setattr(sys, "argv", ["train_linear.py", str(rows_path), "--name", "t1", "--out-dir", str(tmp_path),
                                       "--l2", "0.01,1", "--boot", "200", "--report", str(tmp_path / "cv.json")])
@@ -172,6 +174,18 @@ def test_rows_of_another_feature_version_are_refused():
     rows[0]["feature_version"] = "v0"
     ds = bd.build(rows)
     assert len(ds) == len(rows) - 1 and ds.source["skipped"] == {"feature_version v0": 1}
+
+
+def test_v1_rows_are_refused_and_v2_rows_carry_the_appended_columns():
+    rows = make_rows(n_queries=2, per_query=4, n_pool=0)
+    for r in rows[:3]:
+        r["feature_version"] = "v1"
+        for name in FEATURES[71:]:  # a v1 row has no v2 columns
+            r.pop(f"f_{name}")
+    ds = bd.build(rows)
+    assert FEATURE_VERSION == "v2" and ds.source["skipped"] == {"feature_version v1": 3}
+    assert len(ds) == len(rows) - 3 and ds.X.shape == (len(rows) - 3, len(FEATURES))
+    assert ds.Q.shape[1] == len(query_names(PERSONAS)) and "framing_close" in query_names(PERSONAS)
 
 
 def test_linear_scorer_mask_validation(tmp_path):

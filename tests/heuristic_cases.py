@@ -3,12 +3,16 @@
 tests/data/heuristic_clips.json holds what Engine.clips returns for every case; HeuristicScorer must reproduce it
 exactly. First written at 138dcd6 (before the ranking seam, vhe/rank); regenerated on purpose after the r2 field-test
 fixes changed the selection itself (near-duplicates are never picked, visual edges move onto clean frames, speech
-clips are whole sentences, "leave out X" is a hard gate, a short budget is reported): any other change to it is a
-regression. The cases cover the paths the hand-weighted total runs through: length buckets, cut and length priors,
-the speech bonus, the usable and live-sound gates, opener/closer pools, shot lists (per-item pool extras, round robin,
-exhaustive per-item), avoid items, spoken topics, and the non-commercial saliency blend (mocked: NaN on one file)."""
+clips are whole sentences, "leave out X" is a hard gate, a short budget is reported), and again for features v2 (the
+parsed query of every case gained the five visual-cue keys at their defaults, every clip and every other key stayed
+identical; the cue_* cases were appended): any other change to it is a regression. The cases cover the paths the
+hand-weighted total runs through: length buckets, cut and length priors, the speech bonus, the usable and live-sound
+gates, opener/closer pools, shot lists (per-item pool extras, round robin, exhaustive per-item), avoid items, spoken
+topics, the non-commercial saliency blend (mocked: NaN on one file), and the visual cues (close / wide framing,
+faces, centring, the hook slot, readable text) on index v3 signals."""
 from __future__ import annotations
 
+import json
 import zlib
 from pathlib import Path
 
@@ -101,6 +105,66 @@ def _nc_mock(seed: int, absent: int | None = None):
     return nc
 
 
+CUE_SPANS = {  # file -> kind -> [(start, end) seconds] where the cue project's v3 signals show it
+    0: {"close": [(10.0, 14.0)], "wide": [(30.0, 40.0)]},
+    1: {"text": [(20.0, 26.0)], "close": [(44.0, 48.0)]},
+}
+CUE_BRIEFS = {
+    "cue_none": "6 clips of the parade",
+    "cue_close": "6 clips of the parade, close-ups and faces, keep everything centered",
+    "cue_wide": "6 clips of the parade, wide establishing views, the street as the main character",
+    "cue_hook": "a 20 s edit of the parade, 2-3 s per clip. the first clip has to be the hook",
+    "cue_legible": "4 clips. Show the Pasargad float with its name readable, and the crowd.",
+}
+
+
+def _cue_project(root: Path) -> Path:
+    """Two 60 s files whose index v3 signals (shot scale, faces, approach, OCR text) show CUE_SPANS; everything
+    else is an ordinary medium shot. The embeddings carry one direction everywhere (the parade)."""
+    (parade,) = _dirs(1, seed=9)
+    specs = []
+    for k in (0, 1):
+        n = int(60 * FPS)
+        g = {"scale_close": np.full(n, -6.0, np.float32), "scale_wide": np.full(n, 1.5, np.float32),
+             "face_n": np.zeros(n, np.int16), "face_area_max": np.zeros(n, np.float32),
+             "face_center": np.zeros(n, np.float32), "approach": np.zeros(n, np.float32),
+             "text_area": np.zeros(n, np.float32), "text_conf": np.zeros(n, np.float32)}
+        for a, b in CUE_SPANS[k].get("close", []):
+            i, j = int(a * FPS), int(b * FPS)
+            g["scale_close"][i:j], g["scale_wide"][i:j] = 3.0, -3.0
+            g["face_n"][i:j], g["face_area_max"][i:j], g["face_center"][i:j] = 1, 0.05, 0.9
+            g["approach"][i:i + 6] = 0.8
+        for a, b in CUE_SPANS[k].get("wide", []):
+            i, j = int(a * FPS), int(b * FPS)
+            g["scale_wide"][i:j], g["scale_close"][i:j] = 5.0, -8.0
+        for a, b in CUE_SPANS[k].get("text", []):
+            i, j = int(a * FPS), int(b * FPS)
+            g["text_area"][i:j], g["text_conf"][i:j] = 0.03, 0.95
+        g["emb"] = _emb(np.random.default_rng(20 + k), n, (parade,), [(0, 60, parade)])
+        specs.append((f"take{k}.mp4", 60.0, g))
+    make_project(root, specs)
+    for d in sorted((root / ".vhe" / "files").iterdir()):  # the text store of take1 (OCR read every 3rd step)
+        if d.name.startswith("take1"):
+            a, b = CUE_SPANS[1]["text"][0]
+            items = [[s, "PASARGAD", 0.95, [0.3, 0.4, 0.7, 0.5]] for s in range(int(a * FPS), int(b * FPS), 3)]
+            (d / "ocr.json").write_text(json.dumps({"version": 1, "engine": "fake", "every": 3, "min_conf": 0.7,
+                                                    "items": items}))
+    return root
+
+
+def cue_engine(root: Path) -> Engine:
+    """The cue project's engine: every text the rules parse from CUE_BRIEFS (and the hook/opener slots) matches the
+    parade direction, so the cue signals decide between otherwise equal footage."""
+    from vhe.query.parser import parse
+
+    (parade,) = _dirs(1, seed=9)
+    texts = {"parade"}
+    for q in CUE_BRIEFS.values():
+        p = parse(q)
+        texts |= {*p.shots, p.text, p.opener or "", p.closer or ""}
+    return _engine(_cue_project(root), {t: parade for t in texts if t})
+
+
 def cases(tmp: Path):
     """Yield (name, engine, query, clips kwargs)."""
     root = make_project(tmp / "recap", [("a.mp4", 61.0, {}), ("b/c.mp4", 45.0, {"has_audio": False}),
@@ -173,6 +237,11 @@ def cases(tmp: Path):
     yield "speaks_every", eng, "every moment someone speaks", {}
     yield "soundbite", eng, "3 clips of the crowd. Also give the best 5-8 s soundbite where the host sums up " \
                             "the stream (\"that is it for today\").", {}
+
+    # Visual cues (features v2, index v3 signals): added with the cue bonuses, after the cue-free cases above.
+    eng = cue_engine(tmp / "cues")
+    for name, q in CUE_BRIEFS.items():
+        yield name, eng, q, {}
 
 
 def strip(res: dict, tmp: Path) -> dict:

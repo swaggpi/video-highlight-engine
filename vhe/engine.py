@@ -38,6 +38,7 @@ from vhe.query.plan import (
     LIVE_MAX_MUTED,
     NO_SPEECH_MAX_FRAC,
     OCR_BONUS,
+    OCR_GENERIC,
     assign,
     combine,
     conflicts,
@@ -47,14 +48,15 @@ from vhe.query.plan import (
     item_centre,
     item_scores,
     legibility_steps,
+    legible_items,
     muted_steps,
     ocr_item_scores,
     topic_scores,
 )
 from vhe.query.refine import Context, clean_steps, edges_clean, refine, refine_speech
 from vhe.rank import dump as dumps
-from vhe.rank.features import INDEX, featurize, query_names, query_vector
-from vhe.rank.scorer import Scorer, load_scorer
+from vhe.rank.features import INDEX, featurize, grid_steps, query_names, query_vector
+from vhe.rank.scorer import HOOK_WEIGHTS, Scorer, cue_bonus, load_scorer
 from vhe.rank.select import DUP_GAP_S, duplicates, select_for
 from vhe.rank.signals import (
     blend_nc,
@@ -210,11 +212,17 @@ class Engine:
         sig = timestep_signals(c.grid, c.fps, None, c.audio_steps, c.file_id)
         sig.update(siglip=None, avoid_pen=None, nc_sal=nc, items=None, item_centre=None, muted=self._muted)
         items = p.shots or ([p.text] if p.text else [])
+        # "every shot where the text is legible", "the float with its name legible": confident OCR text counts as
+        # relevant, to the items that ask for it (all of them when none does)
+        legible = legibility_steps(c.grid, p.legible_text)
         if items:
             rel_items = self._relevances(items)
             rel_avoid = self._relevances(p.avoid) if p.avoid else None
             want = combine(rel_items)
-            sig.update(relevance=combine(blend_nc(rel_items, nc), rel_avoid), siglip=want,
+            blended = blend_nc(rel_items, nc)
+            if legible is not None:
+                blended = blended + LEGIBLE_BONUS * legible_items(items)[:, None] * legible[None, :]
+            sig.update(relevance=combine(blended, rel_avoid), siglip=want,
                        avoid_pen=want - combine(rel_items, rel_avoid))
             if p.shots:
                 sig.update(items=rel_items, item_centre=item_centre(rel_items))
@@ -224,11 +232,24 @@ class Engine:
             sig["relevance"] = 0.5 * rel + 0.5 * prior if items else prior
             if sig["siglip"] is None:  # the rel_* features stay SigLIP-only (no text: zero, as before)
                 sig["siglip"] = np.zeros(c.n)
-        legible = legibility_steps(c.grid, p.raw)
-        if legible is not None:  # "every shot where the text is legible": confident OCR text counts as relevant
+        if legible is not None and not items:
             sig["relevance"] = sig["relevance"] + LEGIBLE_BONUS * legible
+        sig["cue"] = self._cue_steps(p)
         sig.update(self._exclusions(p))
         return sig, nc_raw, proposals
+
+    def _cue_steps(self, p: ParsedQuery) -> np.ndarray | None:
+        """Per step: the scorer's visual-cue bonus (vhe.rank.scorer.cue_bonus on the step's own shot scale, face and
+        approach) for a brief with framing / faces / centring cues, so candidate peaks sit on close-ups or wides too;
+        None without cues. Readable text is in relevance already."""
+        if p.framing == "none" and not (p.want_faces or p.centered):
+            return None
+        c = self.corpus
+        cols = {"scale_close_mean": grid_steps(c, {}, "scale_close"),
+                "scale_wide_mean": grid_steps(c, {}, "scale_wide"),
+                "face_area_max_mean": grid_steps(c, {}, "face_area_max"), "approach_max": grid_steps(c, {}, "approach"),
+                "face_center_mean": grid_steps(c, {}, "face_center"), "ocr_item_match": np.zeros(c.n)}
+        return cue_bonus(cols, p.framing, p.want_faces, p.centered, False)
 
     def _highlight_prior(self) -> np.ndarray | None:
         """Per step: how much a generic highlight shows people, faces and action (HIGHLIGHT_TAGS), z-scored and
@@ -448,7 +469,8 @@ class Engine:
         if sig.get("items") is not None:  # which shot item each final span serves
             r0, r1 = c.steps(S1, E1, K1)
             scores = item_scores(sig["items"], r0, r1)
-            ocr = ocr_item_scores(c, p.shots, S1, E1, K1)  # legible on-screen text naming an item (no-op without OCR)
+            # legible on-screen text naming an item (no-op without OCR); a readable-text brief counts its names only
+            ocr = ocr_item_scores(c, p.shots, S1, E1, K1, OCR_GENERIC if p.legible_text else frozenset())
             if ocr is not None:
                 scores = scores + OCR_BONUS * ocr
             for o, row, it in zip(out, scores, assign(scores, sig["item_centre"])):
@@ -459,16 +481,30 @@ class Engine:
             o["total"], o["x"] = float(t), x
         return out
 
-    def _edge_clip(self, text: str, sig: dict, cands: tuple, p: ParsedQuery, taken: list[dict],
-                   max_len: float, persona: str | None = None) -> dict | None:
+    def _edge_clip(self, text: str | None, sig: dict, cands: tuple, p: ParsedQuery, taken: list[dict],
+                   max_len: float, persona: str | None = None, hook: bool = False) -> dict | None:
         """Best clip for the opener/closer description: its own relevance (minus the brief's avoid penalty, without
-        the brief's highlight saliency), steady and clean, not overlapping."""
-        rel = self._relevance(text)
-        avoided = self._avoided(rel, p)
-        edge_sig = dict(sig, relevance=avoided, siglip=rel, avoid_pen=rel - avoided, nc_sal=None, items=None,
-                        item_centre=None)
-        pool = self._pool(edge_sig, EDGE_WEIGHTS, cands, p, EDGE_POOL, persona)
+        the brief's highlight saliency), steady and clean, not overlapping, framed as the brief asks (a wide brief's
+        closer is a wide). The description's own framing words ("an establishing wide") work through its relevance:
+        a shot-scale bonus on top moved p1-videographer-1's opener from the avenue with the crowd to a later, emptier
+        wide. hook: the hook slot, scored with HOOK_WEIGHTS and framing "close" (shot scale, the largest face,
+        something coming at the lens), on the description's relevance or, without one, the brief's, and at least the
+        brief's minimum clip length (a hook fills its first second)."""
+        if text:
+            rel = self._relevance(text)
+            avoided = self._avoided(rel, p)
+            edge_sig = dict(sig, relevance=avoided, siglip=rel, avoid_pen=rel - avoided, nc_sal=None, items=None,
+                            item_centre=None)
+        else:
+            edge_sig = dict(sig, items=None, item_centre=None)
+        # ocr_item_match measures the shot items' names, not the slot's description: no readable-text term here
+        framing = "close" if hook else p.framing
+        slot_p = p if (framing, p.legible_text) == (p.framing, False) else \
+            dataclasses.replace(p, framing=framing, legible_text=False)
+        pool = self._pool(edge_sig, HOOK_WEIGHTS if hook else EDGE_WEIGHTS, cands, slot_p, EDGE_POOL, persona)
         pool = [o for o in pool if o["end"] - o["start"] <= max_len + 1e-6 and _disjoint(o, taken)]
+        if hook:
+            pool = [o for o in pool if o["end"] - o["start"] >= p.min_len - 1e-6] or pool
         if pool and taken:  # the opener and the closer are not the same moment
             vec = self._span_vectors(pool)
             for t, tv in zip(taken, self._span_vectors(taken)):
@@ -506,6 +542,8 @@ class Engine:
             return self._finish(result, t0, load_before, warn_before)
         sig, nc_raw, proposals = self._signals(p)
         per_step = sum(p.weights.get(k, 0.0) * sig[k] for k in ("relevance", "quality", "energy", "steady"))
+        if sig.get("cue") is not None:
+            per_step = per_step + sig["cue"]
         S, E, K, src = self._candidates(per_step, p, proposals)
         result = {"query": p.to_dict(), "clips": [], "candidates": len(S), "files": len(c.members),
                   "noncommercial": sorted({x for ix in c.members for x in ix.meta.get("noncommercial_components", [])})
@@ -531,10 +569,11 @@ class Engine:
         bite_s = sum(b["duration"] for b in bites)
         room = np.inf if p.budget is None else p.budget[1] - bite_s
         for role, text in (("opener", p.opener), ("closer", p.closer)):
-            if text:
-                e = self._edge_clip(text, sig, cands, p, list(edges.values()), room, persona)
+            hook = role == "opener" and p.hook  # "the first clip has to be the hook": the opener slot is a hook pool
+            if text or hook:
+                e = self._edge_clip(text, sig, cands, p, list(edges.values()), room, persona, hook=hook)
                 if e is not None:
-                    edges[role] = dict(e, text=text)
+                    edges[role] = dict(e, text=(f"hook, {text}" if text else "hook") if hook else text)
                     room -= e["end"] - e["start"]
         used = sum(e["end"] - e["start"] for e in edges.values()) + bite_s
         body_p = dataclasses.replace(

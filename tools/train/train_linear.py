@@ -2,7 +2,7 @@
 phi(x, q) = [z, outer(z, q_small)], z the standardised features (learned mask applied), q_small the brief's signal
 weights; plus a pointwise ridge baseline on the same phi. numpy only.
 
-  python tools/train/train_linear.py ROWS.jsonl [--name linear_v1] [--learner ranknet|ridge] [--split train]
+  python tools/train/train_linear.py ROWS.jsonl [--name linear_v2] [--learner ranknet|ridge] [--split train]
                                      [--l2 1e-3,1e-2,0.1,1,10] [--no-cv] [--keep-all-features]
                                      [--no-interactions] [--seed 0] [--report OUT.json]
 
@@ -30,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from build_dataset import DROP_PREFIXES, Dataset, build, file_sha, load_rows, pairs, summary  # noqa: E402
 from eval_rank import aggregate, format_table, heuristic_scores, per_query, score_rows  # noqa: E402
 
-from vhe.rank.features import FEATURES  # noqa: E402
+from vhe.rank.features import FEATURE_VERSION, FEATURES  # noqa: E402
 from vhe.rank.scorer import Q_SMALL, LinearRankScorer  # noqa: E402
 
 REPO = Path(__file__).resolve().parents[2]
@@ -153,7 +153,7 @@ def cross_validate(ds: Dataset, lambdas=LAMBDAS, learners=LEARNERS, seed: int = 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("rows", type=Path)
-    ap.add_argument("--name", default="linear_v1")
+    ap.add_argument("--name", default=f"linear_{FEATURE_VERSION}")
     ap.add_argument("--learner", default="ranknet", choices=LEARNERS, help="which learner's model is written")
     ap.add_argument("--split", default="train")
     ap.add_argument("--l2", default=",".join(f"{x:g}" for x in LAMBDAS), help="comma-separated L2 grid")

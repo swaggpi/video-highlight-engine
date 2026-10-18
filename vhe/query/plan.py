@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 
 import numpy as np
 
+from vhe.query.parser import LEGIBLE_CUE
 from vhe.rank.signals import span_top_mean
 
 # Relevance units (vhe.rank.signals.relevance): 0 is log-odds -8, one unit 2.5 nats, clipped to +-3.
@@ -261,7 +262,15 @@ def exclusion_steps(rel_excl: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 OCR_BONUS = 1.0  # relevance units for a span whose legible text contains all of an item's words
 
 
-def ocr_item_scores(corpus, items: list[str], S: np.ndarray, E: np.ndarray, K: np.ndarray) -> np.ndarray | None:
+# Words of an item that name what carries the text, or ask for it to be readable, not the text itself ("the PASARGAD
+# float with its name legible" -> "pasargad"): left out of the ocr_item_match feature (vhe.rank.features).
+OCR_GENERIC = {"name", "names", "named", "text", "texts", "readable", "legible", "legibly", "clearly", "clear",
+               "visible", "sign", "signs", "banner", "banners", "float", "floats", "label", "labels", "lettering",
+               "written", "words", "wording", "colorful", "colourful", "most", "with"}
+
+
+def ocr_item_scores(corpus, items: list[str], S: np.ndarray, E: np.ndarray, K: np.ndarray,
+                    ignore: set[str] | frozenset = frozenset()) -> np.ndarray | None:
     """Hook for on-screen text: (spans, items) the share of each item's words found in the text read inside
     each span (0..1, matched without spaces), or None when the corpus exposes no text (indexes before on-screen text,
     or OCR not run): callers then change nothing.
@@ -269,7 +278,8 @@ def ocr_item_scores(corpus, items: list[str], S: np.ndarray, E: np.ndarray, K: n
     Reads `corpus.text_items` when it exists: [{"t": virtual seconds, "text", "conf", "file", ...}] (vhe.corpus, from
     each index's ocr.json). The engine adds OCR_BONUS times this to each span's item relevance, so a float whose name
     is legible serves its item ("PASARGAD float"). A legibility prior for "every shot where text is readable" briefs
-    can come from the grid's text_area / text_conf the same way. S, E: virtual seconds; K: file index per span."""
+    can come from the grid's text_area / text_conf the same way. S, E: virtual seconds; K: file index per span.
+    ignore: words never counted (an item left with none scores 0)."""
     texts = getattr(corpus, "text_items", None)
     if not texts or not items or not len(S):
         return None
@@ -279,8 +289,8 @@ def ocr_item_scores(corpus, items: list[str], S: np.ndarray, E: np.ndarray, K: n
     read = [_squash(str(texts[j].get("text", ""))) for j in order]
     files = np.array([int(texts[j].get("file", 0)) for j in order])
     # OCR often drops spaces ("TOMBof CYRUS"): words are matched as substrings of the span's text with spaces removed
-    terms = [[_squash(w) for w in re.findall(r"[^\W\d_][\w'-]*", x.lower()) if len(w) > 2 and w not in STOPWORDS]
-             for x in items]
+    terms = [[_squash(w) for w in re.findall(r"[^\W\d_][\w'-]*", x.lower())
+              if len(w) > 2 and w not in STOPWORDS and w not in ignore] for x in items]
     out = np.zeros((len(S), len(items)))
     for i, (s, e, k) in enumerate(zip(S, E, K)):
         a, b = np.searchsorted(t, s, "left"), np.searchsorted(t, e, "right")
@@ -290,19 +300,28 @@ def ocr_item_scores(corpus, items: list[str], S: np.ndarray, E: np.ndarray, K: n
     return out
 
 
-LEGIBLE_CUE = (r"\b(?:legible|readable|read(?:s|ing)? the|on-screen text|exact (?:text|wording)|spelling|fact-check|"
-               r"lesbar|schrift)\b")
 LEGIBLE_BONUS = 1.0  # relevance units at full OCR confidence, for briefs that ask for readable text
 
 
-def legibility_steps(grid: dict, raw: str) -> np.ndarray | None:
+def legibility_steps(grid: dict, wanted: bool | str) -> np.ndarray | None:
     """Per step 0..1: confident legible text in frame (grid text_conf where text_area > 0, index v3), for a brief that
-    asks for readable text ("every shot where the text is legible"); None otherwise or without OCR in the index."""
-    if "text_conf" not in grid or "text_area" not in grid or not re.search(LEGIBLE_CUE, raw.lower()):
+    asks for readable text (ParsedQuery.legible_text, or a brief string matched with the parser's LEGIBLE_CUE); None
+    otherwise or without OCR in the index. Not scaled by text size: weighting small text down cost the fact-check
+    brief (p3-newsedit-1) its street signs, 84 % -> 72 % of picks with text read inside."""
+    if isinstance(wanted, str):
+        wanted = re.search(LEGIBLE_CUE, wanted.lower()) is not None
+    if not wanted or "text_conf" not in grid or "text_area" not in grid:
         return None
     conf = np.nan_to_num(np.asarray(grid["text_conf"], dtype=float), nan=0.0)
     area = np.nan_to_num(np.asarray(grid["text_area"], dtype=float), nan=0.0)
     return np.clip(np.where(area > 0, conf, 0.0), 0.0, 1.0)
+
+
+def legible_items(items: list[str]) -> np.ndarray:
+    """bool per shot item that itself asks for readable text ("float with its name legible", "the band with the
+    banner readable"); all True when none does (the whole brief asks: "every shot where text is legible")."""
+    ask = np.array([re.search(LEGIBLE_CUE, x.lower()) is not None for x in items], dtype=bool)
+    return ask if ask.any() else np.ones(len(items), dtype=bool)
 
 
 def _squash(text: str) -> str:

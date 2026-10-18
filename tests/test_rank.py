@@ -95,7 +95,7 @@ def test_span_statistics_match_the_per_span_definitions():
 
 # ---- features --------------------------------------------------------------------------------------------------
 def test_feature_names_are_stable_and_unique():
-    assert FEATURE_VERSION == "v1" and len(set(FEATURES)) == len(FEATURES)
+    assert FEATURE_VERSION == "v2" and len(set(FEATURES)) == len(FEATURES)  # v2: test_cues checks the appended columns
     assert FEATURES[:3] == ("rel_mean", "rel_top60", "rel_max")
     for name in ("item_rel", "avoid_pen", "nc_sal_mean", "nc_present", "h_rel_mean", "h_rel_top60", "quality_min",
                  "blown_frac", "unusable_frac", "motion_z", "cam_speed_z", "loud_z", "onset_z", "speech_frac",

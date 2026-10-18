@@ -15,12 +15,14 @@ import re
 import numpy as np
 
 from vhe.query.candidates import cuts_inside
-from vhe.query.plan import assign, item_scores, muted_steps
+from vhe.query.plan import OCR_GENERIC, assign, item_scores, muted_steps, ocr_item_scores
 from vhe.rank.signals import span_max, span_mean, span_min, span_top_mean
 from vhe.signals.tags import LABELS
 
-FEATURE_VERSION = "v1"
-QUERY_VERSION = "v1"
+# v2 (2026-10-18): the index v3 framing, face, approach and on-screen text columns appended (FEATURES_V2) and the
+# brief's visual cues appended to the query's fixed block (QUERY_V2); v1 is the prefix of both.
+FEATURE_VERSION = "v2"
+QUERY_VERSION = "v2"
 SOURCES = ("shot", "window", "peak", "model", "speech")  # vhe.query.candidates.generate
 PERSONAS = ("p1-videographer", "p2-tiktok", "p3-newsedit", "p4-vlogger", "p5-marketing", "p6-casual")
 SIGNALS = ("relevance", "quality", "energy", "steady", "speech")  # the weighted signals of ParsedQuery.weights
@@ -55,17 +57,33 @@ FEATURES = (
     # Zero-shot tag probabilities (vhe.signals.tags.LABELS), span means.
     *(f"tag_{_slug(label)}" for label in LABELS),
 )
+# v2, appended. Index v3 grid keys over the span's steps, raw units: shot-scale margins in logits (scale_close >= 1
+# close-up / fills the frame, scale_wide >= 2.5 wide), the largest face as a fraction of the frame, how centred it
+# is (0..1, 0 without a face), the face count, the looming rate (> 0.3 approaching), confident OCR text area and
+# confidence; ocr_item_match: the best share of a shot item's words read by OCR inside the span (0..1). A grid key an
+# index lacks reads as an ordinary medium shot with no face or text (GRID_NEUTRAL).
+FEATURES_V2 = (
+    "scale_close_mean", "scale_close_max", "scale_wide_mean", "face_area_max_mean", "face_area_max_max",
+    "face_center_mean", "face_n_mean", "approach_max", "text_area_mean", "text_conf_mean", "ocr_item_match",
+)
+FEATURES = FEATURES + FEATURES_V2
 INDEX = {name: i for i, name in enumerate(FEATURES)}
+GRID_NEUTRAL = {"scale_close": -6.0, "scale_wide": 0.0, "face_area_max": 0.0, "face_center": 0.0, "face_n": 0.0,
+                "approach": 0.0, "text_area": 0.0, "text_conf": 0.0}
 
 QUERY_BASE = (
     "w_relevance", "w_quality", "w_energy", "w_steady", "w_speech",  # signal weights (mood, speech intent, plan)
     "mood_energetic", "mood_calm", "exhaustive", "has_text", "has_budget", "target_len", "log_target_len",
     "has_shots", "n_shots", "has_avoid", "has_topics", "need_live_audio",
 )
+# v2: the brief's visual cues (ParsedQuery.framing one-hot, want_faces, hook, legible_text, centered), appended to the
+# fixed block; the persona one-hot stays last (its length depends on the scorer's persona list).
+FRAMINGS = ("none", "close", "wide")
+QUERY_V2 = (*(f"framing_{x}" for x in FRAMINGS), "want_faces", "hook", "legible_text", "centered")
 
 
 def query_names(personas: tuple[str, ...] | list[str] = PERSONAS) -> tuple[str, ...]:
-    return QUERY_BASE + tuple(f"persona_{x}" for x in personas)
+    return QUERY_BASE + QUERY_V2 + tuple(f"persona_{x}" for x in personas)
 
 
 def target_len(p) -> float:
@@ -84,6 +102,9 @@ def query_vector(p, persona: str | None = None, personas: tuple[str, ...] | list
          float(p.budget is not None), target, math.log(max(target, 1e-3)),
          float(bool(p.shots)), float(len(p.shots)), float(bool(p.avoid)), float(bool(p.topics)),
          float(p.need_live_audio)]
+    framing = getattr(p, "framing", "none")
+    v += [float(framing == x) for x in FRAMINGS]
+    v += [float(bool(getattr(p, k, False))) for k in ("want_faces", "hook", "legible_text", "centered")]
     v += [float(persona == x) for x in personas]
     return np.array(v, dtype=np.float64)
 
@@ -169,4 +190,31 @@ def featurize(corpus, sig: dict, S: np.ndarray, E: np.ndarray, K: np.ndarray, sr
             name = f"tag_{_slug(label)}"
             if name in INDEX and j < means.shape[1]:
                 put(name, means[:, j])
+
+    # v2: shot scale, faces, approach, on-screen text (index v3)
+    g = {key: grid_steps(c, sig, key) for key in GRID_NEUTRAL}
+    put("scale_close_mean", span_mean(g["scale_close"], i0, i1))
+    put("scale_close_max", span_max(g["scale_close"], i0, i1))
+    put("scale_wide_mean", span_mean(g["scale_wide"], i0, i1))
+    put("face_area_max_mean", span_mean(g["face_area_max"], i0, i1))
+    put("face_area_max_max", span_max(g["face_area_max"], i0, i1))
+    put("face_center_mean", span_mean(g["face_center"], i0, i1))
+    put("face_n_mean", span_mean(g["face_n"], i0, i1))
+    put("approach_max", span_max(g["approach"], i0, i1))
+    put("text_area_mean", span_mean(g["text_area"], i0, i1))
+    put("text_conf_mean", span_mean(g["text_conf"], i0, i1))
+    items = list(p.shots) or ([p.text] if p.text else [])
+    ocr = ocr_item_scores(c, items, S, E, K, OCR_GENERIC) if items else None
+    if ocr is not None and ocr.size:
+        put("ocr_item_match", ocr.max(1))
     return X
+
+
+def grid_steps(corpus, sig: dict, key: str) -> np.ndarray:
+    """Per-step float64 values of an index v3 grid key (from sig when it has them, else the corpus grid); missing
+    steps and indexes without the key read as GRID_NEUTRAL[key]."""
+    x = sig.get(key)
+    x = corpus.grid.get(key) if x is None else x
+    if x is None:
+        return np.full(corpus.n, GRID_NEUTRAL[key])
+    return np.nan_to_num(np.asarray(x, dtype=np.float64), nan=GRID_NEUTRAL[key])

@@ -12,6 +12,10 @@ These become a plan on the ParsedQuery (shots, avoid, topics, need_live_audio, s
 (Ollama, JSON schema enforced, cached on disk per model and brief) is the default parser when it is reachable; the
 rules are the fallback and also ground the model: numbers the brief does not contain are replaced by the rules'
 values, and avoid/topic items the rules find are added. Both paths end in the same _finalise.
+
+Visual cues the index v3 signals can answer become fields too: framing (close / wide), want_faces, hook, legible_text
+and centered, read on the brief without its opener/closer descriptions and avoid clauses (an LLM value counts only
+where that text has a matching stem).
 """
 from __future__ import annotations
 
@@ -57,6 +61,7 @@ SPEECH_ON = SPEECH_VERBS + SPEECH_VISUAL
 SHORT = ["short", "quick", "kurz", "kurze", "kurzen"]
 LONG = ["long", "longer", "lang", "lange", "langen"]
 CLIP_NOUNS = (r"(?:clips?|scenes?|shots?|moments?|highlights|parts|stretch(?:es)?|cutaways?|selects?|holds?|cuts|"
+              r"hooks?|first-shots?|"
               r"szenen?|momente|stellen|aufnahmen)")
 # A platform named next to a duration ("30 sek für insta") makes it the runtime of the whole post.
 BUDGET_NOUNS = (r"(?:recaps?|edit|video|reels?|montage|highlights?|cut|film|trailer|teaser|sizzle|summary|supercut|"
@@ -143,6 +148,16 @@ class ParsedQuery:
     no_speech: bool = False
     per_item: bool = True
     highlight: bool = False
+    # Visual cues answered by the index v3 signals (shot scale, faces, approach, OCR), brief-wide: framing "close"
+    # (close-ups, faces, filling the frame, right at the camera, centred, vertical/9:16, hook, POV) or "wide"
+    # (establishing, wide views, the place as the main character); want_faces; hook: the first clip must grab in its
+    # first second (the opener slot becomes a hook pool); legible_text: names/signs/text must be readable; centered:
+    # the subject in the middle (9:16 or square crop).
+    framing: str = "none"
+    want_faces: bool = False
+    hook: bool = False
+    legible_text: bool = False
+    centered: bool = False
     parser: str = "rules"  # "rules" or "llm:<model>"
     parser_note: str | None = None  # "cached", or why the LLM was not used
 
@@ -181,6 +196,7 @@ DASHES = re.compile(r"[‒–—−]")  # en/em dashes and minus sign -> '-' (al
 
 def _normalise(q: str) -> str:
     q = DASHES.sub("-", q.lower())  # en/em dashes, minus
+    q = re.sub(r"(?<![\d:])9\s*:\s*16(?![\d:])", "vertical", q)  # an aspect ratio, not 9 min 16 s
     # "not too long" / "nich zu lang" asks for short clips; it must not read as "long" (or as something to avoid).
     q = re.sub(r"\b(?:not|nicht|nich|net)\s+(?:too|so|zu|allzu)\s+(?:long|lang|lange)\b", "short", q)
     q = re.sub(r"\b(?:not|nicht|nich|net)\s+(?:too|so|zu|allzu)\s+(?:short|kurz|kurze)\b", " ", q)
@@ -314,6 +330,92 @@ STYLE = {"steady", "locked-off", "locked", "off", "static", "tripod", "handheld"
 GENERIC_HEAD = {"stretch", "example", "examples", "thing", "things", "item", "items", "b-roll", "broll", "clip", "shot",
                 "scene", "moment", "part", "bit"}
 ITEM_EDGE = EDGE_STOP | {"where", "when", "that", "which", "who", "also", "then", "each", "every", "all", "one", "per"}
+FRAMING_HEADS = {"close-up", "close-ups", "closeup", "closeups", "wide", "wides", "establishing", "wide-angle"}
+FRAMING_WORDS = FRAMING_HEADS | {"close", "ups", "tight", "view", "views", "angle", "lots", "of", "more"}
+
+# ---- visual cues: framing, faces, hook, readable text, centring -------------------------------------------------
+# Read on the brief minus its opener/closer descriptions and avoid clauses: "no bored faces" asks for no faces, and
+# "open on an establishing wide" describes the opener (its relevance picks the wide), not the whole edit. Framing is
+# the majority of close vs wide cues ("wide view ... rather than close-ups": wide; a tie: none).
+HOOK_CUE = (r"\bhooks?\b|\bhooky\b|\bscroll[\s-]?stopp\w*|\bthumb[\s-]?stopp\w*|\bfirst-(?:shots?|frames?)\b|"
+            r"\b(?:in|within)\s+(?:the\s+)?(?:very\s+)?first\s+(?:second|1\s*s\b|(?:two|2|few)\s+seconds)|"
+            r"\bgrabs?\s+(?:the\s+)?(?:attention|viewers?|people)\b|\battention[\s-]grabb\w*")
+CENTRED_CUE = (r"\bcent(?:er|r)ed\b|\bcent(?:er|re)\s+of\s+(?:the\s+)?frame\b|\bin\s+the\s+(?:middle|cent(?:er|re))\b|"
+               r"\bvertical\b|\bcroppable\b|\bcrop(?:s|ped|ping)?\s+(?:it\s+|them\s+)?(?:to|for)\s+(?:a\s+)?"
+               r"(?:square|vertical|portrait)\b|\bmittig\b|\bhochkant\b")
+FACES_CUE = r"\bfaces?\b|\bgesicht(?:er)?\b"
+CLOSE_CUE = (r"\bclose[\s-]?ups?\b|\bcloseups?\b|\bextreme\s+close\b|\btight(?:ly)?\s+(?:shots?|framed|framing)\b|"
+             r"\bfill(?:s|ed|ing)?\s+(?:up\s+)?(?:the\s+)?(?:whole\s+|entire\s+|full\s+)?(?:frame|screen)\b|"
+             r"\b(?:frame|screen)[\s-]filling\b|"
+             r"\b(?:right|straight|directly)\s+(?:at|into|toward|towards|in\s+front\s+of)\s+"
+             r"(?:the\s+)?(?:camera|lens)\b|"
+             r"\b(?:com|runn|walk|charg|mov|head|march|ris|fly)\w*\s+(?:right\s+|straight\s+)?(?:at|toward|towards|"
+             r"into)\s+(?:the\s+)?(?:camera|lens)\b|\bpunchy\b|\bpov\b|\bnahaufnahmen?\b")
+WIDE_CUE = (r"\bestablishing\b|\bwides?\b|\blong\s+(?:views?|shots?)\b|\bsense\s+of\s+place\b|\bas\s+a\s+place\b|"
+            r"\b(?:street|place|city|avenue|town|location|setting|landscape|venue)\b(?:\s+[\w'-]+){0,3}?\s+(?:is|as)\s+"
+            r"(?:the\s+)?main\s+character\b|\btotale\b|\bweitwinkel\w*")
+# "rather than close-ups", "not too wide": the cue word names what the brief does not want.
+CUE_NEGATION = (r"\b(?:rather\s+than|instead\s+of|not|fewer|less|no\s+more)\s+(?:(?:any|the|a|too|so|many)\s+)?"
+                r"(?:[\w-]+\s+){0,2}?(?:close[\s-]?ups?|closeups?|wides?|faces?|tight\s+shots?)\b|"
+                # "one establishing wide that shows the avenue": a single shot of the list, not the edit's framing
+                r"\b(?:one|a|an|single)\s+(?:[\w-]+\s+){0,2}?(?:establishing(?:\s+(?:wide|shot))?|wides?|"
+                r"close[\s-]?ups?)\b")
+LEGIBLE_CUE = (r"\blegib\w*|\breadab\w*|\bread(?:s|ing)?\s+(?:the|its|their|clearly)\b|\bon-screen\s+text\b|"
+               r"\bexact\s+(?:text|wording)\b|\bspellings?\b|\bfact-check\w*|\blesbar\w*|\bschrift\w*")
+# Words a clause can hold besides its cues and still be only an instruction ("keep everything centered cause im
+# cropping to vertical", "first clip has to be the hook"): such a clause gives no shot item.
+CUE_FILLER = {"keep", "keeping", "make", "sure", "everything", "anything", "cause", "because", "since", "im", "i'm",
+              "it", "its", "them", "they", "has", "have", "had", "be", "is", "are", "must", "should", "need", "needs",
+              "got", "gotta", "first", "clip", "clips", "shot", "shots", "frame", "frames", "second", "seconds",
+              "work", "works", "slow", "build", "edit", "video", "always", "really", "very", "just", "so", "up",
+              "subject", "subjects", "square", "crop", "cropping", "cropped"}
+# What an LLM answer may add on top of the rules, per field: its value counts only when the (scoped) brief contains
+# one of these stems.
+CUE_GROUND = {"close": r"close|fill|face|camera|lens|tight|cent(?:er|re)|hook|vertical|pov|punch|nahauf|gesicht",
+              "wide": r"wide|establish|place|long view|landscape|panoram|scenery|totale|weitwinkel",
+              "want_faces": r"\bfaces?\b|gesicht", "hook": r"hook|first|scroll|grab|attention|thumb",
+              "legible_text": r"legib|readab|\bread|text|spell|fact|lesbar|schrift", "centered":
+              r"cent(?:er|re)|middle|vertical|crop|square|mittig|hochkant"}
+
+
+# A list of hooks as the deliverable ("rank me 3 hooks", "the 3 best possible first-shots"): every clip is ranked like
+# the hook slot (vhe.rank.scorer.HOOK_WEIGHTS, steadiness kept at the floor every brief has): motion and the close /
+# approach bonus over the brief's content words, which in such a brief name no shots.
+HOOK_LIST_WEIGHTS = {"relevance": 0.5, "energy": 0.8, "quality": 0.3}
+
+
+def framing_of(text: str | None) -> str:
+    """'close', 'wide' or 'none' for a phrase (a brief's scoped text, or an opener/closer description): the majority
+    of its close and wide cues, negated ones ("rather than close-ups") left out."""
+    if not text:
+        return "none"
+    t = re.sub(CUE_NEGATION, " ", _normalise(text))
+    close = sum(len(re.findall(pat, t)) for pat in (CLOSE_CUE, CENTRED_CUE, HOOK_CUE, FACES_CUE))
+    wide = len(re.findall(WIDE_CUE, t))
+    return "close" if close > wide else "wide" if wide > close else "none"
+
+
+def _set_cues(p: ParsedQuery, text: str) -> None:
+    """Brief-level cue fields from the scoped brief text (opener/closer and avoid clauses already removed)."""
+    t = re.sub(CUE_NEGATION, " ", text)
+    p.framing = framing_of(text)
+    p.want_faces = re.search(FACES_CUE, t) is not None
+    p.hook = p.hook or re.search(HOOK_CUE, t) is not None
+    p.legible_text = re.search(LEGIBLE_CUE, t) is not None
+    p.centered = re.search(CENTRED_CUE, t) is not None
+
+
+def _cue_only(clause: str) -> bool:
+    """A clause that is a framing/hook/centring instruction and names nothing to show (faces are content, kept)."""
+    t = clause.lower()
+    hit = False
+    for pat in (HOOK_CUE, CENTRED_CUE, CLOSE_CUE, LEGIBLE_CUE):
+        t, n = re.subn(pat, " ", t)
+        hit = hit or n > 0
+    if not hit:
+        return False
+    words = [w for w in re.findall(r"[^\W\d_][\w'-]*", t) if len(w) > 2]
+    return all(w in CUE_FILLER or w in STYLE or w in ITEM_EDGE for w in words)
 
 
 def _depth_map(text: str) -> list[bool]:
@@ -372,6 +474,8 @@ def _clean_item(text: str) -> str:
     words = _trim(s.split(), ITEM_EDGE)
     if all(w in STYLE or w in ITEM_EDGE for w in words):  # "steady or locked-off framing" is style, not a shot
         return ""
+    if any(w in FRAMING_HEADS for w in words) and all(w in STYLE | FRAMING_WORDS | ITEM_EDGE for w in words):
+        return ""  # "close-ups", "wide establishing views": a framing cue (ParsedQuery.framing), not a shot
     return " ".join(words[:MAX_ITEM_WORDS])
 
 
@@ -427,6 +531,8 @@ def _plan(rest: str, q: str, p: ParsedQuery) -> str:
     subject = _clean_item(m.group("x")) if m else ""
     shots: list[str] = []
     kept: list[str] = []
+    cue_parts: list[str] = []
+    p._cue_text = ""  # the brief without opener/closer and avoid clauses: what the visual cues are read on
     for sentence in _split_top(re.sub(r"\.{2,}|…", " ", rest), ".!?;"):
         s = sentence.strip()
         if re.search(META_SENTENCE, s):
@@ -449,6 +555,7 @@ def _plan(rest: str, q: str, p: ParsedQuery) -> str:
             p.avoid += items
             p.exclude += [] if soft else items
             s = s[:m.start()] + s[end:]
+        cue_parts.append(s)
         m = re.search(TOPIC, s)
         if m:
             p.topics += _topic_items(m.group(0), s[m.end():])
@@ -459,7 +566,7 @@ def _plan(rest: str, q: str, p: ParsedQuery) -> str:
             colon = _top_colon(c)
             if re.search(META_CLAUSE, c[:colon].strip() if colon is not None else c.strip()):
                 c = c[colon + 1:] if colon is not None else ""  # "for example: a, b" keeps the list
-            clauses.append(c)
+            clauses.append("" if _cue_only(c) else c)  # "keep everything centered": a cue, not a shot
         s = ",".join(c for c in clauses if c.strip())
         colon = _top_colon(s)
         body = s if colon is None or not s[colon + 1:].strip() else s[colon + 1:]
@@ -469,6 +576,7 @@ def _plan(rest: str, q: str, p: ParsedQuery) -> str:
     p.shots = [x for x in shots if not (x in seen or seen.add(x))] if len(set(shots)) >= 2 else []
     if p.shots:
         p.text = subject
+    p._cue_text = ". ".join(cue_parts)
     return ". ".join(kept)
 
 
@@ -568,6 +676,7 @@ def _parse_rules(query: str) -> tuple[ParsedQuery, bool, str | None]:
              None)
     if m:
         p.count, p.count_explicit = max(1, min(MAX_COUNT, int(m.group(1)))), True
+        p._hook_list = re.search(r"(?:hooks?|first-shots?)$", m.group(0)) is not None  # "the 3 best first-shots"
         rest = _cut(rest, m.start(1), m.end(1))
     elif not p.exhaustive and (m := re.search(SINGLE, rest)):
         p.count, p.count_explicit = 1, True
@@ -581,6 +690,7 @@ def _parse_rules(query: str) -> tuple[ParsedQuery, bool, str | None]:
     if p.weights["speech"] == 0.0 and any(_contains(rest, w) for w in SPEECH_ON):
         p.weights["speech"] = 1.0
     rest = _plan(rest, q, p)
+    _set_cues(p, p._cue_text)
     for w in SPEECH_VERBS:
         rest = _strip(rest, w)
 
@@ -640,6 +750,16 @@ def _finalise(p: ParsedQuery, explicit_len: bool, hint: str | None, count: int |
     elif p.budget:
         p.count = max(1, min(MAX_CLIPS, round(mid / ((p.min_len + p.max_len) / 2))))
 
+    if getattr(p, "_hook_list", False):  # "rank me 3 hooks": every clip is a hook candidate, not just the first
+        p.hook = True
+        p.framing = "close" if p.framing == "none" else p.framing
+        p.weights.update(HOOK_LIST_WEIGHTS)
+    if p.opener and re.search(HOOK_CUE, p.opener.lower()):  # "open with a hook": the hook slot, with what it shows
+        p.hook = True
+        if _cue_only(p.opener):
+            p.opener = None
+    if p.framing not in ("none", "close", "wide"):
+        p.framing = "none"
     p.shots = _categorise(_dedupe(p.shots, (p.opener, p.closer)), p.raw)
     # Speech is not a picture: "no host talking" drops speech-heavy clips instead of matching an image to it.
     spoken = [x for x in p.avoid + p.exclude if re.search(SPEECH_ITEM, x.lower())]
@@ -661,7 +781,7 @@ def _finalise(p: ParsedQuery, explicit_len: bool, hint: str | None, count: int |
         p.highlight = False
     if p.shots and not p.text:
         p.text = ", ".join(p.shots)
-    if len(p.shots) >= 2:
+    if len(p.shots) >= 2 and not getattr(p, "_hook_list", False):
         p.weights["relevance"] = max(p.weights["relevance"], SHOT_LIST_RELEVANCE)
     if p.topics and not p.shots:  # "every moment the host talks about ...": speech clips matched to the topics
         p.weights["speech"] = max(p.weights["speech"], 1.0)
@@ -687,7 +807,7 @@ LLM_TIMEOUT = 90.0  # a cold load of a 4B model takes seconds; a hung server mus
 LLM_KEEP_ALIVE = 0
 LLM_OPTIONS = {"temperature": 0, "seed": 0, "num_ctx": 4096}  # the prompt with its examples is ~1.5k tokens
 PARSE_CACHE = Path.home() / ".cache" / "vhe" / "parse"  # one JSON per (prompt version, model, brief)
-PROMPT_VERSION = 3
+PROMPT_VERSION = 4  # 4: framing, want_faces, hook, legible_text, centered
 
 _TEXT = {"type": "string"}
 _NUM = {"type": "number"}
@@ -703,8 +823,11 @@ LLM_SCHEMA = {
         "budget_min_seconds": _NUM, "budget_max_seconds": _NUM,
         "soundbite_min_seconds": _NUM, "soundbite_max_seconds": _NUM,
         "exhaustive": {"type": "boolean"}, "opener": _TEXT, "closer": _TEXT,
+        "framing": {"type": "string", "enum": ["none", "close", "wide"]}, "want_faces": {"type": "boolean"},
+        "hook": {"type": "boolean"}, "legible_text": {"type": "boolean"}, "centered": {"type": "boolean"},
     },
 }
+_NO_CUES = {"framing": "none", "want_faces": False, "hook": False, "legible_text": False, "centered": False}
 LLM_SCHEMA["required"] = list(LLM_SCHEMA["properties"])
 LLM_PROMPT = """You turn a video editor's brief into a JSON edit plan for searching raw footage with an image-text \
 model and a transcript. Only extract what the brief says; never invent items or numbers.
@@ -727,9 +850,15 @@ whole edit. count: number of clips. soundbite_min_seconds / soundbite_max_second
 soundbite. 0 for anything the brief does not state as a number.
 - exhaustive: true for "every / all / each ..." lists.
 - mood: "neutral" unless the brief asks for an energetic or calm feel. speech: "wanted" only if the clips must be \
-someone talking, "unwanted" if they must not contain talking, else "any"."""
+someone talking, "unwanted" if they must not contain talking, else "any".
+- framing: the shot size the whole edit asks for: "close" for close-ups, faces, subjects filling the frame or coming \
+right at the camera, vertical / 9:16 or POV edits; "wide" for establishing or wide views, the place itself as the \
+subject; else "none". The opener's or closer's own shot size and shot sizes the brief rules out do not count.
+- want_faces: true if the brief asks for faces. hook: true if the first clip must grab attention in its first \
+second ("hook", "scroll-stopper"). legible_text: true if names, signs, banners or text must be readable. centered: \
+true if the subject must sit in the middle of the frame (centred, a 9:16 or square crop)."""
 # Worked examples from other domains (never from an evaluation set): a visual list, a speech brief, a casual German
-# brief (translated items).
+# brief (translated items), a vertical hook reel (the visual cue fields).
 LLM_EXAMPLES = [
     ("Make a 2 minute highlight video of the Riverside Food Festival. Start with a drone view of the market tents. "
      "Show the chefs at the grill, kids eating ice cream, the Golden Ladle stall and the brass band. Finish with the "
@@ -739,21 +868,29 @@ LLM_EXAMPLES = [
       "avoid": [], "exclude": ["portable toilets", "person's back blocking the view"], "topics": [],
       "need_live_audio": False, "mood": "neutral", "speech": "any", "min_seconds": 0, "max_seconds": 0, "count": 0,
       "budget_min_seconds": 102, "budget_max_seconds": 138, "soundbite_min_seconds": 0, "soundbite_max_seconds": 0,
-      "exhaustive": False, "opener": "drone view of the market tents", "closer": "lantern release"}),
+      "exhaustive": False, "opener": "drone view of the market tents", "closer": "lantern release", **_NO_CUES}),
     ("Pull all the bits where the coach explains the new training plan or talks about the injury (\"out for six "
      "weeks\"). 10-20 s each.",
      {"content": "coach talking", "shots": [], "avoid": [], "exclude": [],
       "topics": ["the new training plan", "the injury, \"out for six weeks\""], "need_live_audio": False,
       "mood": "neutral", "speech": "wanted", "min_seconds": 10, "max_seconds": 20, "count": 0,
       "budget_min_seconds": 0, "budget_max_seconds": 0, "soundbite_min_seconds": 0, "soundbite_max_seconds": 0,
-      "exhaustive": True, "opener": "", "closer": ""}),
+      "exhaustive": True, "opener": "", "closer": "", **_NO_CUES}),
     ("kannst du mir die schönsten momente vom geburtstag raussuchen, die torte, das tanzen und die kinder beim "
      "spielen, so 45 sek. keine wackler und bitte kein essen",
      {"content": "birthday party highlights", "shots": ["birthday cake", "people dancing", "children playing"],
       "avoid": [], "exclude": ["shaky footage", "food"], "topics": [], "need_live_audio": False, "mood": "neutral",
       "speech": "any", "min_seconds": 0, "max_seconds": 0, "count": 0, "budget_min_seconds": 38,
       "budget_max_seconds": 52, "soundbite_min_seconds": 0, "soundbite_max_seconds": 0, "exhaustive": False,
-      "opener": "", "closer": ""}),
+      "opener": "", "closer": "", **_NO_CUES}),
+    ("30 sec vertical reel of the skate contest. first shot has to hook: a rider flying straight at the lens. then "
+     "tight shots of faces and tricks, keep the riders centred for the 9:16 crop. sponsor banners must be readable",
+     {"content": "skate contest reel", "shots": ["skater faces", "skateboard tricks", "sponsor banners"], "avoid": [],
+      "exclude": [], "topics": [], "need_live_audio": False, "mood": "neutral", "speech": "any", "min_seconds": 0,
+      "max_seconds": 0, "count": 0, "budget_min_seconds": 25.5, "budget_max_seconds": 34.5,
+      "soundbite_min_seconds": 0, "soundbite_max_seconds": 0, "exhaustive": False,
+      "opener": "skater flying straight at the camera", "closer": "", "framing": "close", "want_faces": True,
+      "hook": True, "legible_text": True, "centered": True}),
 ]
 LIVE_CUE = r"\b(?:sound|audio|noise|ton|muted)\b"
 EXHAUSTIVE_CUE = r"\b(?:every|each|all|any|whenever|jede[nrs]?|alle)\b"
@@ -888,6 +1025,17 @@ def _from_llm(data: dict, base: ParsedQuery, explicit_len: bool) -> tuple[Parsed
     p.topics = items("topics") or base.topics
     if p.topics and not p.shots and p.text == base.text:
         p.text = ""
+    # Visual cues: the rules' always stand; the model's count only where the brief (without its opener/closer and
+    # avoid clauses; the whole brief for the hook) has a matching stem, so "open on an establishing wide" does not
+    # make the whole edit wide.
+    scope = getattr(base, "_cue_text", "") or ""
+    p._cue_text, p._hook_list = scope, getattr(base, "_hook_list", False)
+    fr = data.get("framing")
+    p.framing = base.framing if base.framing != "none" else \
+        fr if fr in ("close", "wide") and re.search(CUE_GROUND[fr], scope) else "none"
+    for key in ("want_faces", "hook", "legible_text", "centered"):
+        ground = re.search(CUE_GROUND[key], low if key == "hook" else scope) is not None
+        setattr(p, key, getattr(base, key) or (data.get(key) is True and ground))
     return p, explicit_len
 
 

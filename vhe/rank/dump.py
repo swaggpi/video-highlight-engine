@@ -1,7 +1,7 @@
 """Candidate dumps ("vhe-candidates/1"): every candidate a run scored, with its feature vector, its score and whether
 it was selected, so judge labels can be joined onto spans to build a training set.
 
-{"format": "vhe-candidates/1", "feature_version": "v1",
+{"format": "vhe-candidates/1", "feature_version": "v2", "query_version": "v2",
  "run": {"app_sha", "scorer", "created", "corpus_root", "n_files"},
  "query": {"brief", "parsed", "persona", "q": {name: value}},
  "feature_names": [...],
@@ -24,7 +24,7 @@ from pathlib import Path
 
 import numpy as np
 
-from vhe.rank.features import FEATURE_VERSION, FEATURES
+from vhe.rank.features import FEATURE_VERSION, FEATURES, QUERY_VERSION
 
 FORMAT = "vhe-candidates/1"
 STAGES = ("candidate", "shortlist", "edge", "topic", "external")
@@ -55,7 +55,7 @@ def entry(file: str, start: float, end: float, source: str, stage: str, score: f
 
 def build(*, scorer: str, corpus_root: str, n_files: int, brief: str, parsed: dict, persona: str | None,
           q: np.ndarray, q_names: tuple[str, ...], candidates: list[dict]) -> dict:
-    return {"format": FORMAT, "feature_version": FEATURE_VERSION,
+    return {"format": FORMAT, "feature_version": FEATURE_VERSION, "query_version": QUERY_VERSION,
             "run": {"app_sha": app_sha(), "scorer": scorer,
                     "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                     "corpus_root": corpus_root, "n_files": int(n_files)},

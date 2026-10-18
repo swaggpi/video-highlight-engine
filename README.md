@@ -56,7 +56,14 @@ before any twice; "every float: A, B, C" gives the best clip per named item and 
 to leave out ("leave out shots where ...", "no whip-pans"; a bounded relevance penalty), spoken topics ("talks
 about ...", "explains ...", "sums up ..."; transcript sentences matched with Ollama bge-m3 embeddings, or keyword
 overlap without it), live sound ("with natural sound (not muted)": muted stretches are dropped) and a soundbite next
-to the visual clips ("the best 5-8 s soundbite where ..."). The brief is parsed by a local Ollama model (`qwen3:4b`,
+to the visual clips ("the best 5-8 s soundbite where ..."). Visual cues: framing close ("close-ups", "faces", "fills
+the frame", "right at the camera", "centred", "vertical"/"9:16", "POV", "hook") or wide ("establishing", "wide view",
+"the street as the main character") weights the index's shot scale, largest face and approach (wide also penalises
+close-ups); "faces" and "centred" add the face size and centring terms; "hook" / "the first clip has to grab in the
+first second" makes the first clip the best hook candidate (close, approaching, energetic, usable, within the clip
+length); "names / text readable" adds an OCR legibility prior to the items that ask for it and prefers spans where an
+item's name is read. Cues in the opener/closer description or in avoid clauses do not count for the whole edit.
+The brief is parsed by a local Ollama model (`qwen3:4b`,
 or `--llm MODEL` / `$VHE_LLM`; answers cached in `~/.cache/vhe/parse/`) when the server is reachable, else by the
 rules; numbers the model returns that are not in the brief are ignored. `--no-llm` forces the rules.
 
@@ -71,7 +78,11 @@ parsed brief and its query vector, `feature_names`, and per candidate file, file
 source, stage, score, features, selected, rank, role, item); `--dump-all` adds every gated candidate before
 refinement. `vhe features footage/ --brief TEXT --spans spans.json --out OUT.json` featurises spans picked elsewhere
 (`[{"file", "start", "end"}]` or a `--json` edit list) the same way. `--persona ID` records who the edit is for;
-`--scorer model.json` ranks with a learned model (`vhe-linear-rank/1`) instead of the hand-weighted total.
+`--scorer model.json` ranks with a learned model (`vhe-linear-rank/1`) instead of the hand-weighted total. Features
+v2 (`feature_version`/`query_version` "v2" in dumps and model files): v1's 71 columns, then scale_close/scale_wide,
+face size/centring/count, approach, OCR text area/confidence and `ocr_item_match`; the query vector adds the cue
+one-hots (framing none/close/wide, want_faces, hook, legible_text, centered) before the personas. v1 model files are
+refused (retrain with `tools/train` on v2 dumps).
 
 ## How it works
 
@@ -100,10 +111,11 @@ query (per request; a folder is one corpus: all files on a virtual timeline, a s
                   the pooled corpus (loudness centred per file first); quality from blur/blown/shake, not brightness
   score ......... per candidate a versioned feature vector (rank/features.py) and a Scorer (rank/scorer.py): the
                   hand-weighted total (relevance averaged with the saliency, length-bucket centring, length and
-                  cut priors, speech bonus) or a learned model file; refined spans are featurised and rescored
+                  cut priors, speech bonus, visual-cue bonus) or a learned model file; refined spans are featurised
+                  and rescored
   refine ........ per file: snap edges to cuts, word boundaries, speech pauses, steady frames; enforce lengths
-  select ........ opener/closer first, then shot items round robin, MMR with no overlap, runtime budget, per-file
-                  cap for variety; spoken topics: transcript sentences above a similarity threshold, time order
+  select ........ opener (or the hook) / closer first, then shot items round robin, MMR with no overlap, runtime
+                  budget, per-file cap for variety; spoken topics: transcript sentences above a similarity threshold, time order
   order ......... opener, then files in recording order and time within each file, then closer
   export ........ re-encoded preview cuts (downscaled before HDR tone-map), clips.csv, CMX3600 EDL, rough cut
 ```
