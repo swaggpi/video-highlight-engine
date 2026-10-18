@@ -87,7 +87,8 @@ What a brief can say (English or German):
 Every clip starts and ends on clean frames (visual) or holds whole sentences with the first and last word whole
 (speech: lead-in 0.25 s, tail 0.4 s, at most to the middle of the pause); no moment is picked twice. The brief is
 parsed by a local Ollama model (`qwen3:4b`, or `--llm MODEL` / `$VHE_LLM`; answers cached in `~/.cache/vhe/parse/`)
-when the server is reachable, else by the rules; numbers the model returns that are not in the brief are ignored.
+when the server is reachable, else by the rules; numbers the model returns that are not in the brief are ignored,
+and its spoken topics and "every ..." flag count only where the brief has the words for them.
 `--no-llm` forces the rules.
 
 Output: `--json` writes `{"query", "parser", "parsed", "clips": [{"file", "start", "end", "duration", "score",
@@ -121,6 +122,7 @@ index (once per video; vhe/pipeline.py, vhe/project.py for folders)
                   shot scale (scale_close / scale_wide margins)
   quality ....... re-blur sharpness ratio, luma and contrast, blown highlights; the usable mask and its reason bits
                   (covered, uniform, blown out, blurry, shaky, obstructed; bad framing as a soft reason)
+                  stored; the query applies only covered, uniform, blown out, blurry (config.ACTIVE_REASONS)
   text .......... RapidOCR on 1 fps of the analysis frames: text_area, text_conf per step, ocr.json text store
   faces ......... YuNet on every analysis frame: face_n, face_area_max, face_center; approach (subject growing
                   toward the lens). OCR and faces are skipped with a warning when unavailable
@@ -148,6 +150,14 @@ query (per request; a folder is one corpus: all files on a virtual timeline, a s
   order ......... opener, then files in recording order and time within each file, then closer, then a soundbite
   export ........ re-encoded preview cuts (downscaled before HDR tone-map), clips.csv, CMX3600 EDL, rough cut
 ```
+
+Streamer VODs and other talk-heavy footage: briefs about reactions ("the 5 funniest moments", "every jump scare,
+death and clutch play", "a cold open with the biggest reaction", "a 10 min highlights video") rank by an audio
+reaction curve (loudness/onset bursts over the file's own running level) and the transcript's excited speech
+(exclamations, laughs, strong words), so the named moments do not have to be visible to SigLIP; quoted lines
+("the 'I made it into Harvard' bit") and the named moments are looked up in the transcript; "cut all dead air: the
+menus, ..." is a list to avoid, not shots. Dark frames that still show something (a black game-over screen with a
+facecam) are usable: `covered` needs a uniform frame.
 
 ## Layout
 

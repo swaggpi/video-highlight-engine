@@ -162,6 +162,61 @@ def test_llm_fills_what_rules_miss_and_categorises_names(monkeypatch):
     assert "portrait floats" in p.shots
 
 
+def test_llm_answers_leave_out_unfilled_numbers_and_flags(monkeypatch):
+    # The worked examples show the short answer the model is asked for: the item lists, opener/closer, mood and
+    # exhaustive always (even when empty), the numbers, speech, live sound and visual cues only when the brief fills
+    # them.
+    calls = _mock_ollama(monkeypatch, {"content": "parade recap", "shots": ["mounted police", "colorful floats"],
+                                       "avoid": [], "exclude": [], "topics": [], "mood": "energetic",
+                                       "exhaustive": False, "opener": "", "closer": "giant flag"})
+    p = parse_with_llm(B1, model="m")
+    required = set(llm.LLM_SCHEMA["required"])
+    assert required < set(llm.LLM_SCHEMA["properties"]) and calls[0]["format"]["required"] == llm.LLM_SCHEMA["required"]
+    examples = [json.loads(m["content"]) for m in calls[0]["messages"] if m["role"] == "assistant"]
+    assert examples and all(required <= set(e) for e in examples)
+    assert all(v not in (0, False) and v != llm.LLM_DEFAULTS.get(k) for e in examples for k, v in e.items()
+               if k not in required)
+    assert any("framing" in e for e in examples) and not all("framing" in e for e in examples)
+    # A short answer is a whole plan: the missing fields are their defaults, and the rules' numbers stand.
+    assert p.parser == "llm:m" and p.shots == ["mounted police", "colorful floats"] and p.closer == "giant flag"
+    assert p.mood == "energetic" and p.budget == (60.0, 90.0) and p.framing == "none" and not p.need_live_audio
+    assert p.soundbite_len is None and not p.no_speech and not p.hook
+
+
+@pytest.mark.parametrize("brief, exhaustive", [
+    (B4, False),  # "3-6 s each": a clip length
+    ("Give me six hero moments, 2-3 s each: the crowd, a float, a dancer. Each must be steady. Nothing political in "
+     "any of them.", False),
+    ("welche clips sind müll und welche sind die 5 die ich auf jeden fall behalten soll", False),
+    (B3, True),  # "List every parade float"
+    ("Pull each moment the host waves at the camera.", True),
+])
+def test_llm_exhaustive_needs_a_list_word(monkeypatch, brief, exhaustive):
+    _mock_ollama(monkeypatch, _answer(content="parade", exhaustive=True))
+    assert parse_with_llm(brief, model="m").exhaustive is exhaustive
+
+
+def test_llm_runtime_numbers_are_not_a_clip_length(monkeypatch):
+    _mock_ollama(monkeypatch, _answer(content="parade recap", min_seconds=60, max_seconds=90))
+    p = parse_with_llm(B1, model="m")  # "a 60-90 s energetic recap": the runtime, not one 60-90 s clip
+    assert p.budget == (60.0, 90.0) and p.max_len < 60 and p.count > 1
+    _mock_ollama(monkeypatch, _answer(content="dogs", min_seconds=4, max_seconds=8))
+    p = parse_with_llm("a 60 s reel of the dogs, keep the shots between 4 and 8", model="m2")
+    assert (p.min_len, p.max_len) == (4.0, 8.0)  # numbers that are not the runtime still set the clip length
+
+
+def test_llm_topics_need_a_brief_about_talking(monkeypatch):
+    # A b-roll list names no spoken topic: the model's topics (its shot groups) would add a soundbite clip.
+    brief = ("VO b-roll list for a 75 s pkg: the cultural parade (horses, band, floats) AND the protest presence at "
+             "the end (portrait signs, the giant flag). 8-10 cutaways, 4-8 s each, no host talking over it.")
+    _mock_ollama(monkeypatch, _answer(content="parade b-roll", shots=["horses", "portrait signs"],
+                                      topics=["cultural parade", "protest presence"]))
+    p = parse_with_llm(brief, model="m")
+    assert p.topics == [] and p.soundbite_len is None and p.shots == ["horses", "portrait signs"]
+    _mock_ollama(monkeypatch, _answer(content="host talking", topics=["muting the music, \"copyright\""]))
+    assert parse_with_llm(B2, model="m2").topics == ["muting the music, \"copyright\""]
+
+
 def test_llm_unreachable_falls_back_to_rules(monkeypatch):
     def down(req, timeout):
         raise OSError("connection refused")

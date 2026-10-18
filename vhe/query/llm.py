@@ -22,13 +22,20 @@ from vhe.query.lexicon import (
     HARD_CUE,
     ITEM_EDGE,
     NUM,
+    SOUNDBITE,
     SPEECH_ITEM,
     STYLE,
+    TOPIC,
 )
 from vhe.query.model import BUDGET_TOL, ParsedQuery
 from vhe.query.rules import finalise, normalise, parse_rules, set_mood
 from vhe.query.text_match import word_tokens
 
+# qwen3:1.7b was measured as the default (2026-10-18, 17 dev briefs, same prompt): 2-3x faster (mean 14.7 s vs 31.8 s
+# per cold parse, CPU-only 29 s vs 68 s) but its plans changed picks: spoken topics copied from the shot list (a
+# soundbite added to visual briefs), hooks and openers/closers the brief does not ask for (one copied from a worked
+# example), clip lengths read from the runtime ("60-90 s recap" -> one 60-90 s clip), talking-track topics without the
+# quoted words. $VHE_LLM=qwen3:1.7b still selects it.
 DEFAULT_LLM = "qwen3:4b"
 OLLAMA_HOST = "http://127.0.0.1:11434"
 LLM_TIMEOUT = 90.0  # a cold load of a 4B model takes seconds; a hung server must not hang the query
@@ -41,11 +48,15 @@ LLM_TIMEOUT = 90.0  # a cold load of a 4B model takes seconds; a hung server mus
 # 2026-10-18 next to another 1.3 GB GPU tenant and a second UI process: 45-47 s per uncached parse with the models
 # resident, 31-34 s with them lent (then 7 of 37 layers fit: Ollama keeps ~0.8 GB free; all of them need ~3.6 GB
 # free); a warm, resident model would save the 4-12 s load and most of the 8.5 s prompt evaluation, at the cost of the
-# models' GPU memory.
+# models' GPU memory. Generating the answer is most of a parse when the GPU is shared (~5 tok/s with 0.1 GB of the
+# model on it), so the answer leaves out the fields the brief does not fill (LLM_SCHEMA["required"]): 236 -> 163
+# answer tokens and 1685 -> 1419 prompt tokens, 46.5 -> 31.8 s mean per cold parse over the 17 dev briefs (the GPU
+# shared with the UI and semsearch), 87.5 -> 67.8 s CPU-only next to a busy core (7 briefs); the plans differ about as
+# much as two runs of the old prompt do (item wording, an opener).
 LLM_KEEP_ALIVE = 0
-LLM_OPTIONS = {"temperature": 0, "seed": 0, "num_ctx": 4096}  # the prompt with its examples is ~1.5k tokens
+LLM_OPTIONS = {"temperature": 0, "seed": 0, "num_ctx": 4096}  # the prompt with its examples is ~1.4k tokens
 PARSE_CACHE = Path.home() / ".cache" / "vhe" / "parse"  # one JSON per (prompt version, model, brief)
-PROMPT_VERSION = 4  # 4: framing, want_faces, hook, legible_text, centered
+PROMPT_VERSION = 5  # 4: framing, want_faces, hook, legible_text, centered; 5: unfilled numbers and flags left out
 
 _TEXT = {"type": "string"}
 _NUM = {"type": "number"}
@@ -66,7 +77,14 @@ LLM_SCHEMA = {
     },
 }
 _NO_CUES = {"framing": "none", "want_faces": False, "hook": False, "legible_text": False, "centered": False}
-LLM_SCHEMA["required"] = list(LLM_SCHEMA["properties"])
+# The numbers, speech, live sound and the visual cue fields are optional: the model leaves out the ones the brief does
+# not fill (left at their LLM_DEFAULTS), which halves the answer, and generating it is most of a parse on a contended
+# GPU; _from_llm reads a missing field as its default. The item lists, opener / closer, mood and exhaustive stay
+# required, so the examples show them even when empty: with those optional too (2026-10-18, qwen3:4b, 17 dev briefs)
+# the model put shots into a speech brief (B2), turned the first listed shot into an opener (B5, p4-vlogger-2) and
+# left the topics of a talking-track brief to the rules (B2, B5).
+LLM_SCHEMA["required"] = ["content", "shots", "avoid", "exclude", "topics", "mood", "exhaustive", "opener", "closer"]
+LLM_DEFAULTS = {"speech": "any", "framing": "none"}  # and 0 / false for the other optional fields
 LLM_PROMPT = """You turn a video editor's brief into a JSON edit plan for searching raw footage with an image-text \
 model and a transcript. Only extract what the brief says; never invent items or numbers.
 - Write content, shots, avoid, exclude, topics, opener and closer in English. If the brief is in another language, \
@@ -85,7 +103,7 @@ topic, with any quoted words. [] otherwise.
 - opener / closer: what the first / last shot shows, "" if not given.
 - min_seconds / max_seconds: length of each clip. budget_min_seconds / budget_max_seconds: total runtime of the \
 whole edit. count: number of clips. soundbite_min_seconds / soundbite_max_seconds: length of a requested spoken \
-soundbite. 0 for anything the brief does not state as a number.
+soundbite. Leave them out unless the brief states the number.
 - exhaustive: true for "every / all / each ..." lists.
 - mood: "neutral" unless the brief asks for an energetic or calm feel. speech: "wanted" only if the clips must be \
 someone talking, "unwanted" if they must not contain talking, else "any".
@@ -94,7 +112,8 @@ right at the camera, vertical / 9:16 or POV edits; "wide" for establishing or wi
 subject; else "none". The opener's or closer's own shot size and shot sizes the brief rules out do not count.
 - want_faces: true if the brief asks for faces. hook: true if the first clip must grab attention in its first \
 second ("hook", "scroll-stopper"). legible_text: true if names, signs, banners or text must be readable. centered: \
-true if the subject must sit in the middle of the frame (centred, a 9:16 or square crop)."""
+true if the subject must sit in the middle of the frame (centred, a 9:16 or square crop).
+- Leave out the numbers, booleans, speech and framing the brief does not fill (0, false, "any", "none")."""
 # Worked examples from other domains (never from an evaluation set): a visual list, a speech brief, a casual German
 # brief (translated items), a vertical hook reel (the visual cue fields).
 LLM_EXAMPLES = [
@@ -132,6 +151,17 @@ LLM_EXAMPLES = [
 ]
 LIVE_CUE = r"\b(?:sound|audio|noise|ton|muted)\b"
 EXHAUSTIVE_CUE = r"\b(?:every|each|all|any|whenever|jede[nrs]?|alle)\b"
+# Those words where they ask for no list: a per-clip length ("3-6 s each"), a rule for every pick ("each must be
+# steady", "nothing political in any of them"), "auf jeden Fall" (definitely). The model's exhaustive flag on B4 and
+# p5-marketing-2 (an explicit count of shots) flipped between prompt versions on these words alone.
+NOT_EXHAUSTIVE = (r"\b(?:s|sec|secs|seconds?|sek|sekunden)\s+each\b|\beach\s+(?:must|should|has\s+to|needs?\s+to)\b"
+                  r"|\bany\s+of\s+(?:them|these|those)\b|\bauf\s+jeden\s+fall\b")
+
+
+def _compact(answer: dict) -> dict:
+    """The answer without the fields the brief leaves at their default (how the model is asked to answer)."""
+    return {k: v for k, v in answer.items()
+            if k in LLM_SCHEMA["required"] or (v not in ("", [], 0, False, None) and v != LLM_DEFAULTS.get(k))}
 
 
 def default_llm() -> str | None:
@@ -153,7 +183,7 @@ def _ask_llm(query: str, model: str, host: str) -> tuple[dict, bool]:
         pass
     messages = [{"role": "system", "content": LLM_PROMPT}]
     for user, answer in LLM_EXAMPLES:
-        messages += [{"role": "user", "content": user}, {"role": "assistant", "content": json.dumps(answer)}]
+        messages += [{"role": "user", "content": user}, {"role": "assistant", "content": json.dumps(_compact(answer))}]
     messages.append({"role": "user", "content": query})
     body = {"model": model, "stream": False, "format": LLM_SCHEMA, "think": False, "keep_alive": LLM_KEEP_ALIVE,
             "options": dict(LLM_OPTIONS), "messages": messages}
@@ -256,8 +286,11 @@ def _from_llm(data: dict, base: ParsedQuery, explicit_len: bool) -> tuple[Parsed
     set_mood(p, base.mood or data.get("mood"))
     p.weights["speech"] = base.weights["speech"]
     p.min_len, p.max_len = base.min_len, base.max_len
-    if not explicit_len and (num("min_seconds") or num("max_seconds")):
-        lo, hi = num("min_seconds"), num("max_seconds")
+    # "a 60-90 s recap" is a runtime the rules already read: the same numbers are not also a clip length (qwen3:1.7b
+    # made B1 one 60-90 s clip).
+    budget_numbers = {round(x, 2) for x in base.budget} if base.budget else set()
+    lo, hi = num("min_seconds"), num("max_seconds")
+    if not explicit_len and (lo or hi) and not {round(x, 2) for x in (lo, hi) if x} <= budget_numbers:
         p.min_len, p.max_len, explicit_len = lo or max(1.0, 0.7 * hi), hi or 1.3 * lo, True
     p.count, p.count_explicit = base.count, base.count_explicit
     if not p.count_explicit and num("count"):
@@ -272,8 +305,8 @@ def _from_llm(data: dict, base: ParsedQuery, explicit_len: bool) -> tuple[Parsed
     if p.soundbite_len is None and num("soundbite_max_seconds"):
         p.soundbite_len = (num("soundbite_min_seconds") or 0.7 * num("soundbite_max_seconds"),
                            num("soundbite_max_seconds"))
-    p.exhaustive = base.exhaustive or (bool(data.get("exhaustive")) and re.search(EXHAUSTIVE_CUE, p.raw.lower())
-                                       is not None)
+    p.exhaustive = base.exhaustive or (bool(data.get("exhaustive")) and re.search(
+        EXHAUSTIVE_CUE, re.sub(NOT_EXHAUSTIVE, " ", p.raw.lower())) is not None)
     p.need_live_audio = base.need_live_audio or (bool(data.get("need_live_audio")) and
                                                  re.search(LIVE_CUE, p.raw.lower()) is not None)
     p.opener = " ".join(str(data.get("opener") or "").split()) or base.opener
@@ -290,7 +323,9 @@ def _from_llm(data: dict, base: ParsedQuery, explicit_len: bool) -> tuple[Parsed
         p.weights["speech"] = min(p.weights["speech"], -1.0)
     p.per_item = re.search(ALL_MATCHES, low) is None
     p.highlight = base.highlight
-    p.topics = items("topics") or base.topics
+    # Spoken topics only where the brief asks for someone talking about something (or a soundbite): a topic list
+    # adds a soundbite next to the visual clips, and the model also put shot lists there (p3-newsedit-2).
+    p.topics = (items("topics") if re.search(TOPIC, low) or re.search(SOUNDBITE, low) else []) or base.topics
     if p.topics and not p.shots and p.text == base.text:
         p.text = ""
     # Visual cues: the rules' always stand; the model's count only where the brief (without its opener/closer and

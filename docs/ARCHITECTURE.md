@@ -21,14 +21,14 @@ cli, ui                                       entry points
 | `models.py` | process-wide model cache, `resolve_device`, `MODEL_LOCK`, `on_device` (CPU fallback after a GPU OOM), `gpu_released` (the cached models' weights wait in host memory while the parser LLM runs, `on_gpu_lost` if they cannot return) |
 | `config.py` | index-time `Config` and calibrated thresholds; `CANDIDATE_LENGTHS` (candidate windows, scorer buckets) |
 | `pipeline.py`, `project.py` | index one video; index a folder incrementally into `<DIR>/.vhe/` |
-| `signals/*` | index-time signals: cuts, motion/shake, audio/VAD, transcript, SigLIP2 frames and tags, quality and the usable mask (`quality.reason_mask` decodes its reason bits), OCR, faces, CG-DETR |
+| `signals/*` | index-time signals: cuts, motion/shake, audio/VAD, transcript, SigLIP2 frames and tags, quality and the usable mask (`quality.reason_mask` decodes its reason bits; the index stores every reason, the query side applies only `config.ACTIVE_REASONS` via `quality.query_usable`), OCR, faces, CG-DETR |
 | `index/store.py` | `Index` (meta.json, grid.npz, speech.json, ocr.json); refuses another index or text-store version |
 | `corpus.py` | `Corpus`: indexes concatenated on one virtual timeline; virtual <-> file-local times (`locate`), transcript words in a span |
 | `query/model.py` | `ParsedQuery`, clip/count limits, signal-weight presets, slot weights (`EDGE_WEIGHTS`, `HOOK_WEIGHTS`, `HOOK_LIST_WEIGHTS`) |
 | `query/parser.py` | `parse_brief`: the LLM when reachable, else the rules |
 | `query/lexicon.py` | every word list and regex the rules match |
 | `query/rules.py` | deterministic parse (`parse`), and `finalise`, shared with the LLM path |
-| `query/llm.py` | Ollama parse with a JSON schema, disk cache, grounding against the rules |
+| `query/llm.py` | Ollama parse with a JSON schema (unfilled numbers and flags left out of the answer), disk cache, grounding against the rules |
 | `query/text_match.py` | the one `STOPWORDS`, word tokens, squashing; shot-item words read on screen; legibility prior |
 | `query/exclusions.py` | hard-exclusion masks: SigLIP thresholds, camera defects, forbidden words on screen |
 | `query/topics.py` | spoken topics vs transcript sentences (bge-m3 embeddings, cached per text and model digest, or keywords) |
@@ -38,7 +38,7 @@ cli, ui                                       entry points
 | `rank/brief_signals.py` | a brief -> its per-step signal dict (item relevance, avoid penalty, nc saliency, cue bonus, highlight prior, exclusion masks) |
 | `rank/items.py` | shot-list relevance: combine with avoid, item evidence (SigLIP + names read on screen), which item a span serves |
 | `rank/gate.py` | the hard gates (unusable, muted, excluded, defects, forbidden text, speech) |
-| `rank/features.py` | `featurize` (95 raw columns, `FEATURE_VERSION` v3), `item_features` (per shot item), `pool_stats` (length-bucket statistics), `query_vector` (`QUERY_VERSION` v3) |
+| `rank/features.py` | `featurize` (101 raw columns, `FEATURE_VERSION` v4), `item_features` (per shot item), `pool_stats` (length-bucket statistics), `query_vector` (`QUERY_VERSION` v4) |
 | `rank/scorer.py` | the `Scorer` protocol, `HeuristicScorer` (every hand-set weight and bonus), `LinearRankScorer`, `load_scorer` |
 | `rank/pool.py` | stage 1/2 shortlist, the opener/closer/hook slot pools, spoken-topic picks |
 | `rank/select.py` | selection: MMR, near-duplicates, item round robin, budgets, exhaustive lists, budget fill; `ScoreScale` (thresholds in pool spreads) |
@@ -98,7 +98,7 @@ scorer-independent matching (SigLIP item relevance plus names read on screen, `i
   of SigLIP and nc saliency, and the `bucket_*` columns); `tests/data/heuristic_clips.json` pins its output. A dumped
   row's score is the scorer on that row's features (score() for stage-1 candidates, the final total otherwise).
 - `LinearRankScorer` (`vhe-linear-rank/1` JSON: mu, sd, w over `[z, outer(z, q_small)]`, a feature mask) is the
-  first learned model; `vhe clips --scorer models/<name>.json`. A model of another feature or query version (v1, v2)
+  first learned model; `vhe clips --scorer models/<name>.json`. A model of another feature or query version (v1-v3)
   is refused.
 - A fine-tuned model plugs in the same way: implement the protocol (e.g. a GBDT or a small MLP over X and q) and add
   its file format to `load_scorer`. Learned models should not read `h_rel_*` or `src_*` (masked in training).
@@ -108,6 +108,19 @@ Feature v3 (2026-10-18) after v2's 82 columns (unchanged order): `edges_clean`, 
 `bucket_energy`, `bucket_steady`, `bucket_speech`, `bucket_legibility`, `bucket_highlight`; `h_rel_*` lost the
 legibility bonus and the highlight blend (now composed by the heuristic), `ocr_item_match` has the one OCR ignore
 rule. Query v3 appends `highlight` before the persona one-hot.
+
+Stream / VOD briefs (features and query v4, 2026-10-18). `signals/reaction.py` derives two curves at query time from
+what every index holds (no re-index): `reaction` (loudness and onset bursts over the file's running 90 s median, in
+6 dB units; `rank/signals.timestep_signals`) and `excitement` (the transcript's exclamations, laughter tokens, strong
+words, shouted and repeated words, speech-rate bursts; `rank/brief_signals`). `query/text_match.line_steps` finds a
+brief's spoken lines in the transcript (`ParsedQuery.lines`: quoted lines, and a reaction brief's named moments).
+Features v4 append `reaction_mean`, `reaction_max`, `excitement_mean`, `quote_match`, `bucket_reaction`,
+`bucket_excitement` after v3's 95; query v4 appends `reaction`. The heuristic's highlight prior is
+`scorer.compose_prior` (the visual prior with the reaction prior mixed in; a reaction brief leans on it), plus
+`QUOTE_BONUS` where a line is said. A reaction brief (`ParsedQuery.reaction`: funniest, scares, deaths, clutch, cold
+open ...) is a highlight brief whose shot list becomes one content text; "cut the dead air: ..." lists are soft avoid
+items. `covered` counts only with `uniform` (`quality.decode_bits`; older indexes are read the same way), and the
+same-file cosine duplicate rule holds within `select.DUP_SIM_WINDOW_S` of a pick (a long recording keeps one look).
 - An owned highlight head replaces the non-commercial CG-DETR saliency in its slot: `Engine._nc_scores(text)` returns
   per-step saliency on the corpus grid (NaN where a file has none) and proposals per file; `brief_signals` z-scores it
   into `nc_sal`, which feeds `nc_sal_mean`, `nc_sal_top60`, `nc_present` and the heuristic's blend. A head with
