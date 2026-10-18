@@ -19,30 +19,42 @@ class State:
     def __init__(self, device: str) -> None:
         self.device = device
         self.lock = threading.Lock()
-        self.job = {"state": "idle", "stage": "", "error": None, "video": None}
+        self.job = {"state": "idle", "stage": "", "file": "", "error": None, "video": None}
         self.engines: dict[str, object] = {}
+        self.media: set[Path] = set()  # source files of opened engines: the only files /media serves
 
-    def engine(self, video: str):
+    def engine(self, path: str):
+        """Engine for a project folder or a video file; models come from the process-wide cache (vhe.models)."""
         from vhe.engine import Engine
 
-        key = str(Path(video).resolve())
+        key = str(Path(path).resolve())
         with self.lock:
             if key not in self.engines:
-                self.engines[key] = Engine(default_index_dir(Path(key)), self.device)
+                self.engines[key] = Engine.open(Path(key), self.device)
+                self.media.update(Path(s).resolve() for s in self.engines[key].corpus.sources)
             return self.engines[key]
 
 
-def _index_job(state: State, video: str) -> None:
-    from vhe.engine import MODEL_LOCK
-    from vhe.pipeline import build_index
+def _index_job(state: State, path: str) -> None:
+    from vhe.models import MODEL_LOCK
 
     def progress(msg: str) -> None:
-        state.job["stage"] = msg
+        if msg.startswith("["):  # "[k/N] file (...)" from the project indexer
+            state.job["file"] = msg
+        state.job["stage"] = msg.strip()
 
     try:
         with MODEL_LOCK:  # queries wait while indexing holds the accelerator
-            build_index(Path(video), cfg=Config(device=state.device), progress=progress)
-        state.engines.pop(str(Path(video).resolve()), None)
+            if Path(path).is_dir():
+                from vhe.project import index_project
+
+                index_project(Path(path), Config(device=state.device), progress=progress)
+            else:
+                from vhe.pipeline import build_index
+
+                build_index(Path(path), cfg=Config(device=state.device), progress=progress)
+        with state.lock:
+            state.engines.pop(str(Path(path).resolve()), None)
         state.job.update(state="done", stage="done")
     except Exception as exc:  # surfaced in the UI
         traceback.print_exc()
@@ -102,29 +114,35 @@ def make_handler(state: State, port: int):
             path = urllib.parse.urlparse(self.path).path
             try:
                 data = self._body()
-                video = data.get("video", "")
+                video = data.get("video", "")  # a video file or a project folder
                 if path == "/api/index":
-                    if not Path(video).is_file():
-                        return self._json({"error": f"file not found: {video}"}, 400)
+                    if not Path(video).exists():
+                        return self._json({"error": f"not found: {video}"}, 400)
                     with state.lock:
                         if state.job["state"] == "running":
                             return self._json({"error": "an index job is already running"}, 409)
-                        state.job = {"state": "running", "stage": "starting", "error": None, "video": video}
+                        state.job = {"state": "running", "stage": "starting", "file": "", "error": None,
+                                     "video": video}
                     threading.Thread(target=_index_job, args=(state, video), daemon=True).start()
                     return self._json({"ok": True})
-                if not default_index_dir(Path(video)).joinpath("meta.json").exists():
-                    return self._json({"error": "video is not indexed yet"}, 400)
-                eng = state.engine(video)
+                try:
+                    eng = state.engine(video)
+                except FileNotFoundError as exc:
+                    return self._json({"error": str(exc)}, 400)
                 if path == "/api/clips":
+                    # The count box is empty by default: then the brief's own count/budget decides.
                     return self._json(eng.clips(data.get("query", ""), count=data.get("count") or None))
                 if path == "/api/search":
                     return self._json({"results": eng.search(data.get("query", ""))})
                 if path == "/api/export":
                     from vhe.export.clips import export_clips
 
-                    out = Path(video).parent / (Path(video).stem + "_clips")
-                    paths = export_clips(Path(video), data.get("clips", []), out)
-                    return self._json({"folder": str(out), "files": [p.name for p in paths]})
+                    src = Path(video).resolve()
+                    # Next to the footage folder, not inside it: re-indexing would take the clips for new takes.
+                    out = src.parent / (src.name + "_vhe_export" if src.is_dir() else src.stem + "_clips")
+                    res = export_clips(data.get("clips", []), out, eng.corpus.source_map, with_rough_cut=True)
+                    return self._json({"folder": str(out), "files": [p.name for p in res["clips"]],
+                                       "edl": res["edl"].name, "rough_cut": res["rough_cut"] and res["rough_cut"].name})
                 self._json({"error": "not found"}, 404)
             except Exception as exc:
                 traceback.print_exc()
@@ -132,8 +150,9 @@ def make_handler(state: State, port: int):
 
         def _media(self, raw: str) -> None:
             path = Path(raw).resolve()
-            # Only serve videos that have an index next to them; this is not a general file server.
-            if not path.is_file() or not default_index_dir(path).joinpath("meta.json").exists():
+            # Only serve source videos of an opened index or project; this is not a general file server.
+            if not path.is_file() or (path not in state.media
+                                      and not default_index_dir(path).joinpath("meta.json").exists()):
                 return self._json({"error": "not an indexed video"}, 403)
             size = path.stat().st_size
             start, end = 0, size - 1

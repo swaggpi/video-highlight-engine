@@ -18,6 +18,30 @@ import numpy as np
 import torch
 
 NC_COMPONENT = "lighthouse-cg-detr-qvhighlights (CC BY-NC-SA 4.0 training data)"
+CLIP_CONTEXT = 77  # CLIP text context in tokens, start and end token included
+
+
+def _clip_tokens(text: str) -> int:
+    try:
+        from clip.clip import _tokenizer
+    except Exception:  # no CLIP package: a conservative estimate (BPE splits words and punctuation)
+        import re
+
+        return 2 * len(re.findall(r"\w+|[^\w\s]", text)) + 2
+    return len(_tokenizer.encode(text)) + 2
+
+
+def fit_clip_query(text: str, context: int = CLIP_CONTEXT) -> str:
+    """The longest whole-word prefix of `text` that fits CLIP's context. Lighthouse calls clip.tokenize without
+    truncation, which raises 'Input ... is too long for context length 77' on a long editor's brief."""
+    words = text.split()
+    if _clip_tokens(" ".join(words)) <= context:
+        return " ".join(words)
+    lo, hi = 0, len(words)  # binary search on the prefix length; token count grows with it
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        lo, hi = (mid, hi) if _clip_tokens(" ".join(words[:mid])) <= context else (lo, mid - 1)
+    return " ".join(words[:lo])
 
 
 def window_starts(duration: float, window: float, overlap: float) -> list[float]:
@@ -26,8 +50,10 @@ def window_starts(duration: float, window: float, overlap: float) -> list[float]
     step = window - overlap
     starts = list(np.arange(0.0, duration - window, step))
     last = max(0.0, duration - window)  # last window ends exactly at the end
-    if starts and last - starts[-1] < 5.0:
-        starts[-1] = last  # avoid a near-duplicate final window
+    # Replace a near-duplicate final window only if the one before still reaches it; otherwise (a video slightly
+    # longer than one window) moving the only window would leave the start unscored.
+    if len(starts) > 1 and last - starts[-1] < 5.0 and starts[-2] + window >= last:
+        starts[-1] = last
     else:
         starts.append(last)
     return [round(float(s), 3) for s in starts]
@@ -35,17 +61,19 @@ def window_starts(duration: float, window: float, overlap: float) -> list[float]
 
 class NCHighlighter:
     def __init__(self, ckpt: str, device: str) -> None:
-        from lighthouse.models import CGDETRPredictor
+        from vhe import models
 
         if not Path(ckpt).exists():
             raise FileNotFoundError(f"missing checkpoint {ckpt}; see README 'Non-commercial highlight model'")
         self.device = "cuda" if device == "cuda" else "cpu"  # Lighthouse does not support MPS
-        self.predictor = CGDETRPredictor(ckpt, device=self.device, feature_name="clip")
+        self.predictor = models.cg_detr(ckpt, self.device)
         self.clip_len = float(self.predictor._clip_len)
         self._feats: dict[str, dict] = {}
 
-    def encode(self, video: Path, duration: float, window: float, overlap: float, cache: Path,
-               progress=None) -> list[dict]:
+    def encode(self, frames_dir: Path, grid_fps: float, duration: float, window: float, overlap: float,
+               cache: Path, progress=None) -> list[dict]:
+        """Features per window from the cached analysis frames (frames/%06d.jpg at grid_fps), not a second decode
+        of the source."""
         cache.mkdir(parents=True, exist_ok=True)
         window = min(window, 74 * self.clip_len)  # positional embedding limit: 75 clips
         chunks = []
@@ -58,10 +86,13 @@ class NCHighlighter:
                 if length < 2 * self.clip_len:
                     continue
                 part = Path(tmp) / f"part_{k}.avi"
-                # Lighthouse samples one frame per clip_len seconds at 224 px, so a 1 fps proxy is enough.
-                # MJPEG is in every ffmpeg build and cheap to write at 1 fps.
-                subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{start}", "-i", str(video), "-t", f"{length}",
-                                "-an", "-vf", "fps=1,scale=-2:224", "-c:v", "mjpeg", "-q:v", "3", str(part)],
+                # Lighthouse samples one frame per clip_len seconds at 224 px, so a 1 fps proxy is enough: every
+                # third cached frame (round=up: second k gets the frame at k s, not the one after). MJPEG is in
+                # every ffmpeg build and cheap to write at 1 fps.
+                subprocess.run(["ffmpeg", "-v", "error", "-y", "-framerate", f"{grid_fps}",
+                                "-start_number", str(int(round(start * grid_fps)) + 1),
+                                "-i", str(frames_dir / "%06d.jpg"), "-t", f"{length}",
+                                "-vf", "fps=1:round=up,scale=-2:224", "-c:v", "mjpeg", "-q:v", "3", str(part)],
                                check=True)
                 feats = self.predictor.encode_video(str(part))
                 path = cache / f"chunk_{k:03d}.pt"
@@ -73,6 +104,9 @@ class NCHighlighter:
 
     def predict(self, query: str, chunks: list[dict], cache: Path, n_grid: int, grid_fps: float):
         """Return (saliency on the grid, proposed windows [(start, end, score)] in absolute seconds)."""
+        query = fit_clip_query(query)
+        if not query:
+            return np.full(n_grid, np.nan), []
         acc = np.zeros(n_grid)
         wsum = np.zeros(n_grid)
         proposals = []

@@ -11,14 +11,11 @@ from PIL import Image
 
 class Encoder:
     def __init__(self, name: str, device: str) -> None:
-        from transformers import AutoModel, AutoProcessor
+        from vhe import models
 
         self.name = name
         self.device = device
-        dtype = torch.float16 if device in ("cuda", "mps") else torch.float32
-        self.model = AutoModel.from_pretrained(name, torch_dtype=dtype).to(device).eval()
-        self.processor = AutoProcessor.from_pretrained(name)
-        self.dtype = dtype
+        self.model, self.processor, self.dtype = models.siglip(name, device)
 
     @torch.no_grad()
     def images(self, paths: list[Path], batch_size: int = 32, progress=None) -> np.ndarray:

@@ -14,8 +14,8 @@
   .meta { font-family: ui-monospace, monospace; font-size: 12px; }
 </style>
 
-<div class="row"><input id="video" type="text" placeholder="/path/to/video.mp4"><button id="indexBtn">Index</button></div>
-<div class="row"><input id="query" type="text" placeholder="e.g. short high-energy scenes"><input id="count" type="number" min="1" max="50" value="5" style="width:60px"><button id="clipsBtn">Find clips</button><button id="searchBtn">Search</button></div>
+<div class="row"><input id="video" type="text" placeholder="/path/to/footage-folder or /path/to/video.mp4"><button id="indexBtn">Index</button></div>
+<div class="row"><input id="query" type="text" placeholder="e.g. 60-90 s energetic recap, open with an establishing shot"><input id="count" type="number" min="1" max="50" placeholder="auto" title="number of clips; empty = from the brief" style="width:60px"><button id="clipsBtn">Find clips</button><button id="searchBtn">Search</button></div>
 <div id="status"></div>
 <div id="results"></div>
 <div class="row"><button id="exportBtn" hidden>Export selected</button></div>
@@ -40,13 +40,12 @@ $("indexBtn").onclick = async () => {
   try { await post("/api/index", {video}); } catch (e) { return status(e.message); }
   const poll = setInterval(async () => {
     const s = await (await fetch("/api/status")).json();
-    status(s.state === "error" ? `Error: ${s.error}` : `Indexing: ${s.stage}`);
+    status(s.state === "error" ? `Error: ${s.error}` : `Indexing: ${s.file && s.file !== s.stage ? s.file + " · " : ""}${s.stage}`);
     if (s.state !== "running") { clearInterval(poll); if (s.state === "done") status("Indexed. Enter a query."); }
   }, 1000);
 };
 
 function render(items, withExport) {
-  const video = encodeURIComponent($("video").value.trim());
   current = items;
   $("results").innerHTML = "";
   items.forEach((c, i) => {
@@ -64,11 +63,11 @@ function render(items, withExport) {
     box.dataset.i = i;
     box.checked = withExport;
     box.hidden = !withExport;
-    row.append(box, ` ${fmt(c.start)}–${fmt(c.end)} · ${score} · ${label}`);
+    row.append(box, ` ${i + 1}. ${c.file} ${fmt(c.file_start)}–${fmt(c.file_end)} · ${score} · ${c.reason || label}`);
     const player = document.createElement("video");
     player.controls = true;
     player.preload = "none";
-    player.src = `/media?path=${video}#t=${c.start},${c.end}`;
+    player.src = `/media?path=${encodeURIComponent(c.path)}#t=${c.file_start},${c.file_end}`;
     div.append(row, player);
     $("results").appendChild(div);
   });
@@ -78,7 +77,8 @@ function render(items, withExport) {
 $("clipsBtn").onclick = async () => {
   status("Ranking…");
   try {
-    const r = await post("/api/clips", {video: $("video").value.trim(), query: $("query").value, count: +$("count").value});
+    const count = $("count").value.trim();  // empty = let the brief decide (count or runtime budget)
+    const r = await post("/api/clips", {video: $("video").value.trim(), query: $("query").value, count: count ? +count : null});
     render(r.clips, true);
     status(`${r.clips.length} clips in ${r.seconds}s` + ((r.noncommercial || []).length ? " · uses non-commercial model" : ""));
   } catch (e) { status(e.message); }
@@ -98,7 +98,7 @@ $("exportBtn").onclick = async () => {
   status("Exporting…");
   try {
     const r = await post("/api/export", {video: $("video").value.trim(), clips: picked});
-    status(`Exported ${r.files.length} clips to ${r.folder}`);
+    status(`Exported ${r.files.length} clips, ${r.edl}${r.rough_cut ? ", " + r.rough_cut : ""} to ${r.folder}`);
   } catch (e) { status(e.message); }
 };
 </script>

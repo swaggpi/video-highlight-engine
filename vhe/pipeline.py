@@ -1,6 +1,8 @@
-"""Index a video once: decode, signals, embeddings, tags, transcript, non-commercial highlight features."""
+"""Index a video once: decode, signals, embeddings, tags, shot scale, on-screen text, faces, transcript,
+non-commercial highlight features."""
 from __future__ import annotations
 
+import logging
 import shutil
 import time
 from pathlib import Path
@@ -8,50 +10,29 @@ from typing import Callable
 
 import numpy as np
 
-from vhe.config import Config, resolve_device
+from vhe.config import Config
 from vhe.index.store import default_index_dir, save_index
 from vhe.ingest.decode import decode, frame_paths, load_tiny
+from vhe.models import resolve_device
 from vhe.signals.audio import audio_signals, load_audio, speech_mask, voice_activity
+from vhe.signals.changes import change_points
+from vhe.signals.faces import approach
 from vhe.signals.frames import Encoder
 from vhe.signals.motion import motion_signals
-from vhe.signals.quality import frame_quality
+from vhe.signals.quality import frame_quality, usable_mask
 from vhe.signals.shots import detect_cuts, frame_diffs
-from vhe.signals.tags import LABELS, label_texts, tag_probs
+from vhe.signals.tags import (
+    LABELS,
+    defect_scores,
+    defect_texts,
+    label_texts,
+    scale_scores,
+    scale_texts,
+    tag_probs,
+)
 from vhe.timing import Counter, Timings
 
-
-def change_points(emb: np.ndarray, fps: float, cuts: list[float], half_window_s: float = 1.0,
-                  z_thresh: float = 2.5, min_gap_s: float = 2.0, min_dist: float = 0.05) -> list[float]:
-    """Content changes inside shots (raw footage is often one long take): peaks of the embedding distance
-    between the second before and the second after each step."""
-    k = max(1, int(round(half_window_s * fps)))
-    e = emb.astype(np.float32)
-    n = len(e)
-    if n < 2 * k + 2:
-        return []
-    c = np.concatenate([np.zeros((1, e.shape[1]), np.float32), np.cumsum(e, axis=0)])
-    i = np.arange(k, n - k)
-    before = c[i] - c[i - k]
-    after = c[i + k] - c[i]
-    cos = (before * after).sum(1) / (np.linalg.norm(before, axis=1) * np.linalg.norm(after, axis=1) + 1e-9)
-    dist = 1.0 - cos
-    med = np.median(dist)
-    mad = np.median(np.abs(dist - med)) * 1.4826 + 1e-9
-    z = (dist - med) / mad
-    cut_arr = np.asarray(cuts)
-    out: list[float] = []
-    for j in np.argsort(-z):
-        if z[j] < z_thresh:
-            break
-        if dist[j] < min_dist:  # relative outliers in a static take are noise, not content changes
-            continue
-        t = float(i[j] / fps)
-        if cut_arr.size and np.min(np.abs(cut_arr - t)) < 1.0:
-            continue
-        if any(abs(t - o) < min_gap_s for o in out):
-            continue
-        out.append(round(t, 3))
-    return sorted(out)
+log = logging.getLogger("vhe")
 
 
 def build_index(video: Path, out_dir: Path | None = None, cfg: Config | None = None,
@@ -63,7 +44,6 @@ def build_index(video: Path, out_dir: Path | None = None, cfg: Config | None = N
     say = progress or (lambda msg: None)
     device = resolve_device(cfg.device)
     timings = Timings()
-    fps = cfg.fps
 
     try:
         return _build(video, out, cfg, say, device, timings)
@@ -80,6 +60,8 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
     with timings.stage("decode") as r:
         info = decode(video, out, cfg)
         r["items"] = info["n_frames"]
+    say(f"decoded {info['n_frames']} frames, tiny stream {info['tiny_fps']:g} fps (source {info['src_fps']:.3f}), "
+        f"hwaccel {info['hwaccel']}")
     n = info["n_frames"]
     if n == 0:
         raise RuntimeError("no frames decoded")
@@ -118,7 +100,6 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
     else:
         for key in ("loudness", "onset", "speech"):
             grid[key] = np.zeros(n, dtype=np.float32)
-    grid["has_audio"] = np.array(info["has_audio"])
 
     paths = frame_paths(out)
     say(f"embedding {len(paths)} frames")
@@ -130,22 +111,33 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
     with timings.stage("tags"):
         scale, bias = encoder.logit_params()
         grid["tags"] = tag_probs(emb, encoder.texts(label_texts()), scale, bias)
+        grid.update(defect_scores(emb, encoder.texts(defect_texts()), scale, bias))
+        grid.update(scale_scores(emb, encoder.texts(scale_texts()), scale, bias))
     say("frame quality")
     with timings.stage("quality", items=len(paths)):
         grid.update(frame_quality(paths))
+    ocr, faces_meta = _ocr(paths, grid, cfg, say, timings), _faces(paths, grid, cfg, say, timings)
+    # Without faces (detector unavailable) approach follows the close-up margin alone.
+    grid["approach"] = approach(grid.get("face_area_max", np.zeros(n, np.float32)), grid["scale_close"], fps, cuts)
+    grid["usable"], grid["unusable"] = usable_mask(grid["luma"], grid["contrast"], grid["blown"],
+                                                   grid["blur_ratio"], grid["shake"], grid["obstruction"],
+                                                   grid["framing"])
     grid["emb"] = emb
     cps = change_points(emb, fps, cuts)
-    del encoder  # free memory before the optional model loads
 
     meta = {
         **info, "fps": fps, "config": cfg.to_dict(), "device": device, "encoder": cfg.encoder,
         "logit_scale": scale, "logit_bias": bias, "labels": LABELS,
         "cuts": cuts, "change_points": cps, "vad": vad, "nc_highlight": None,
+        "language": transcript["language"] if transcript else None,
+        "usable_fraction": round(float(grid["usable"].mean()), 4),
         "noncommercial_components": [],
+        "ocr": None if ocr is None else {k: v for k, v in ocr.items() if k != "items"},
+        "faces": faces_meta,
         "timings": timings.stages, "created": time.strftime("%Y-%m-%dT%H:%M:%S"),
     }
     # Save before the optional stage so a failure there never loses the expensive work above.
-    save_index(out, meta, grid, transcript)
+    save_index(out, meta, grid, transcript, ocr)
 
     if cfg.use_nc_highlight:
         say("non-commercial highlight features")
@@ -155,7 +147,7 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
             with timings.stage("load_nc_model"):
                 hl = NCHighlighter(cfg.nc_checkpoint, device)
             with timings.stage("nc_highlight_encode"):
-                chunks = hl.encode(Path(info["source"]), duration, cfg.nc_window_s, cfg.nc_overlap_s, out / "nc",
+                chunks = hl.encode(out / "frames", fps, duration, cfg.nc_window_s, cfg.nc_overlap_s, out / "nc",
                                    progress=Counter(say, "highlight windows", every_s=0))
             if chunks:
                 meta.update(nc_highlight={"component": NC_COMPONENT, "chunks": chunks},
@@ -163,6 +155,53 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
         except Exception as exc:  # optional stage: keep the index without it
             say(f"skipping non-commercial highlight model: {exc}")
         meta["timings"] = timings.stages
-        save_index(out, meta, grid, transcript)
+        save_index(out, meta, grid, transcript, ocr)
     say("done")
     return out
+
+
+def _skip(say, what: str, exc: Exception) -> None:
+    """An optional index-time signal is unavailable: warn, keep indexing without it."""
+    msg = f"skipping {what}: {type(exc).__name__}: {exc}"
+    log.warning(msg)
+    say(msg)
+
+
+def _ocr(paths: list[Path], grid: dict, cfg: Config, say, timings: Timings) -> dict | None:
+    """Adds text_area/text_conf to grid; returns the text store for ocr.json, or None when OCR did not run."""
+    if not cfg.use_ocr:
+        return None
+    from vhe.config import OCR_EVERY, OCR_MIN_CONF
+    from vhe.signals.ocr import ENGINE_NAME, load_engine, ocr_frames
+
+    try:  # optional: rapidocr-onnxruntime not installed, or onnxruntime broken on this machine
+        with timings.stage("load_ocr"):
+            engine = load_engine(cfg.frame_height)
+        say("on-screen text")
+        with timings.stage("ocr", items=len(range(0, len(paths), OCR_EVERY))):
+            sig, items = ocr_frames(paths, engine, progress=Counter(say, "reading text"))
+    except Exception as exc:
+        _skip(say, "on-screen text (OCR)", exc)
+        return None
+    grid.update(sig)
+    return {"engine": ENGINE_NAME, "every": OCR_EVERY, "min_conf": OCR_MIN_CONF, "items": items}
+
+
+def _faces(paths: list[Path], grid: dict, cfg: Config, say, timings: Timings) -> dict | None:
+    """Adds face_n/face_area_max/face_center to grid; returns their meta entry, or None when faces did not run."""
+    if not cfg.use_faces:
+        return None
+    from vhe.config import FACE_MIN_SCORE
+    from vhe.signals.faces import MODEL_NAME, face_signals, load_detector
+
+    try:  # optional: model not downloadable (offline, $VHE_NO_DOWNLOAD) or checksum mismatch
+        with timings.stage("load_faces"):
+            detector = load_detector()
+        say("faces")
+        with timings.stage("faces", items=len(paths)):
+            sig = face_signals(paths, detector, progress=Counter(say, "faces"))
+    except Exception as exc:
+        _skip(say, "faces", exc)
+        return None
+    grid.update(sig)
+    return {"model": MODEL_NAME, "min_score": FACE_MIN_SCORE}

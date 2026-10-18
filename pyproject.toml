@@ -13,18 +13,25 @@ dependencies = [
     "transformers==4.51.3",
     "sentencepiece",
     "protobuf",
+    "pillow",  # vhe.signals.frames opens the analysis frames with PIL
     "opencv-python-headless",
     "librosa",
     "soundfile",
     "faster-whisper",
     "silero-vad",
+    # On-screen text. Its opencv-python requirement is overridden below ([tool.uv]).
+    "rapidocr-onnxruntime==1.4.4",
+    "onnxruntime",
+    "pyclipper",
+    "shapely",
 ]
 
 [project.optional-dependencies]
 # Lighthouse CG-DETR highlight scorer. NON-COMMERCIAL weights (trained on QVHighlights, CC BY-NC-SA).
 # Install the package itself with --no-deps: its setup.py pins numpy<=1.23.5 and pulls gradio.
-nc = ["clip @ git+https://github.com/openai/CLIP.git", "easydict", "einops", "fvcore", "ftfy", "regex",
-      "torchlibrosa", "ffmpeg-python", "pandas", "tqdm", "pyyaml", "scikit-learn"]
+# torchaudio: Lighthouse imports it; install it from the same index as torch (CPU or CUDA build).
+nc = ["torchaudio==2.4.1", "clip @ git+https://github.com/openai/CLIP.git", "easydict", "einops", "fvcore", "ftfy",
+      "regex", "torchlibrosa", "ffmpeg-python", "pandas", "tqdm", "pyyaml", "scikit-learn"]
 dev = ["pytest"]
 
 [project.scripts]
@@ -38,3 +45,7 @@ vhe = ["ui/*.html"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.uv]
+# rapidocr-onnxruntime requires opencv-python; opencv-python-headless above already provides cv2.
+override-dependencies = ["opencv-python ; sys_platform == 'never'"]
