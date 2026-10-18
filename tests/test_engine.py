@@ -54,6 +54,98 @@ def test_cuda_out_of_memory_falls_back_to_cpu(tmp_path, monkeypatch):
         eng2.text_vectors(["x"])
 
 
+def test_cached_models_found_inside_wrappers():
+    import types
+
+    import torch
+
+    from vhe import models
+
+    a, b, c = torch.nn.Linear(2, 2), torch.nn.Linear(2, 2), torch.nn.Linear(2, 2)
+    wrapper = types.SimpleNamespace(_model=a, _text=types.SimpleNamespace(encoders=[types.SimpleNamespace(m=b)]))
+    found = list(models._modules((c, wrapper, "processor", torch.float16)))
+    assert [id(m) for m in found] == [id(c), id(a), id(b)]
+    assert list(models._modules(types.SimpleNamespace(x=a, y=a))) == [a]  # shared module once
+
+
+@pytest.mark.skipif(not __import__("torch").cuda.is_available(), reason="no CUDA GPU")
+def test_gpu_released_lends_the_memory_and_restores_weights_bit_for_bit():
+    import torch
+
+    from vhe import models
+
+    m = torch.nn.Linear(64, 64).half().cuda()
+    before = {k: v.clone() for k, v in m.state_dict().items()}
+    with models._LOCK:
+        models._CACHE[("test-lend",)] = (m, None, torch.float16)
+    try:
+        with models.gpu_released():
+            assert all(not t.is_cuda for t in m.parameters())
+        assert all(t.is_cuda for t in m.parameters())
+        assert all(torch.equal(before[k], v) and v.dtype == before[k].dtype for k, v in m.state_dict().items())
+    finally:
+        with models._LOCK:
+            models._CACHE.pop(("test-lend",), None)
+
+
+def test_models_that_cannot_return_to_the_gpu_switch_their_owners_to_the_cpu(tmp_path, monkeypatch):
+    import types
+
+    from vhe import models
+
+    class Weights:
+        def __init__(self):
+            self.where = []
+
+        def parameters(self):
+            return iter(())
+
+        def buffers(self):
+            return iter(())
+
+        def to(self, device):
+            if device != "cpu":
+                raise RuntimeError("CUDA out of memory. Tried to allocate 20.00 MiB")
+            self.where.append(device)
+
+    fake_torch = types.SimpleNamespace(cuda=types.SimpleNamespace(mem_get_info=lambda: (1 << 40, 1 << 40),
+                                                                  empty_cache=lambda: None))
+    root = make_project(tmp_path / "p", [("a.mp4", 40.0, {})])
+    eng = Engine.open(root, device="cpu", use_nc=False)
+    eng.device = "cuda"
+    w = Weights()
+    with models._LOCK:
+        models._CACHE[("test-lost",)] = w
+    with pytest.warns(RuntimeWarning, match="could not return to the GPU"):
+        models._return_to_gpu(fake_torch, [w], ["cuda:0"])
+    assert w.where == ["cpu"] and ("test-lost",) not in models._CACHE
+    assert eng.device == "cpu" and any("could not return to the GPU" in x for x in eng.warnings)
+    # any other error is not swallowed
+    w.to = lambda device: (_ for _ in ()).throw(ValueError("bad"))
+    with pytest.raises(ValueError):
+        models._return_to_gpu(fake_torch, [w], ["cuda:0"])
+
+
+def test_highlight_scores_computed_once_per_text(tmp_path, monkeypatch):
+    root = make_project(tmp_path / "p", [("a.mp4", 40.0, {})])
+    eng = Engine.open(root, device="cpu", use_nc=False)
+    eng.use_nc = True
+    calls = []
+
+    def predict(text):
+        calls.append(text)
+        return np.arange(eng.corpus.n, dtype=float), [[(1.0, 2.0, 0.5)]]
+
+    monkeypatch.setattr(eng, "_nc_predict", predict)
+    s1, p1 = eng._nc_scores("a float")
+    s1[:] = -1.0  # callers own their copies
+    p1[0].append((9.0, 9.5, 0.1))
+    s2, p2 = eng._nc_scores("a float")
+    assert calls == ["a float"] and s2[0] == 0.0 and p2 == [[(1.0, 2.0, 0.5)]]
+    eng._nc_scores("a dancer")
+    assert calls == ["a float", "a dancer"]
+
+
 # ---- hard gates ------------------------------------------------------------------------------------------------------
 def _mixed_project(tmp_path):
     dogs, birds = _dirs(2, seed=3)

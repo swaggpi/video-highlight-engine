@@ -4,10 +4,13 @@ one lock that serialises inference across UI requests and indexing, and the CPU 
 error (on_device)."""
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import os
 import shutil
+import sys
 import threading
+import time
 import urllib.request
 import warnings
 from pathlib import Path
@@ -78,15 +81,130 @@ def clear() -> None:
         _CACHE.clear()
 
 
+# ---- lending the GPU to another process (the parser LLM) -------------------------------------------------------------
+GPU_LEND_LOCK_WAIT_S = 2.0  # a running inference (or indexing) keeps the models: the parse then runs beside them
+GPU_RETURN_WAIT_S = 10.0  # how long the models wait for the borrower to free the memory before they move back
+GPU_RETURN_MARGIN = 256 << 20  # bytes free beyond the models' own size before they move back
+_LOST: list = []  # weak callbacks: models could not go back to the GPU (each owner switches to the CPU)
+
+
+def on_gpu_lost(callback: Callable[[str], None]) -> None:
+    """Register an owner's switch-to-CPU (a bound method, held weakly): called with a message when models lent to
+    another process (gpu_released) cannot return to the GPU. The owner must drop its models, as on_device's to_cpu."""
+    import weakref
+
+    _LOST[:] = [ref for ref in _LOST if ref() is not None]
+    _LOST.append(weakref.WeakMethod(callback) if hasattr(callback, "__self__") else (lambda cb=callback: cb))
+
+
+def _modules(obj, depth: int = 6, seen: set | None = None):
+    """torch modules in a cached model entry: the entry itself, members of short lists and tuples, or attributes of
+    wrapper objects (Lighthouse's predictor holds its CLIP encoders a few attributes deep). Dicts and long lists are
+    not searched (a tokenizer's vocabulary holds no model)."""
+    import torch
+
+    seen = set() if seen is None else seen
+    if id(obj) in seen or depth < 0:
+        return
+    seen.add(id(obj))
+    if isinstance(obj, torch.nn.Module):
+        yield obj
+    elif isinstance(obj, (list, tuple)) and len(obj) <= 16:
+        for x in obj:
+            yield from _modules(x, depth - 1, seen)
+    elif hasattr(obj, "__dict__") and not isinstance(obj, type):
+        for x in vars(obj).values():
+            yield from _modules(x, depth - 1, seen)
+
+
+def _cuda_modules() -> list:
+    out, seen = [], set()
+    with _LOCK:
+        entries = list(_CACHE.values())
+    for entry in entries:
+        for m in _modules(entry):
+            if id(m) not in seen and any(t.is_cuda for t in (*m.parameters(), *m.buffers())):
+                seen.add(id(m))
+                out.append(m)
+    return out
+
+
+def _nbytes(m) -> int:
+    return sum(t.numel() * t.element_size() for t in (*m.parameters(), *m.buffers()))
+
+
+@contextlib.contextmanager
+def gpu_released():
+    """While the block runs, the cached models' weights wait in host memory and the GPU memory they held is free for
+    another process: the parser LLM (Ollama, unloaded when it answers) otherwise gets only part of a 6 GB card next
+    to SigLIP2 and CG-DETR (1.5 GB) and runs mostly on the CPU (2026-10-18, GTX 1660 Super: 30-34 s per parse with
+    0.8 of qwen3:4b's 2.7 GB on the GPU). The weights move back afterwards, bit for bit (same dtype), once the
+    borrower has freed the memory. If they cannot, every registered owner switches to the CPU (on_gpu_lost) and the
+    cache is cleared, as after an out-of-memory error (on_device). A no-op unless this process has models on a CUDA
+    GPU and the model lock is free within GPU_LEND_LOCK_WAIT_S (inference and indexing keep their models)."""
+    torch = sys.modules.get("torch")
+    if torch is None or not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        yield
+        return
+    if not MODEL_LOCK.acquire(timeout=GPU_LEND_LOCK_WAIT_S):
+        yield
+        return
+    try:
+        moved = _cuda_modules()
+        devices = [next(t for t in (*m.parameters(), *m.buffers()) if t.is_cuda).device for m in moved]
+        for m in moved:
+            m.to("cpu")
+        if moved:
+            torch.cuda.empty_cache()
+        try:
+            yield
+        finally:
+            if moved:
+                _return_to_gpu(torch, moved, devices)
+    finally:
+        MODEL_LOCK.release()
+
+
+def _return_to_gpu(torch, moved: list, devices: list) -> None:
+    need = sum(_nbytes(m) for m in moved) + GPU_RETURN_MARGIN
+    deadline = time.monotonic() + GPU_RETURN_WAIT_S
+    while time.monotonic() < deadline and torch.cuda.mem_get_info()[0] < need:
+        time.sleep(0.1)  # Ollama's runner releases the memory a moment after it answers
+    try:
+        for m, dev in zip(moved, devices, strict=True):
+            m.to(dev)
+    except Exception as exc:
+        if not is_oom(exc):
+            raise
+        for m in moved:  # one consistent place for every weight; the owners reload on the CPU
+            m.to("cpu")
+        clear()
+        torch.cuda.empty_cache()
+        msg = "models could not return to the GPU after the brief parse (out of memory); running on the CPU (slower)"
+        warnings.warn(msg, RuntimeWarning, stacklevel=3)
+        for ref in list(_LOST):
+            cb = ref()
+            if cb is not None:
+                cb(msg)
+        _LOST[:] = [ref for ref in _LOST if ref() is not None]
+
+
 def siglip(name: str, device: str):
-    """(model, processor, dtype); fp16 on GPUs."""
+    """(model, processor, dtype); fp16 on GPUs. Loaded from the local Hugging Face snapshot when there is one: asking
+    the Hub whether each file changed cost 12-15 s of a 17-20 s load (2026-10-18, over a VPN), and the processor
+    still asks with local_files_only; the Hub only when the model was never downloaded."""
     def load():
         import torch
+        from huggingface_hub import snapshot_download
         from transformers import AutoModel, AutoProcessor
 
         dtype = torch.float16 if device in ("cuda", "mps") else torch.float32
-        model = AutoModel.from_pretrained(name, torch_dtype=dtype).to(device).eval()
-        return model, AutoProcessor.from_pretrained(name), dtype
+        try:
+            source = snapshot_download(name, local_files_only=True)
+        except Exception:  # not in the local cache (or `name` is a local folder): from_pretrained resolves it
+            source = name
+        model = AutoModel.from_pretrained(source, torch_dtype=dtype).to(device).eval()
+        return model, AutoProcessor.from_pretrained(source), dtype
 
     return cached(("siglip", name, device), load)
 

@@ -12,6 +12,7 @@ import re
 import urllib.request
 from pathlib import Path
 
+from vhe.models import gpu_released
 from vhe.query.lexicon import (
     ALL_MATCHES,
     CUE_FILLER,
@@ -35,7 +36,12 @@ LLM_TIMEOUT = 90.0  # a cold load of a 4B model takes seconds; a hung server mus
 # a resident qwen3:4b (~2.8 GB) made 3 of 17 dev briefs fail with CUDA OOM. Measured 2026-10-18 (16 cores, GTX 1660
 # Super, two dev briefs, cold): GPU 12-22 s per parse, CPU-only (num_gpu 0) 44-57 s. So the parse runs on the GPU and
 # unloads at once (keep_alive 0: Ollama's /api/ps is empty when the response returns); the engine's CPU fallback
-# covers any other GPU tenant.
+# covers any other GPU tenant. In a warm process (the UI) the loaded SigLIP2 and CG-DETR lend their 1.4 GB to the parse
+# (vhe.models.gpu_released) and return afterwards, which a resident LLM would prevent: keep_alive stays 0. Measured
+# 2026-10-18 next to another 1.3 GB GPU tenant and a second UI process: 45-47 s per uncached parse with the models
+# resident, 31-34 s with them lent (then 7 of 37 layers fit: Ollama keeps ~0.8 GB free; all of them need ~3.6 GB
+# free); a warm, resident model would save the 4-12 s load and most of the 8.5 s prompt evaluation, at the cost of the
+# models' GPU memory.
 LLM_KEEP_ALIVE = 0
 LLM_OPTIONS = {"temperature": 0, "seed": 0, "num_ctx": 4096}  # the prompt with its examples is ~1.5k tokens
 PARSE_CACHE = Path.home() / ".cache" / "vhe" / "parse"  # one JSON per (prompt version, model, brief)
@@ -153,7 +159,8 @@ def _ask_llm(query: str, model: str, host: str) -> tuple[dict, bool]:
             "options": dict(LLM_OPTIONS), "messages": messages}
     req = urllib.request.Request(f"{host}/api/chat", data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
+    # The loaded query models lend their GPU memory to the parse (vhe.models.gpu_released), so the model fits on it.
+    with gpu_released(), urllib.request.urlopen(req, timeout=LLM_TIMEOUT) as resp:
         data = json.loads(json.loads(resp.read())["message"]["content"])
     if not isinstance(data, dict):
         raise ValueError("LLM answer is not a JSON object")

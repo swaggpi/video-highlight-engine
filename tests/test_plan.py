@@ -406,3 +406,68 @@ def test_topic_embeddings_unload_unless_another_client_holds_the_model(monkeypat
 
     monkeypatch.setattr(urllib.request, "urlopen", urlopen)
     assert topics.embed(["a sentence"]) is not None and bodies[0]["keep_alive"] == "0s"
+
+
+# ---- topic embeddings cache ------------------------------------------------------------------------------------------
+def _fake_server(monkeypatch, digest="sha256:aaa"):
+    """Ollama stand-in: /api/tags names bge-m3 with `digest`, /api/embed returns a vector per text (a function of
+    the text alone, as bge-m3's are); returns (the embed request bodies, the vector function)."""
+    bodies = []
+
+    def vec(text):
+        return np.random.default_rng(sum(map(ord, text))).normal(size=8).tolist()
+
+    def urlopen(req, timeout):
+        url = req if isinstance(req, str) else req.full_url
+        if url.endswith("/api/tags"):
+            return io.BytesIO(json.dumps({"models": [{"name": "bge-m3:latest", "digest": digest}]}).encode())
+        if url.endswith("/api/ps"):
+            return io.BytesIO(json.dumps({"models": []}).encode())
+        body = json.loads(req.data)
+        bodies.append(body)
+        return io.BytesIO(json.dumps({"embeddings": [vec(t) for t in body["input"]]}).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", urlopen)
+    return bodies, vec
+
+
+def test_topic_embeddings_cached_per_text_and_model_version(monkeypatch):
+    bodies, vec = _fake_server(monkeypatch)
+    texts = [f"sentence {i}" for i in range(40)]
+
+    def fresh(ts):
+        v = np.array([vec(t) for t in ts], dtype=np.float32)
+        return v / (np.linalg.norm(v, axis=1, keepdims=True) + 1e-9)
+
+    np.testing.assert_array_equal(topics.embed(texts[:20]), fresh(texts[:20]))
+    # batches of EMBED_BATCH, the model held between them and unloaded after the last
+    assert [len(b["input"]) for b in bodies] == [16, 4] and [b["keep_alive"] for b in bodies] == ["60s", "0s"]
+    bodies.clear()
+    mixed = texts[30:35] + texts[:10] + texts[30:31]  # new, cached and repeated texts
+    np.testing.assert_array_equal(topics.embed(mixed), fresh(mixed))
+    assert [b["input"] for b in bodies] == [texts[30:35]]  # only the new ones, once each
+    # another process: the vectors come from the disk cache
+    monkeypatch.setattr(topics, "_STORE", topics._Store())
+    bodies.clear()
+    np.testing.assert_array_equal(topics.embed(texts[:20] + texts[30:35]), fresh(texts[:20] + texts[30:35]))
+    assert bodies == []
+    # a new version of the model (another digest) is embedded again
+    bodies, _ = _fake_server(monkeypatch, digest="sha256:bbb")
+    topics.embed(texts[:3])
+    assert [b["input"] for b in bodies] == [texts[:3]]
+
+
+def test_topic_embeddings_fail_as_a_whole(monkeypatch):
+    bodies, _ = _fake_server(monkeypatch)
+    served = urllib.request.urlopen
+
+    def flaky(req, timeout):
+        if not isinstance(req, str) and len(bodies) == 1:
+            raise TimeoutError("timed out")
+        return served(req, timeout)
+
+    monkeypatch.setattr(urllib.request, "urlopen", flaky)
+    assert topics.embed([f"t{i}" for i in range(20)]) is None  # the second batch failed: keyword fallback
+    bodies.clear()
+    monkeypatch.setattr(urllib.request, "urlopen", served)
+    assert topics.embed(["t1"]) is not None and bodies == []  # the first batch was cached

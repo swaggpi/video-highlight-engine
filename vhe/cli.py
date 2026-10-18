@@ -97,6 +97,10 @@ def cmd_clips(a: argparse.Namespace) -> None:
     print(f"{res['files']} files, {res.get('candidates', 0)} candidates ({res.get('unusable_dropped', 0)} unusable, "
           f"{res.get('excluded_dropped', 0)} excluded), "
           f"ranking {res['seconds']:.2f}s, model load {res['load_seconds']:.1f}s")
+    if res.get("timings"):
+        from vhe.timing import format_report
+
+        print(format_report(res["timings"]))
     for i, c in enumerate(res["clips"], 1):
         said = f'  "{c["transcript"]}"' if c["transcript"] else ""
         item = f"  [{c['item']}]" if c.get("item") else ""

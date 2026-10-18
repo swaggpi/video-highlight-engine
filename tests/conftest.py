@@ -9,6 +9,11 @@ def _hermetic_parsing(tmp_path_factory, monkeypatch):
 
     monkeypatch.setenv("VHE_LLM", "none")
     monkeypatch.setattr(llm, "PARSE_CACHE", tmp_path_factory.mktemp("parse_cache"))
+    from vhe.query import topics
+
+    # nor the user's topic-embedding cache (an empty in-memory store per test)
+    monkeypatch.setattr(topics, "EMBED_CACHE", tmp_path_factory.mktemp("embed_cache") / "embed.sqlite")
+    monkeypatch.setattr(topics, "_STORE", topics._Store())
 
 
 @pytest.fixture(autouse=True)

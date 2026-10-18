@@ -1,8 +1,10 @@
-"""Minimal local UI: stdlib HTTP server on 127.0.0.1, one HTML page, JSON endpoints, ranged video serving."""
+"""Minimal local UI: stdlib HTTP server on 127.0.0.1, one HTML page, JSON endpoints, ranged video serving, and
+per-clip WebM previews (vhe.export.preview) that play in browsers without an H.264 decoder."""
 from __future__ import annotations
 
 import json
 import mimetypes
+import subprocess
 import threading
 import traceback
 import urllib.parse
@@ -10,9 +12,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 from vhe.config import Config
+from vhe.export.preview import make_preview, preview_path, span
 from vhe.index.store import default_index_dir
+from vhe.project import PROJECT_DIR
 
 PAGE = Path(__file__).with_name("index.html")
+PREVIEW_CONCURRENCY = 2  # transcodes at once (each uses several cores); the page also asks for previews lazily
 
 
 class State:
@@ -22,6 +27,9 @@ class State:
         self.job = {"state": "idle", "stage": "", "file": "", "error": None, "video": None}
         self.engines: dict[str, object] = {}
         self.media: set[Path] = set()  # source files of opened engines: the only files /media serves
+        self.previews: dict[Path, Path] = {}  # source file -> its project's preview cache folder
+        self.preview_slots = threading.BoundedSemaphore(PREVIEW_CONCURRENCY)
+        self.preview_locks: dict[str, threading.Lock] = {}  # one transcode per preview, however many requests ask
 
     def engine(self, path: str):
         """Engine for a project folder or a video file; models come from the process-wide cache (vhe.models)."""
@@ -31,8 +39,24 @@ class State:
         with self.lock:
             if key not in self.engines:
                 self.engines[key] = Engine.open(Path(key), self.device)
-                self.media.update(Path(s).resolve() for s in self.engines[key].corpus.sources)
+                c = self.engines[key].corpus
+                for k, s in enumerate(c.sources):
+                    s = Path(s).resolve()
+                    self.media.add(s)
+                    # <DIR>/.vhe/previews for a project, the video's own index folder otherwise
+                    self.previews[s] = (Path(c.root) / PROJECT_DIR if c.root else c.members[k].root) / "previews"
             return self.engines[key]
+
+    def allowed(self, path: Path) -> bool:
+        """Only source videos of an opened index or project are served; this is not a general file server."""
+        return path.is_file() and (path in self.media or default_index_dir(path).joinpath("meta.json").exists())
+
+    def preview_dir(self, path: Path) -> Path:
+        return self.previews.get(path) or default_index_dir(path) / "previews"
+
+    def preview_lock(self, key: str) -> threading.Lock:
+        with self.lock:
+            return self.preview_locks.setdefault(key, threading.Lock())
 
 
 def _index_job(state: State, path: str) -> None:
@@ -105,6 +129,9 @@ def make_handler(state: State, port: int):
                 self._json(state.job)
             elif url.path == "/media":
                 self._media(urllib.parse.parse_qs(url.query).get("path", [""])[0])
+            elif url.path == "/preview":
+                q = urllib.parse.parse_qs(url.query)
+                self._preview(*(q.get(k, [""])[0] for k in ("path", "start", "end")))
             else:
                 self._json({"error": "not found"}, 404)
 
@@ -150,10 +177,32 @@ def make_handler(state: State, port: int):
 
         def _media(self, raw: str) -> None:
             path = Path(raw).resolve()
-            # Only serve source videos of an opened index or project; this is not a general file server.
-            if not path.is_file() or (path not in state.media
-                                      and not default_index_dir(path).joinpath("meta.json").exists()):
+            if not state.allowed(path):
                 return self._json({"error": "not an indexed video"}, 403)
+            self._send_file(path, mimetypes.guess_type(path.name)[0] or "video/mp4")
+
+        def _preview(self, raw: str, start: str, end: str) -> None:
+            """The clip source[start:end] (file-local seconds) as WebM, transcoded once and cached on disk."""
+            path = Path(raw).resolve() if raw else None
+            if path is None or not state.allowed(path):
+                return self._json({"error": "not an indexed video"}, 403)
+            try:
+                s, e = span(start, end)
+            except ValueError as exc:
+                return self._json({"error": f"bad span: {exc}"}, 400)
+            out = preview_path(state.preview_dir(path), path, s, e)
+            with state.preview_lock(out.stem):
+                if not out.exists():
+                    try:
+                        with state.preview_slots:
+                            make_preview(path, s, e, out)
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        err = getattr(exc, "stderr", None)
+                        detail = (err if isinstance(err, str) and err.strip() else str(exc)).strip()
+                        return self._json({"error": f"preview failed: {detail[-500:]}"}, 500)
+            self._send_file(out, "video/webm")
+
+        def _send_file(self, path: Path, content_type: str) -> None:
             size = path.stat().st_size
             start, end = 0, size - 1
             rng = self.headers.get("Range")
@@ -171,7 +220,7 @@ def make_handler(state: State, port: int):
                     return
             length = end - start + 1
             self.send_response(206 if rng else 200)
-            self.send_header("Content-Type", mimetypes.guess_type(path.name)[0] or "video/mp4")
+            self.send_header("Content-Type", content_type)
             self.send_header("Accept-Ranges", "bytes")
             self.send_header("Content-Length", str(length))
             if rng:

@@ -20,9 +20,11 @@ says in `warnings` when it still falls short. A model that runs out of GPU memor
 warning, vhe.models.on_device) instead of failing the query."""
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import functools
 import re
+import threading
 import time
 from pathlib import Path
 
@@ -30,7 +32,7 @@ import numpy as np
 
 from vhe import results
 from vhe.corpus import Corpus, open_corpus
-from vhe.models import MODEL_LOCK, on_device, resolve_device
+from vhe.models import MODEL_LOCK, on_device, on_gpu_lost, resolve_device
 from vhe.query.candidates import corpus_candidates, peak_times
 from vhe.query.model import ParsedQuery
 from vhe.query.parser import parse_brief
@@ -45,6 +47,7 @@ from vhe.rank.items import combine
 from vhe.rank.scorer import Scorer, load_scorer
 from vhe.rank.select import disjoint, fill_budget, score_scale, select_for
 from vhe.rank.signals import muted_steps, relevance, timestep_signals
+from vhe.timing import Timings
 
 EMB_BLOCK = 1 << 16  # rows cast to float32 per matmul block
 
@@ -60,12 +63,15 @@ class Engine:
         self._encoder = None
         self._nc = None
         self._text_cache: dict[str, np.ndarray] = {}
+        self._nc_cache: dict[str, tuple[np.ndarray | None, list[list]]] = {}  # highlight-model output per query text
         self._contexts: dict[int, Context] = {}
+        self._tls = threading.local()  # the running clips() call's Timings (UI requests run in threads)
         self._emb = c.grid["emb"]  # stored dtype (float16 saves ~1 GB on a 40 h corpus); cast per block in _similarity
         self._logit = (float(c.meta["logit_scale"]), float(c.meta.get("logit_bias") or 0.0))
         self.load_seconds = 0.0
         self.scorer = load_scorer(scorer)
         self.warnings: list[str] = []  # e.g. a model moved to the CPU after a GPU out-of-memory error
+        on_gpu_lost(self._to_cpu)  # models handed to the LLM parse could not go back to the GPU (vhe.models)
 
     @classmethod
     def open(cls, path: Path | str, device: str = "auto", use_nc: bool = True,
@@ -105,14 +111,31 @@ class Engine:
     def _to_cpu(self, msg: str) -> None:
         self.warnings.append(msg)
         self.device, self._encoder, self._nc = "cpu", None, None
+        self._nc_cache.clear()
+
+    @contextlib.contextmanager
+    def _part(self, name: str):
+        """Time a model call as a part of the running clips() stage (Timings.add)."""
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            clock = getattr(self._tls, "clock", None)
+            if clock is not None:
+                clock.add(name, time.perf_counter() - t0)
 
     def _nc_scores(self, text: str) -> tuple[np.ndarray | None, list[list]]:
-        """Highlight-model saliency on the corpus grid (NaN for files without it) and proposals per file."""
+        """Highlight-model saliency on the corpus grid (NaN for files without it) and proposals per file; computed once
+        per query text (the model is deterministic, its window features are fixed), returned as copies."""
         c = self.corpus
         if not self.use_nc or not text:
             return None, [[] for _ in c.members]
-        with MODEL_LOCK:
-            return self._on_device("CG-DETR", lambda: self._nc_predict(text))
+        with self._part("highlight model"):
+            if text not in self._nc_cache:
+                with MODEL_LOCK:
+                    self._nc_cache[text] = self._on_device("CG-DETR", lambda: self._nc_predict(text))
+            sal, proposals = self._nc_cache[text]
+            return sal.copy(), [list(props) for props in proposals]
 
     def _nc_model(self):
         if self._nc is None:
@@ -140,7 +163,8 @@ class Engine:
     # ---- relevance and the engine's per-corpus caches ---------------------------------------------------------
     def _relevance(self, text: str) -> np.ndarray:
         c = self.corpus
-        return relevance(self._similarity(self.text_vector(text)), c.fps, self._logit, c.file_id)
+        with self._part("siglip"):
+            return relevance(self._similarity(self.text_vector(text)), c.fps, self._logit, c.file_id)
 
     def _relevances(self, texts: list[str]) -> np.ndarray:
         """(texts, steps) SigLIP relevance per text on the absolute scale. With one text this is text_vector's path,
@@ -148,8 +172,9 @@ class Engine:
         c = self.corpus
         if len(texts) == 1:
             return self._relevance(texts[0])[None]
-        sims = self._similarity(self.text_vectors(texts).T)
-        return np.stack([relevance(sims[:, k], c.fps, self._logit, c.file_id) for k in range(len(texts))])
+        with self._part("siglip"):
+            sims = self._similarity(self.text_vectors(texts).T)
+            return np.stack([relevance(sims[:, k], c.fps, self._logit, c.file_id) for k in range(len(texts))])
 
     def _similarity(self, v: np.ndarray) -> np.ndarray:
         """emb @ v in float32 (v: one vector, or (dim, k) for k texts), one block of rows at a time."""
@@ -229,23 +254,41 @@ class Engine:
         persona: who the edit is for (part of the query vector a learned scorer sees). dump: write every scored
         candidate there (vhe.rank.dump: the shortlist and the picks; with dump_all every gated candidate too).
         The result's `warnings` say what the edit could not deliver (a budget the footage cannot fill, a model that
-        fell back to the CPU)."""
+        fell back to the CPU); `timings` is the wall clock per stage (vhe.timing.Timings records; parts such as the
+        model calls inside a stage have "sub": True)."""
         load_before, warn_before = self.load_seconds, len(self.warnings)
         t0 = time.perf_counter()
+        clock = self._tls.clock = Timings()
+        try:
+            result = self._clips(clock, query, count, min_len, max_len, llm, budget_s, persona, dump, dump_all)
+        finally:
+            self._tls.clock = None
+        if self.load_seconds > load_before:  # inside the stages above (the first query loads the models)
+            clock.add("of which model load", self.load_seconds - load_before)
+        result["timings"] = clock.stages
+        return self._finish(result, t0, load_before, warn_before)
+
+    def _clips(self, clock: Timings, query: str, count: int | None, min_len: float | None, max_len: float | None,
+               llm: str | None, budget_s, persona: str | None, dump, dump_all: bool) -> dict:
         c = self.corpus
-        p = self.parse(query, llm, count=count, min_len=min_len, max_len=max_len, budget_s=budget_s)
+        with clock.stage("parse"):
+            p = self.parse(query, llm, count=count, min_len=min_len, max_len=max_len, budget_s=budget_s)
         if p.topics and not p.shots:  # "every moment the host talks about ...": transcript spans, not pictures
-            clips, n_spans, method = self._topic_clips(p, None if p.exhaustive else p.count,
-                                                       p.soundbite_len or (p.min_len, p.max_len), role=None)
+            with clock.stage("topics"):
+                clips, n_spans, method = self._topic_clips(p, None if p.exhaustive else p.count,
+                                                           p.soundbite_len or (p.min_len, p.max_len), role=None)
             result = {"query": p.to_dict(), "clips": clips, "candidates": n_spans, "files": len(c.members),
                       "noncommercial": [], "unusable_dropped": 0, "excluded_dropped": 0, "topic_match": method}
             if dump:
-                sig, _, proposals = self._signals(p)
-                dumps.write_run(dump, c, self.scorer, query, p, persona, sig, topic=clips,
-                                stats=self._pool_stats(sig, self._candidates(sig, p, proposals)[0], p))
-            return self._finish(result, t0, load_before, warn_before)
-        sig, nc_raw, proposals = self._signals(p)
-        cands, n_generated = self._candidates(sig, p, proposals)
+                with clock.stage("dump"):
+                    sig, _, proposals = self._signals(p)
+                    dumps.write_run(dump, c, self.scorer, query, p, persona, sig, topic=clips,
+                                    stats=self._pool_stats(sig, self._candidates(sig, p, proposals)[0], p))
+            return result
+        with clock.stage("signals"):
+            sig, nc_raw, proposals = self._signals(p)
+        with clock.stage("candidates"):
+            cands, n_generated = self._candidates(sig, p, proposals)
         S, E, K, src, allowed = cands
         result = {"query": p.to_dict(), "clips": [], "candidates": n_generated, "files": len(c.members),
                   "noncommercial": sorted({x for ix in c.members for x in ix.meta.get("noncommercial_components", [])})
@@ -254,63 +297,73 @@ class Engine:
         result["excluded_dropped"] = int(len(S) - allowed.sum())
         if not allowed.any():
             if dump:
-                dumps.write_run(dump, c, self.scorer, query, p, persona, sig)
+                with clock.stage("dump"):
+                    dumps.write_run(dump, c, self.scorer, query, p, persona, sig)
             result["warnings"] = ["no usable footage matches the brief after its exclusions"]
-            return self._finish(result, t0, load_before, warn_before)
+            return result
 
         bites = []
         if p.topics:  # "also the best 5-8 s soundbite where the host sums up": a separate deliverable, at the end
-            bites, _, result["topic_match"] = self._topic_clips(p, 1, p.soundbite_len or (p.min_len, p.max_len),
-                                                                role="soundbite")
+            with clock.stage("topics"):
+                bites, _, result["topic_match"] = self._topic_clips(p, 1, p.soundbite_len or (p.min_len, p.max_len),
+                                                                    role="soundbite")
         # Opener and closer first: they take their slots (and budget, as the soundbite does) before the body.
         edges: dict[str, dict] = {}
         bite_s = sum(b["duration"] for b in bites)
         room = np.inf if p.budget is None else p.budget[1] - bite_s
-        for role, text in (("opener", p.opener), ("closer", p.closer)):
-            hook = role == "opener" and p.hook  # "the first clip has to be the hook": the opener slot is a hook pool
-            if text or hook:
-                e = self._edge_clip(text, sig, cands, p, list(edges.values()), room, persona, hook=hook)
-                if e is not None:
-                    edges[role] = dict(e, text=(f"hook, {text}" if text else "hook") if hook else text)
-                    room -= e["end"] - e["start"]
+        with clock.stage("slots"):
+            for role, text in (("opener", p.opener), ("closer", p.closer)):
+                # "the first clip has to be the hook": the opener slot is a hook pool
+                hook = role == "opener" and p.hook
+                if text or hook:
+                    e = self._edge_clip(text, sig, cands, p, list(edges.values()), room, persona, hook=hook)
+                    if e is not None:
+                        edges[role] = dict(e, text=(f"hook, {text}" if text else "hook") if hook else text)
+                        room -= e["end"] - e["start"]
         used = sum(e["end"] - e["start"] for e in edges.values()) + bite_s
         body_p = dataclasses.replace(
             p, count=max(0, p.count - len(edges)),
             budget=None if p.budget is None else (max(0.0, p.budget[0] - used), p.budget[1] - used))
 
         trace: dict = {}  # the stage-1 pool: its scores set the brief's score scale, its statistics the features'
-        pool = self._pool(sig, p.weights, cands, p, max(400, 40 * p.count), persona, trace)
+        with clock.stage("shortlist"):
+            pool = self._pool(sig, p.weights, cands, p, max(400, 40 * p.count), persona, trace)
         for cid, o in enumerate(pool):
             o["cid"] = cid
         scored = [o for o in pool if disjoint(o, edges.values())]
-        if scored:
-            r0, r1 = c.steps(*(np.array([o[key] for o in scored]) for key in ("start", "end", "file")))
-            speech_cum = np.concatenate([[0.0], np.cumsum(sig["speech"])])
-            for o, f in zip(scored, (speech_cum[r1] - speech_cum[r0]) / (r1 - r0), strict=True):
-                o["speech_frac"] = float(f)
-            item_rel = np.array([o["item_rel"] for o in scored]) if sig["items"] is not None else None
-            taken = list(edges.values())
-            body = select_for(scored, self._mean_vectors(r0, r1), body_p, groups=np.array([o["file"] for o in scored]),
-                              item_rel=item_rel, item_centre=sig["item_centre"], taken=taken,
-                              taken_vectors=self._span_vectors(taken), scale=score_scale(trace["s"]))
-        else:
-            body = []
+        with clock.stage("select"):
+            if scored:
+                r0, r1 = c.steps(*(np.array([o[key] for o in scored]) for key in ("start", "end", "file")))
+                speech_cum = np.concatenate([[0.0], np.cumsum(sig["speech"])])
+                for o, f in zip(scored, (speech_cum[r1] - speech_cum[r0]) / (r1 - r0), strict=True):
+                    o["speech_frac"] = float(f)
+                item_rel = np.array([o["item_rel"] for o in scored]) if sig["items"] is not None else None
+                taken = list(edges.values())
+                body = select_for(scored, self._mean_vectors(r0, r1), body_p,
+                                  groups=np.array([o["file"] for o in scored]), item_rel=item_rel,
+                                  item_centre=sig["item_centre"], taken=taken,
+                                  taken_vectors=self._span_vectors(taken), scale=score_scale(trace["s"]))
+            else:
+                body = []
         if p.budget is not None:
-            body = fill_budget(body, list(edges.values()), p, c, self._context,
-                               lambda S, E, K: self._gate(S, E, K, p, sig), bite_s)
-            self._rescore_extended(body, sig, p, trace["stats"])
+            with clock.stage("budget fill"):
+                body = fill_budget(body, list(edges.values()), p, c, self._context,
+                                   lambda S, E, K: self._gate(S, E, K, p, sig), bite_s)
+                self._rescore_extended(body, sig, p, trace["stats"])
         # Edit order: files in manifest order (= virtual time), then time within the file; opener first, closer last.
         ordered = ([("opener", edges["opener"])] if "opener" in edges else []) + \
             [(None, o) for o in sorted(body, key=lambda o: o["start"])] + \
             ([("closer", edges["closer"])] if "closer" in edges else [])
-        for role, o in ordered:
-            result["clips"].append(results.clip(c, o, sig, p, role, self.scorer))
-        result["clips"] += bites
-        result["warnings"] = results.shortfall(result["clips"], p)
+        with clock.stage("results", items=len(ordered)):
+            for role, o in ordered:
+                result["clips"].append(results.clip(c, o, sig, p, role, self.scorer))
+            result["clips"] += bites
+            result["warnings"] = results.shortfall(result["clips"], p)
         if dump:
-            dumps.write_run(dump, c, self.scorer, query, p, persona, sig, pool, edges, body, bites,
-                            trace if dump_all else None, stats=trace["stats"])
-        return self._finish(result, t0, load_before, warn_before)
+            with clock.stage("dump"):
+                dumps.write_run(dump, c, self.scorer, query, p, persona, sig, pool, edges, body, bites,
+                                trace if dump_all else None, stats=trace["stats"])
+        return result
 
     def _candidates(self, sig: dict, p: ParsedQuery, proposals: list[list]) -> tuple[tuple, int]:
         """((S, E, K, src, allowed) of the usable candidates, number generated): candidates from the brief's per-step

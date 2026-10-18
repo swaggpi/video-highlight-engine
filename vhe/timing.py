@@ -5,7 +5,8 @@ from contextlib import contextmanager
 
 
 class Timings:
-    """Wall-clock per stage, with an optional item count for ms-per-item."""
+    """Wall-clock per stage, with an optional item count for ms-per-item. Stages are listed in the order they start.
+    A part ("sub": True, e.g. the model calls inside a stage) is reported indented and not added to the total."""
 
     def __init__(self) -> None:
         self.stages: list[dict] = []
@@ -14,11 +15,20 @@ class Timings:
     def stage(self, name: str, items: int | None = None):
         start = time.perf_counter()
         record = {"stage": name, "seconds": 0.0, "items": items}
+        self.stages.append(record)
         try:
             yield record
         finally:
             record["seconds"] = round(time.perf_counter() - start, 3)
-            self.stages.append(record)
+
+    def add(self, name: str, seconds: float, sub: bool = True) -> None:
+        """Add `seconds` to the part (or stage) `name`, created on first use."""
+        for s in self.stages:
+            if s["stage"] == name and bool(s.get("sub")) == sub:
+                s["seconds"] = round(s["seconds"] + seconds, 3)
+                return
+        record = {"stage": name, "seconds": round(seconds, 3), "items": None}
+        self.stages.append(record | {"sub": True} if sub else record)
 
     def report(self, video_seconds: float | None = None) -> str:
         return format_report(self.stages, video_seconds)
@@ -28,8 +38,11 @@ def format_report(stages: list[dict], video_seconds: float | None = None) -> str
     lines = [f"{'stage':<22}{'seconds':>9}{'ms/item':>10}"]
     total = 0.0
     for s in stages:
-        total += s["seconds"]
         per = f"{1000 * s['seconds'] / s['items']:.1f}" if s.get("items") else "-"
+        if s.get("sub"):
+            lines.append(f"{'  ' + s['stage']:<22}{s['seconds']:>9.2f}{per:>10}")
+            continue
+        total += s["seconds"]
         lines.append(f"{s['stage']:<22}{s['seconds']:>9.2f}{per:>10}")
     lines.append(f"{'total':<22}{total:>9.2f}")
     if video_seconds:

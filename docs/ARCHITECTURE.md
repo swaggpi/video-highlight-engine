@@ -18,7 +18,7 @@ cli, ui                                       entry points
 
 | module | job |
 |---|---|
-| `models.py` | process-wide model cache, `resolve_device`, `MODEL_LOCK`, `on_device` (CPU fallback after a GPU OOM) |
+| `models.py` | process-wide model cache, `resolve_device`, `MODEL_LOCK`, `on_device` (CPU fallback after a GPU OOM), `gpu_released` (the cached models' weights wait in host memory while the parser LLM runs, `on_gpu_lost` if they cannot return) |
 | `config.py` | index-time `Config` and calibrated thresholds; `CANDIDATE_LENGTHS` (candidate windows, scorer buckets) |
 | `pipeline.py`, `project.py` | index one video; index a folder incrementally into `<DIR>/.vhe/` |
 | `signals/*` | index-time signals: cuts, motion/shake, audio/VAD, transcript, SigLIP2 frames and tags, quality and the usable mask (`quality.reason_mask` decodes its reason bits), OCR, faces, CG-DETR |
@@ -31,7 +31,7 @@ cli, ui                                       entry points
 | `query/llm.py` | Ollama parse with a JSON schema, disk cache, grounding against the rules |
 | `query/text_match.py` | the one `STOPWORDS`, word tokens, squashing; shot-item words read on screen; legibility prior |
 | `query/exclusions.py` | hard-exclusion masks: SigLIP thresholds, camera defects, forbidden words on screen |
-| `query/topics.py` | spoken topics vs transcript sentences (bge-m3 embeddings or keywords) |
+| `query/topics.py` | spoken topics vs transcript sentences (bge-m3 embeddings, cached per text and model digest, or keywords) |
 | `query/candidates.py` | candidate spans per file (sub-shots, windows, peaks, proposals, utterances) |
 | `query/refine.py` | clip edges: whole sentences and words, clean frames, cuts |
 | `rank/signals.py` | per-step signals over the corpus grid (relevance scale, quality, energy, steadiness, muted), span statistics |
@@ -44,7 +44,9 @@ cli, ui                                       entry points
 | `rank/select.py` | selection: MMR, near-duplicates, item round robin, budgets, exhaustive lists, budget fill; `ScoreScale` (thresholds in pool spreads) |
 | `rank/dump.py` | candidate dumps (`vhe-candidates/1`) for training, and features for external spans |
 | `results.py` | the result clip dict (the scorer's total, signal summary, labels, reason from the scorer's contributions, transcript) and shortfall warnings |
-| `engine.py` | `Engine`: SigLIP / CG-DETR runtime and caches; `clips()` and `search()` orchestration |
+| `engine.py` | `Engine`: SigLIP / CG-DETR runtime and caches (SigLIP text vectors, highlight-model output per query text, refine contexts); `clips()` (with `timings` per stage) and `search()` orchestration |
+| `export/preview.py` | the UI's clip previews: a span transcoded to WebM (VP9 + Opus), cache key and path |
+| `ui/server.py` | local HTTP UI: JSON endpoints, `/media` (indexed sources, ranged), `/preview` (cached WebM of a span, same allow-list) |
 
 ## Data flow
 

@@ -45,8 +45,24 @@ $("indexBtn").onclick = async () => {
   }, 1000);
 };
 
+// Each clip plays from /preview: exactly its span, transcoded once on the server to WebM (VP9 + Opus), which any
+// modern browser decodes (the sources are H.264, which some Firefox builds cannot play). A preview is requested only
+// when its player comes near the viewport, so a long result list does not start every transcode at once; if the
+// preview fails, the player falls back to the source file (/media, seeked to the clip).
+const previewUrl = c => `/preview?path=${encodeURIComponent(c.path)}&start=${c.file_start}&end=${c.file_end}`;
+const mediaUrl = c => `/media?path=${encodeURIComponent(c.path)}#t=${c.file_start},${c.file_end}`;
+const lazy = "IntersectionObserver" in window ? new IntersectionObserver(entries => {
+  for (const e of entries) {
+    if (!e.isIntersecting) continue;
+    lazy.unobserve(e.target);
+    e.target.preload = "metadata";
+    e.target.src = e.target.dataset.src;
+  }
+}, {rootMargin: "200px"}) : null;
+
 function render(items, withExport) {
   current = items;
+  if (lazy) lazy.disconnect();
   $("results").innerHTML = "";
   items.forEach((c, i) => {
     const div = document.createElement("div");
@@ -67,7 +83,13 @@ function render(items, withExport) {
     const player = document.createElement("video");
     player.controls = true;
     player.preload = "none";
-    player.src = `/media?path=${encodeURIComponent(c.path)}#t=${c.file_start},${c.file_end}`;
+    player.dataset.src = previewUrl(c);
+    player.addEventListener("error", () => {
+      if (player.dataset.fallback) return;
+      player.dataset.fallback = "1";
+      player.src = mediaUrl(c);
+    });
+    if (lazy) lazy.observe(player); else player.src = player.dataset.src;
     div.append(row, player);
     $("results").appendChild(div);
   });

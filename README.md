@@ -54,6 +54,12 @@ vhe info footage/                   # project files and status (or a video's ind
 vhe ui                              # http://127.0.0.1:8765: folder or file, Index, brief, Find clips, Search, Export
 ```
 
+The UI plays each result from a preview of exactly its span, transcoded on first view to WebM (VP9 + Opus, 640 px
+wide; about 0.1 s per second of clip) and cached in the project's `.vhe/previews/`, so it plays in browsers without
+an H.264 decoder (some Firefox builds); this needs an ffmpeg with libvpx and libopus. `vhe clips` prints the time
+per stage (parse, signals, candidates, slots, shortlist, select, ...); spoken-topic embeddings are cached in
+`~/.cache/vhe/embed.sqlite`, parses in `~/.cache/vhe/parse/`.
+
 What a brief can say (English or German):
 
 - **Length and count**: a total runtime ("60-90 s recap") or per-clip lengths ("3-6 s each"), a count ("5 clips").
@@ -150,7 +156,8 @@ vhe/
   cli.py, ui/{server.py,index.html}    commands and the local web UI
   engine.py                            the query entry point: models, caches, clips() and search() orchestration
   results.py                           result clips (times, scores, labels, reason, transcript) and warnings
-  models.py                            model cache, device choice, inference lock, GPU out-of-memory fallback
+  models.py                            model cache, device choice, inference lock, GPU out-of-memory fallback,
+                                       lending the GPU memory to the parser LLM
   config.py, timing.py                 thresholds and Config; stage timings
   pipeline.py, project.py              index one video; index a folder incrementally (manifest)
   ingest/decode.py                     ffmpeg decode and probe
@@ -160,7 +167,7 @@ vhe/
   query/                               brief -> ParsedQuery (parser, rules, lexicon, llm, model) and what the
                                        brief matches (text_match, exclusions, topics); candidates, refine
   rank/                                brief_signals, gate, features, scorer, pool, select, items, signals, dump
-  export/clips.py                      preview cuts, CSV, EDL, rough cut
+  export/clips.py, export/preview.py   preview cuts, CSV, EDL, rough cut; the UI's WebM clip previews
 tools/train/                           learned ranker: build_dataset, train_linear, eval_rank, DATASET_CARD.md
 tests/                                 pytest; tests/data/heuristic_clips.json pins Engine.clips on synthetic cases
 docs/ARCHITECTURE.md                   module map, data flow, the learnable seam, the training loop

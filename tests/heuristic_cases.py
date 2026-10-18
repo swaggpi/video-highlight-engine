@@ -29,7 +29,7 @@ from vhe.engine import Engine
 from vhe.index.store import save_index
 from vhe.query import topics
 
-TIMING = ("seconds", "load_seconds")
+TIMING = ("seconds", "load_seconds", "timings")
 
 
 def _unit(v: np.ndarray) -> np.ndarray:
