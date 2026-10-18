@@ -13,6 +13,8 @@ from pathlib import Path
 
 import numpy as np
 
+from vhe.signals.quality import query_usable
+
 # 2: shake from tile-robust numpy phase correlation; 'obstruction'/'framing' scores and their usable-mask reasons.
 # 3: on-screen text (text_area, text_conf, ocr.json), faces (face_n, face_area_max, face_center), shot scale
 #    (scale_close, scale_wide) and approach.
@@ -51,6 +53,8 @@ class Index:
             raise ValueError(f"index version {self.meta.get('version')} != {INDEX_VERSION}; re-index the video")
         with np.load(self.root / "grid.npz") as g:
             self.grid = {k: g[k] for k in g.files}
+        if "usable" in self.grid and "unusable" in self.grid:  # the stored mask has every reason; apply the active
+            self.grid["usable"] = query_usable(self.grid["usable"], self.grid["unusable"])
         speech = self.root / "speech.json"
         self.transcript = json.loads(speech.read_text()) if speech.exists() else None
 
@@ -94,8 +98,8 @@ class Index:
 
     @property
     def usable(self) -> np.ndarray:
-        """bool per grid step: no absolute defect (signals/quality.usable_mask; the reasons are grid["unusable"],
-        decoded with quality.reason_names / reason_mask)."""
+        """bool per grid step: no absolute defect among the active reasons (signals/quality.usable_mask and
+        query_usable; the reasons are grid["unusable"], decoded with quality.reason_names / reason_mask)."""
         return self.grid["usable"].astype(bool)
 
     @functools.cached_property

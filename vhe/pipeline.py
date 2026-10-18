@@ -19,7 +19,7 @@ from vhe.signals.changes import change_points
 from vhe.signals.faces import approach
 from vhe.signals.frames import Encoder
 from vhe.signals.motion import motion_signals
-from vhe.signals.quality import frame_quality, usable_mask
+from vhe.signals.quality import frame_quality, query_usable, usable_mask
 from vhe.signals.shots import detect_cuts, frame_diffs
 from vhe.signals.tags import (
     LABELS,
@@ -130,7 +130,7 @@ def _build(video: Path, out: Path, cfg: Config, say, device: str, timings: Timin
         "logit_scale": scale, "logit_bias": bias, "labels": LABELS,
         "cuts": cuts, "change_points": cps, "vad": vad, "nc_highlight": None,
         "language": transcript["language"] if transcript else None,
-        "usable_fraction": round(float(grid["usable"].mean()), 4),
+        "usable_fraction": round(float(query_usable(grid["usable"], grid["unusable"]).mean()), 4),
         "noncommercial_components": [],
         "ocr": None if ocr is None else {k: v for k, v in ocr.items() if k != "items"},
         "faces": faces_meta,

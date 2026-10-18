@@ -1,12 +1,12 @@
 """Hard gates on candidate spans: what a clip may not contain, whatever its score. A span is dropped when too many
-of its grid steps are unusable (covered, blown, blurry, very shaky), muted where the brief needs live sound, showing
-an excluded item or camera defect, holding a forbidden word on screen, or (when the brief wants none) speech. The
-per-step masks come from the brief's signals (vhe.rank.brief_signals, vhe.query.exclusions)."""
+of its grid steps are unusable (covered, blown, blurry: config.ACTIVE_REASONS), muted where the brief needs live
+sound, showing an excluded item or camera defect, holding a forbidden word on screen, or (when the brief wants none)
+speech. The per-step masks come from the brief's signals (vhe.rank.brief_signals, vhe.query.exclusions)."""
 from __future__ import annotations
 
 import numpy as np
 
-MAX_UNUSABLE = 0.2  # candidates with more unusable steps (covered, blown, blurry, very shaky) are dropped, any mood
+MAX_UNUSABLE = 0.2  # candidates with more unusable steps (the active reasons: covered, blown, blurry) are dropped
 LIVE_MAX_MUTED = 0.1  # need_live_audio: clips with a larger muted (or audio-less) fraction are dropped
 EXCLUDE_MAX_FRAC = 0.1  # a clip with more of its steps showing an excluded item is dropped
 DEFECT_MAX_FRAC = 0.1  # ... or with more of its steps showing an excluded camera defect ("no whip-pans")

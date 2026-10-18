@@ -10,7 +10,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from vhe.query.candidates import sentence_spans
-from vhe.signals.quality import reason_mask
+from vhe.signals.quality import reason_active, reason_mask
 
 FRAME_GUARD = 0.04  # stay one frame clear of a cut
 # Clean edges: the first and last EDGE_STEPS grid steps (2 at 3 fps: 0.67 s) of a visual clip must be usable, not
@@ -62,9 +62,11 @@ class Context:
 
 def clean_steps(grid: dict) -> np.ndarray:
     """Per grid step: fit to start or end a visual clip on. Usable (not covered, black, blown, blurry, very shaky or
-    obstructed), not pointed at the ground or sky, and the camera not swinging (cam_speed, shake)."""
+    obstructed), not pointed at the ground or sky, and the camera not swinging (cam_speed, shake); each defect only
+    while its reason is active (config.ACTIVE_REASONS; shake goes with "shaky")."""
     ok = np.asarray(grid["usable"], dtype=bool) & ~reason_mask(grid["unusable"], "bad_framing")
-    for key, limit in (("cam_speed", EDGE_MAX_SPEED), ("shake", EDGE_MAX_SHAKE)):
+    limits = (("cam_speed", EDGE_MAX_SPEED),) + ((("shake", EDGE_MAX_SHAKE),) if reason_active("shaky") else ())
+    for key, limit in limits:
         ok &= np.nan_to_num(np.asarray(grid[key], dtype=float), nan=0.0) <= limit
     return ok
 

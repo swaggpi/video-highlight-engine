@@ -58,6 +58,14 @@ OBSTRUCTED_MARGIN = 0.5
 # be intended): camera at the ground or pointed straight up. At 1.0: precision 0.77, recall 0.84 (27/32); the false
 # positives are mostly whip-pan blur.
 BAD_FRAMING_MARGIN = 1.0
+# The usable-mask reasons the query side applies (vhe.signals.quality: query_usable, reason_mask, reason_active).
+# shaky, obstructed and bad_framing are off (2026-10-18): they model a physical handheld camera and rejected ~60 %
+# of a game livestream VOD (in-game camera turns read as shake, dark game scenes as a covered lens). Their bits are
+# still computed and stored at index time, so adding a reason back here needs no re-index. An inactive reason gates
+# no candidate, marks no clip edge unclean, costs no quality and answers no exclusion; with "shaky" off the shake
+# signal is no defect either (no quality penalty, no clean-edge limit, no exclusion). It still feeds the brief's
+# "steady" weight and nudges edges to the steadier frame nearby (refine._steadier), which are preferences.
+ACTIVE_REASONS = frozenset({"covered", "uniform", "blown_out", "blurry"})
 
 # On-screen text (signals/ocr.py, RapidOCR PP-OCRv4 on the 360 p analysis frames). Measured 2026-10-18 on irl-event
 # (dev set; festival-commons is held out): at the native 360 p detector size recall on the named floats, banners and

@@ -14,7 +14,7 @@ import numpy as np
 
 from vhe.config import BLOWN_FRAC
 from vhe.signals import robust_z, smooth
-from vhe.signals.quality import reason_mask
+from vhe.signals.quality import reason_active, reason_mask
 
 # log-odds -> relevance: odds of e^-8 (p ~ 3e-4) is 0, every REL_WIDTH nats one unit, clipped to +-3 like the
 # z-scored signals. SigLIP2 logits: unrelated frames ~ -15..-10, partial matches ~ -6..-2, clear matches > 0.
@@ -105,12 +105,12 @@ def muted_steps(loudness: np.ndarray, has_audio: np.ndarray) -> np.ndarray:
 
 def _quality_parts(grid: dict) -> dict[str, np.ndarray]:
     """The quality components per step: detail (pooled robust z of the log re-blur ratio, NaN where unmeasured),
-    blown highlights (0..1 of BLOWN_FRAC), shake above the pool's median (0..1 per 3 z) and the soft bad-framing
-    reason (0/1)."""
+    blown highlights (0..1 of BLOWN_FRAC), shake above the pool's median (0..1 per 3 z; 0 while the shaky reason is
+    inactive, config.ACTIVE_REASONS) and the soft bad-framing reason (0/1; 0 while inactive)."""
     r = np.asarray(grid["blur_ratio"], dtype=float)
     return {"detail": robust_z(np.log(np.where(np.isfinite(r) & (r > 0), r, np.nan))),
             "blown": np.clip(np.nan_to_num(np.asarray(grid.get("blown", 0.0), dtype=float)) / BLOWN_FRAC, 0, 1),
-            "shaky": np.clip(robust_z(grid["shake"]), 0, None) / 3,
+            "shaky": np.clip(robust_z(grid["shake"]), 0, None) / 3 if reason_active("shaky") else np.zeros(len(r)),
             "framing": reason_mask(grid["unusable"], "bad_framing").astype(float)}
 
 

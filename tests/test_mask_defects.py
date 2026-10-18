@@ -3,10 +3,13 @@ and framing margins (tags.defect_scores) with mocked embeddings."""
 import cv2
 import numpy as np
 
+from vhe import config
 from vhe.config import BAD_FRAMING_MARGIN, OBSTRUCTED_MARGIN, SHAKY
+from vhe.query.exclusions import defect_steps
+from vhe.query.refine import clean_steps
 from vhe.rank.signals import timestep_signals
 from vhe.signals.motion import motion_signals, phase_shift
-from vhe.signals.quality import reason_names, usable_mask
+from vhe.signals.quality import REASONS, query_usable, reason_mask, reason_names, usable_mask
 from vhe.signals.tags import (
     BAD_FRAMING_PROMPTS,
     OBSTRUCTED_PROMPTS,
@@ -122,16 +125,84 @@ def test_obstructed_is_hard_and_bad_framing_soft():
     assert usable5.all() and not bits5.any()
 
 
-def test_bad_framing_lowers_quality_only():
-    n = 40
-    rng = np.random.default_rng(6)
-    grid = {"t": np.arange(n) / 3.0, "blur_ratio": 15 + rng.random(n), "blown": np.zeros(n),
+def _signal_grid(n=40, seed=6):
+    rng = np.random.default_rng(seed)
+    return {"t": np.arange(n) / 3.0, "blur_ratio": 15 + rng.random(n), "blown": np.zeros(n),
             "shake": 0.05 * rng.random(n), "motion": rng.random(n), "cam_speed": rng.random(n),
             "loudness": rng.random(n), "onset": rng.random(n), "speech": np.zeros(n), "usable": np.ones(n, bool),
             "unusable": np.zeros(n, np.uint8)}
+
+
+def test_bad_framing_lowers_quality_only(monkeypatch):
+    monkeypatch.setattr(config, "ACTIVE_REASONS", frozenset(REASONS))  # the check is off by default
+    grid = _signal_grid()
     base = timestep_signals(grid, 3.0)
     grid["unusable"][10:20] = 1 << 6  # bad_framing
     framed = timestep_signals(grid, 3.0)
     assert np.all(framed["quality"][10:20] < base["quality"][10:20] - 0.5)
     assert np.array_equal(framed["quality"][:10], base["quality"][:10])
     assert np.array_equal(framed["energy"], base["energy"])
+
+
+def test_camera_defect_checks_are_off_by_default():
+    """shaky, obstructed and bad_framing are stored but not applied (config.ACTIVE_REASONS): no unusable step, no
+    quality penalty (also not from the shake signal), no unclean edge, no exclusion."""
+    assert config.ACTIVE_REASONS == {"covered", "uniform", "blown_out", "blurry"}
+    bit = {r: np.uint8(1 << i) for i, r in enumerate(REASONS)}
+    bits = np.array([0, bit["shaky"], bit["obstructed"], bit["bad_framing"], bit["shaky"] | bit["blurry"],
+                     bit["covered"], 0], np.uint8)
+    stored = np.array([True, False, False, True, False, False, False])  # last: unusable without a reason bit
+    assert query_usable(stored, bits).tolist() == [True, True, True, True, False, False, False]
+    assert not reason_mask(bits, "shaky", "obstructed", "bad_framing").any()
+    assert reason_mask(bits, "covered", "blurry").tolist() == [False] * 4 + [True, True, False]
+
+    grid = _signal_grid()
+    base = timestep_signals(grid, 3.0)
+    grid["shake"][10:20] = 5.0  # violent shake, flagged shaky and obstructed / framed badly at index time
+    grid["unusable"][10:20] = bit["shaky"] | bit["obstructed"] | bit["bad_framing"]
+    grid["usable"][10:20] = False
+    grid["usable"] = query_usable(grid["usable"], grid["unusable"])  # what Index loads
+    got = timestep_signals(grid, 3.0)
+    assert grid["usable"].all() and np.array_equal(got["quality"], base["quality"])
+    assert not got["framing"].any() and not got["unusable"].any()
+    grid["cam_speed"] = np.zeros(len(grid["t"]))
+    assert clean_steps(grid).all()
+    for kind in ("shaky", "blocked", "framing"):
+        assert not defect_steps(grid, kind).any(), kind
+
+
+def test_camera_defect_checks_apply_when_enabled(monkeypatch):
+    monkeypatch.setattr(config, "ACTIVE_REASONS", frozenset(REASONS))
+    bit = {r: np.uint8(1 << i) for i, r in enumerate(REASONS)}
+    bits = np.array([0, bit["shaky"], bit["obstructed"], bit["bad_framing"]], np.uint8)
+    stored = np.array([True, False, False, True])
+    assert np.array_equal(query_usable(stored, bits), stored)  # every reason active: the stored mask as is
+    grid = _signal_grid()
+    grid["cam_speed"] = np.zeros(len(grid["t"]))
+    grid["shake"][10:20] = 5.0
+    grid["unusable"][10:20] = bit["shaky"] | bit["obstructed"]
+    grid["unusable"][20:25] = bit["bad_framing"]
+    grid["usable"][10:20] = False
+    assert not clean_steps(grid)[10:25].any() and clean_steps(grid)[:10].all()
+    assert defect_steps(grid, "shaky")[10:20].all() and defect_steps(grid, "blocked")[10:20].all()
+    assert defect_steps(grid, "framing")[20:25].all()
+    clean = {**grid, "unusable": np.zeros(len(grid["t"]), np.uint8), "usable": np.ones(len(grid["t"]), bool)}
+    shaky, steady = timestep_signals(clean, 3.0), timestep_signals({**clean, "shake": _signal_grid()["shake"]}, 3.0)
+    assert np.all(shaky["quality"][10:20] < steady["quality"][10:20] - 0.3)  # the shake quality penalty (<= 0.6)
+
+
+def test_index_applies_active_reasons_at_load(tmp_path, monkeypatch):
+    """No re-index: the stored usable mask has every reason, Index applies the active ones when it loads."""
+    from vhe.index.store import Index, save_index
+
+    n = 6
+    bit = {r: 1 << i for i, r in enumerate(REASONS)}
+    unusable = np.array([0, bit["shaky"], bit["obstructed"], bit["covered"], bit["bad_framing"], 0], np.uint8)
+    usable = np.array([True, False, False, False, True, True])
+    save_index(tmp_path, {"fps": 3.0, "duration": 2.0, "cuts": []},
+               {"t": np.arange(n) / 3.0, "usable": usable, "unusable": unusable}, None)
+    assert Index(tmp_path).usable.tolist() == [True, True, True, False, True, True]
+    with np.load(tmp_path / "grid.npz") as g:
+        assert np.array_equal(g["usable"], usable)  # the file is not rewritten
+    monkeypatch.setattr(config, "ACTIVE_REASONS", frozenset(REASONS))
+    assert np.array_equal(Index(tmp_path).usable, usable)

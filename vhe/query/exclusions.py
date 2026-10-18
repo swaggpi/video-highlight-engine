@@ -11,7 +11,7 @@ import numpy as np
 
 from vhe.query.refine import EDGE_MAX_SHAKE
 from vhe.query.text_match import STOPWORDS, WORD, squash, word_tokens
-from vhe.signals.quality import reason_mask
+from vhe.signals.quality import reason_active, reason_mask
 
 # "no protest signs", "absolutely no sanitation trucks": a clip showing an excluded item is dropped, not penalised.
 # SigLIP relevance is not comparable across phrases (on the irl-event footage "empty street" has a corpus median of
@@ -47,14 +47,16 @@ def defect_kind(item: str) -> str | None:
 
 
 def defect_steps(grid: dict, kind: str) -> np.ndarray:
-    """bool per grid step where the camera defect `kind` shows (from the usable-mask reasons and motion)."""
+    """bool per grid step where the camera defect `kind` shows (from the usable-mask reasons and motion). A defect
+    whose reasons are inactive (config.ACTIVE_REASONS) shows nowhere."""
     def above(key: str, limit: float) -> np.ndarray:
         return np.nan_to_num(np.asarray(grid[key], dtype=float), nan=0.0) > limit
 
     if kind == "whip":
         return above("cam_speed", WHIP_SPEED)
     if kind == "shaky":
-        return reason_mask(grid["unusable"], "shaky") | above("shake", EDGE_MAX_SHAKE)
+        shaky = reason_mask(grid["unusable"], "shaky")
+        return shaky | above("shake", EDGE_MAX_SHAKE) if reason_active("shaky") else shaky
     if kind == "blocked":
         return reason_mask(grid["unusable"], "covered", "uniform", "obstructed")
     return reason_mask(grid["unusable"], "bad_framing")

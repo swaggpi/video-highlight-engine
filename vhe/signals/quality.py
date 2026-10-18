@@ -8,6 +8,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from vhe import config
 from vhe.config import (
     BAD_FRAMING_MARGIN,
     BLOWN_FRAC,
@@ -21,6 +22,7 @@ from vhe.config import (
 
 # Bit i of grid["unusable"] set = reason REASONS[i] applies at that step. New reasons are appended, so older indexes
 # decode the same. SOFT reasons are recorded but do not make a step unusable (vhe.rank.signals lowers quality instead).
+# The index stores every reason; the query side applies only config.ACTIVE_REASONS (query_usable, reason_mask).
 REASONS = ("covered", "uniform", "blown_out", "blurry", "shaky", "obstructed", "bad_framing")
 SOFT = ("bad_framing",)
 SOFT_BITS = sum(1 << REASONS.index(r) for r in SOFT)
@@ -83,6 +85,25 @@ def reason_names(bits: int) -> list[str]:
     return [r for i, r in enumerate(REASONS) if int(bits) >> i & 1]
 
 
+def reason_active(name: str) -> bool:
+    """Whether the query side applies reason `name` (config.ACTIVE_REASONS, read at call time)."""
+    return name in config.ACTIVE_REASONS
+
+
+def _bits_of(names) -> np.uint8:
+    return np.uint8(sum(1 << REASONS.index(r) for r in names))
+
+
 def reason_mask(bits: np.ndarray, *names: str) -> np.ndarray:
-    """bool per step: any of the named REASONS set in `bits` (grid["unusable"])."""
-    return (np.asarray(bits, dtype=np.uint8) & np.uint8(sum(1 << REASONS.index(r) for r in names))) > 0
+    """bool per step: any of the named REASONS set in `bits` (grid["unusable"]); inactive reasons never show."""
+    return (np.asarray(bits, dtype=np.uint8) & _bits_of(r for r in names if reason_active(r))) > 0
+
+
+def query_usable(usable: np.ndarray, bits: np.ndarray) -> np.ndarray:
+    """The stored usable mask as the query side applies it: steps made unusable only by inactive reasons are usable
+    again. With every reason active it is `usable` unchanged; a step marked unusable without any reason bit (or by
+    an active one) stays unusable."""
+    bits = np.asarray(bits, dtype=np.uint8)
+    hard = _bits_of(r for r in REASONS if r not in SOFT)
+    active = _bits_of(r for r in REASONS if r not in SOFT and reason_active(r))
+    return np.asarray(usable, dtype=bool) | (((bits & hard) != 0) & ((bits & active) == 0))
