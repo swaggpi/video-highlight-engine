@@ -7,11 +7,14 @@ clips are whole sentences, "leave out X" is a hard gate, a short budget is repor
 parsed query of every case gained the five visual-cue keys at their defaults, every clip and every other key stayed
 identical; the cue_* cases were appended), and for the r3 speech padding (only the speech-index cases topics,
 speaks_every and soundbite moved: speech-clip edges sit SPEECH_LEAD before the first and SPEECH_TAIL after the last
-word, in the pause; every other case stayed identical): any other change to it is a regression. The cases cover the
-paths the hand-weighted total runs through: length buckets, cut and length priors, the speech bonus, the usable and
-live-sound gates, opener/closer pools, shot lists (per-item pool extras, round robin, exhaustive per-item), avoid
-items, spoken topics, the non-commercial saliency blend (mocked: NaN on one file), and the visual cues (close / wide
-framing, faces, centring, the hook slot, readable text) on index v3 signals. The module-layout pass (vhe/query,
+word, in the pause; every other case stayed identical), and for features v3 (the scorer seam made a drop-in: the
+final total scores the refined span itself, length-bucket centring by per-signal medians, the clean-edge term,
+legibility / highlight / OCR bonuses composed by the heuristic, the merged stopword list, pool-relative selection
+units; dogs_every appended): any other change to it is a regression. The cases cover the paths the hand-weighted
+total runs through: length buckets, cut and length priors, the speech bonus, the usable and live-sound gates,
+opener/closer pools, shot lists (per-item pool extras, round robin, exhaustive per-item), a visual "every X" list,
+avoid items, spoken topics, the non-commercial saliency blend (mocked: NaN on one file), and the visual cues (close /
+wide framing, faces, centring, the hook slot, readable text) on index v3 signals. The module-layout pass (vhe/query,
 vhe/rank split into one module per job) kept it byte-identical."""
 from __future__ import annotations
 
@@ -183,6 +186,8 @@ def cases(tmp: Path):
                                        ("dogs.mp4", 40.0, {"emb": on})])
     yield "dogs", _engine(root, {"dogs": dogs}), "3 clips of dogs", {}
     yield "dogs_nc", _engine(root, {"dogs": dogs}, _nc_mock(11, absent=0)), "3 clips of dogs", {}
+    # a visual "every X" list (strong_matches: the score margin and floor, in the pool's spreads; added for v3)
+    yield "dogs_every", _engine(root, {"dogs": dogs}), "every shot of dogs", {}
 
     n = int(90 * FPS)
     loud, usable, motion = np.full(n, 0.1), np.ones(n, bool), np.full(n, 0.1)
@@ -254,11 +259,17 @@ def strip(res: dict, tmp: Path) -> dict:
     return out
 
 
-def run_all(tmp: Path, **clips_kw) -> dict:
-    """{case name: Engine.clips result without timings}; rules parser, keyword topic matching (no servers)."""
+def run_all(tmp: Path, scorer=None, **clips_kw) -> dict:
+    """{case name: Engine.clips result without timings}; rules parser, keyword topic matching (no servers). scorer:
+    rank every case with this Scorer instead of the engine's default (the heuristic)."""
     embed = topics.embed
     topics.embed = lambda texts, **kw: None
+    out = {}
     try:
-        return {name: strip(eng.clips(query, llm=None, **kw, **clips_kw), tmp) for name, eng, query, kw in cases(tmp)}
+        for name, eng, query, kw in cases(tmp):
+            if scorer is not None:
+                eng.scorer = scorer
+            out[name] = strip(eng.clips(query, llm=None, **kw, **clips_kw), tmp)
+        return out
     finally:
         topics.embed = embed

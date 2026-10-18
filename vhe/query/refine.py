@@ -230,9 +230,23 @@ def edges_clean(s: float, e: float, ctx: Context) -> bool:
     """True if a clip s..e starts and ends on clean steps (always True when the context has no clean mask)."""
     if ctx.clean is None or not len(ctx.clean):
         return True
-    i0 = min(int(np.floor(s * ctx.fps + 1e-6)), len(ctx.clean) - 1)
-    i1 = max(int(np.ceil(e * ctx.fps - 1e-6)), i0 + 1)
-    return _edge_ok(ctx, i0) and _edge_ok(ctx, min(i1, len(ctx.clean)), end=True)
+    return bool(spans_edges_clean(ctx.clean, np.zeros(1, int), np.array([len(ctx.clean)]), np.array([s]),
+                                  np.array([e]), ctx.fps)[0])
+
+
+def spans_edges_clean(clean: np.ndarray, lo: np.ndarray, n: np.ndarray, s: np.ndarray, e: np.ndarray,
+                      fps: float) -> np.ndarray:
+    """edges_clean for many clips at once: clip j spans s[j]..e[j] seconds of a file whose clean mask is
+    clean[lo[j]:lo[j] + n[j]] (several files' masks concatenated, as a corpus grid)."""
+    i0 = np.minimum(np.floor(np.asarray(s) * fps + 1e-6).astype(int), n - 1)
+    j = np.minimum(np.maximum(np.ceil(np.asarray(e) * fps - 1e-6).astype(int), i0 + 1), n)
+    cum = np.concatenate([[0], np.cumsum(np.asarray(clean, dtype=np.int64))])
+
+    def ok(a, b):  # _edge_ok: steps a..b inside the file, all clean
+        inside = (a >= 0) & (b <= n)
+        return inside & (cum[lo + np.clip(b, 0, n)] - cum[lo + np.clip(a, 0, n)] == b - a)
+
+    return ok(i0, i0 + EDGE_STEPS) & ok(j - EDGE_STEPS, j)
 
 
 def trim_edges(s: float, e: float, ctx: Context, min_len: float, max_len: float) -> tuple[float, float]:

@@ -1,4 +1,4 @@
-# Dataset card: vhe ranking rows (features v2)
+# Dataset card: vhe ranking rows (features v3)
 
 Training data for the learned candidate scorer (`vhe/rank/scorer.py`, `LinearRankScorer`). Built outside this
 repository by the field-test harness (`vhe-field-test/eval/`), consumed by `tools/train/`. Not shipped with the
@@ -7,9 +7,10 @@ package.
 ## How a row comes about
 
 1. `app_pick.py` runs `vhe clips <footage> <brief> --persona <id> --dump-candidates <run>/app/<brief>.cands.json`.
-   The dump (`vhe-candidates/1`, `vhe/rank/dump.py`) holds every scored candidate of the run: the selected clips and
-   the unselected shortlist pool (refined edges), opener/closer picks, spoken-topic clips; with `--dump-all` also
-   every gated candidate before refinement.
+   The dump (`vhe-candidates/1`, `vhe/rank/dump.py`) holds every scored candidate of the run: the selected clips (as
+   returned: a clip the budget fill lengthened has its final edges and features) and the unselected shortlist pool
+   (refined edges), opener/closer picks, spoken-topic clips; with `--dump-all` also every gated candidate before
+   refinement.
 2. `opus_pick.py` asks Claude Opus for its own clip selection for the same brief (an independent baseline).
 3. `judge.py` shows both selections, shuffled and anonymised (K01..Knn), to a model judge, which scores every clip
    (fit 0-3, usable 0-2, redundant_with) and prefers one of the two sets.
@@ -24,21 +25,21 @@ package.
 |---|---|
 | `row_id` | `set/run_id/brief_id/origin/index` |
 | `set`, `run_id`, `brief_id` | the query: rows are only ever compared within one (set, run, brief) |
-| `persona`, `brief_kind`, `brief_text`, `parsed`, `q` | who the edit is for, `"reject"` briefs, the brief, the app's parse of it (with the visual cues framing, want_faces, hook, legible_text, centered), the query vector (`query_names()`, v2: v1 plus the cue entries before the personas) |
+| `persona`, `brief_kind`, `brief_text`, `parsed`, `q` | who the edit is for, `"reject"` briefs, the brief, the app's parse of it (with the visual cues framing, want_faces, hook, legible_text, centered), the query vector (`query_names()`, v3: v1, the v2 cue entries and the v3 `highlight` flag, then the personas) |
 | `file`, `start`, `end` | the span, file-local seconds (3 dp) |
 | `source`, `stage` | candidate generator (`window`, `peak`, ..., `external`) and dump stage |
 | `origin` | `app_dump` (the app's own dump), `app_picks` (app picks featurised afterwards), `opus` |
 | `selected_by` | `app`, `opus` or `none` (an unselected pool row) |
 | `app_rank`, `role` | selection order / opener-closer-soundbite in the app's run |
-| `dump_score` | the score recorded with the features (the run's scorer; for `external` rows: `score()` over that file's spans only) |
-| `f_<name>` | the 82 features v2 (`vhe/rank/features.py: FEATURES`): the 71 of v1, then the 11 index v3 columns `FEATURES_V2` (shot scale, faces, approach, OCR text, `ocr_item_match`) |
+| `dump_score` | the score recorded with the features: the run's scorer on the row's own features and `q` (`score()` for stage-1 `candidate` rows, the final total for every other row, `external` ones included; topic rows: the transcript match) |
+| `f_<name>` | the 95 features v3 (`vhe/rank/features.py: FEATURES`): the 71 of v1, the 11 index v3 columns `FEATURES_V2` (shot scale, faces, approach, OCR text, `ocr_item_match`), then the 13 `FEATURES_V3` (`edges_clean`, `legibility_mean`, `highlight_prior_mean`, `detail_z_mean`, `framing_frac`, and the `bucket_*` pool statistics of the brief's stage-1 candidates for the span's length bucket). Raw signals only: `h_rel_*` hold no legibility bonus or highlight blend since v3 |
 | `judge_clip`, `label_iou` | the judged clip the label came from, and the overlap (1.0 for an exact match) |
 | `judge_fit`, `judge_usable`, `judge_redundant` | the judge's clip scores; redundant = repeats an earlier clip of the same system's set |
 | `set_pref`, `set_margin` | +1 / -1 if the judge preferred / rejected the set this row was selected into; margin slight/clear/strong/forfeit |
 | `label_kind` | `judged`, `label_transfer`, `pool_negative`, `unjudged` |
 | `y_point`, `weight` | the target and row weight (below) |
 | `split` | `heldout` for set `festival-commons`, else `train` |
-| `feature_version`, `scorer_at_dump`, `app_sha` | provenance; rows of another feature version (v1 rows included: retrain on v2 dumps) are refused by `build_dataset.py` |
+| `feature_version`, `scorer_at_dump`, `app_sha` | provenance; rows of another feature version (v1 and v2 rows included: re-featurise the judged picks with `vhe features` or retrain on v3 dumps) are refused by `build_dataset.py` |
 
 ## Labels
 
@@ -54,8 +55,8 @@ package.
 
 Training pairs: labelled rows of one query whose y differ by >= 1/3 (weight = the smaller row weight), plus the
 pool pairs above. Learned features drop `src_*` (external spans have no generator source, so the column would tell
-the model who picked a clip) and `h_rel_*` (the hand-weighted relevance, kept only so the heuristic is an exact
-function of the features); the mask travels in the model file.
+the model who picked a clip) and `h_rel_*` (the per-step blend of SigLIP and nc saliency the heuristic reads; a
+learned model sees the parts); the mask travels in the model file.
 
 ## Splits
 
@@ -76,9 +77,12 @@ function of the features); the mask travels in the model file.
 - **Few, correlated sources.** Each footage set is one shoot by one person (irl-event: one handheld livestream;
   festival-commons: one uploader's phone), so camera, location and style are shared by every row of a set. Briefs
   were written for the set by one author; two runs of the same brief are not independent (folds are by brief).
-- **Small.** Tens of briefs, hundreds of labelled rows: the 492-weight interaction model (`phi = [z, outer(z,
-  q_small)]`: 82 features x (1 + 5 signal weights)) can overfit; CV picks the L2 and `--no-interactions` fits 82
+- **Small.** Tens of briefs, hundreds of labelled rows: the 570-weight interaction model (`phi = [z, outer(z,
+  q_small)]`: 95 features x (1 + 5 signal weights)) can overfit; CV picks the L2 and `--no-interactions` fits 95
   weights.
+- **Source-shaped columns.** `edges_clean` is 1 by definition for app speech clips (they end in word gaps) and
+  measured for external spans; `bucket_*` are statistics of the brief's stage-1 pool, identical for every row of a
+  query in the same length bucket (they only matter across lengths and briefs).
 - **Parse noise.** The brief is parsed by a local LLM; app and Opus rows of one brief can carry different `q` if the
   parse differs between calls (`eval_rank.py` reports how many queries are affected).
 - **Code-version mix.** `vhe features` should run the same app code as the run; for runs whose app snapshot predates

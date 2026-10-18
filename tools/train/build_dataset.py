@@ -7,8 +7,8 @@ dependency).
 A row is one span under one query (set, run_id, brief_id) with its feature vector (f_<name>, FEATURE_VERSION), its query
 vector (q: {name: value}), the judge label (y_point, label_kind, weight) and bookkeeping (origin, selected_by,
 dump_score). The learned feature mask drops src_* (external spans, e.g. Opus picks, have no generator source, so the
-column would encode who picked the clip) and h_rel_* (the hand-weighted relevance, kept only so HeuristicScorer is an
-exact function of X) unless --keep-all-features.
+column would encode who picked the clip) and h_rel_* (the blended relevance HeuristicScorer reads; a learned model
+sees its parts, rel_* and nc_sal_*) unless --keep-all-features. Rows of another feature version (v1, v2) are refused.
 """
 from __future__ import annotations
 

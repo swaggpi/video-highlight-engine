@@ -36,14 +36,14 @@ cli, ui                                       entry points
 | `query/refine.py` | clip edges: whole sentences and words, clean frames, cuts |
 | `rank/signals.py` | per-step signals over the corpus grid (relevance scale, quality, energy, steadiness, muted), span statistics |
 | `rank/brief_signals.py` | a brief -> its per-step signal dict (item relevance, avoid penalty, nc saliency, cue bonus, highlight prior, exclusion masks) |
-| `rank/items.py` | shot-list relevance: combine with avoid, which item a span serves |
+| `rank/items.py` | shot-list relevance: combine with avoid, item evidence (SigLIP + names read on screen), which item a span serves |
 | `rank/gate.py` | the hard gates (unusable, muted, excluded, defects, forbidden text, speech) |
-| `rank/features.py` | `featurize` (82 columns, `FEATURE_VERSION` v2) and `query_vector` (`QUERY_VERSION` v2) |
-| `rank/scorer.py` | the `Scorer` protocol, `HeuristicScorer`, `LinearRankScorer`, `load_scorer` |
+| `rank/features.py` | `featurize` (95 raw columns, `FEATURE_VERSION` v3), `item_features` (per shot item), `pool_stats` (length-bucket statistics), `query_vector` (`QUERY_VERSION` v3) |
+| `rank/scorer.py` | the `Scorer` protocol, `HeuristicScorer` (every hand-set weight and bonus), `LinearRankScorer`, `load_scorer` |
 | `rank/pool.py` | stage 1/2 shortlist, the opener/closer/hook slot pools, spoken-topic picks |
-| `rank/select.py` | selection: MMR, near-duplicates, item round robin, budgets, exhaustive lists, budget fill |
+| `rank/select.py` | selection: MMR, near-duplicates, item round robin, budgets, exhaustive lists, budget fill; `ScoreScale` (thresholds in pool spreads) |
 | `rank/dump.py` | candidate dumps (`vhe-candidates/1`) for training, and features for external spans |
-| `results.py` | the result clip dict (scores, labels, reason, transcript) and shortfall warnings |
+| `results.py` | the result clip dict (the scorer's total, signal summary, labels, reason from the scorer's contributions, transcript) and shortfall warnings |
 | `engine.py` | `Engine`: SigLIP / CG-DETR runtime and caches; `clips()` and `search()` orchestration |
 
 ## Data flow
@@ -56,29 +56,56 @@ Query time (`Engine.clips`):
 
 1. `parse_brief` -> `ParsedQuery` (weights, lengths, budget, count, plan lists, visual cues).
 2. `brief_signals` -> per-step signals: corpus signals plus SigLIP relevance per shot item (absolute log-odds
-   scale), the avoid penalty, the nc saliency, the cue bonus and the exclusion masks.
+   scale), the avoid penalty, the nc saliency, legibility, the highlight prior, the clean-edge mask, the cue bonus and
+   the exclusion masks; `relevance`, the per-step curve candidate peaks follow, is composed with the heuristic's
+   constants (no scorer reads it).
 3. `corpus_candidates` -> spans per file; `gate` drops unusable / muted spans, then the forbidden ones.
-4. `pool.shortlist`: `featurize` -> `Scorer.score` on every candidate; refine the best; gate, featurise and
-   `Scorer.rescore` the refined spans. The opener/closer/hook slots run the same on their own relevance and weights.
-5. `select_for` (+ `fill_budget`) on the shortlist; edit order; `results.clip` per pick; `results.shortfall`.
-6. Optionally `dump.write_run`: every scored candidate with its features, score and selection.
+4. `pool.shortlist`: `featurize` -> `pool_stats` -> `Scorer.score` on every candidate (with a shot list also
+   `Scorer.score_items` for each item's own best); refine the best; gate, featurise (with the stage-1 pool
+   statistics) and `Scorer.rescore` the refined spans, `Scorer.score_items` per item. The opener/closer/hook slots run
+   the same on their own relevance and weights.
+5. `select_for` on the shortlist with the brief's `ScoreScale` (stage-1 scores); `fill_budget`, and lengthened clips
+   featurised and rescored as returned; edit order; `results.clip` per pick; `results.shortfall`.
+6. Optionally `dump.write_run`: every scored candidate with its features, score and selection; a selected row is the
+   clip as returned.
 
 Spoken-topic briefs skip 2-5 for transcript sentences (`pool.topic_picks`).
 
 ## The learnable seam
 
-`featurize(corpus, sig, spans) -> X (n, 82)` and `query_vector(p, persona) -> q (30 with the six default personas)`
-are the only inputs of a scorer. A `Scorer` has `name`, `feature_version`, `personas`, `score(X, q)` (shortlist) and
-`rescore(s, X_pre, X_post, q)` (final totals after refinement). Selection only sees the totals, so a scorer changes
-the ranking without touching gates, edges or selection rules.
+`featurize(corpus, sig, spans) -> X (n, 95)` and `query_vector(p, persona) -> q (31 with the six default personas)`
+are the only inputs of a scorer. A `Scorer` has `name`, `feature_version`, `personas`, `score(X, q)` (shortlist),
+`rescore(s, X_pre, X_post, q)` (final totals after refinement) and `score_items(X_items, q, final)` (each span's
+score per shot item, from `item_features`: the same spans as if the brief named that item alone); optionally
+`explain(X, q, final)` (contributions summing to the score; the clip's `reason`). A clip's `score` is the scorer's
+total.
 
-- `HeuristicScorer` is the hand-weighted total, an exact function of X (it reads the `h_rel_*` columns);
-  `tests/data/heuristic_clips.json` pins its output.
+Features carry raw signals; every hand-set weight, bonus and penalty is in `HeuristicScorer` (legibility, the
+highlight-prior blend, on-screen names, cue bonuses, unclean edges, length and cut priors). The one pool statistic is
+`pool_stats`: per candidate-length bucket, its size and the medians of a few signal means over the brief's stage-1
+candidates (`bucket_*` columns), attached to any span by its length, so every scorer is a function of a span's row.
+
+Selection never reads a score's absolute value: the exhaustive floor and margin and the MMR penalty are in units of
+the brief's `ScoreScale` (median and robust spread of its stage-1 scores; constants calibrated so one spread is two
+heuristic units, `select.HEURISTIC_SCALE`). Any scorer that is an increasing affine function of another picks the
+same clips (`tests/test_rank.py`: the pinned cases with the heuristic x7 + 100 and x0.2 - 5), and the exhaustive floor
+never empties a list that has matches. Which item a span serves and the exhaustive relevance gates are
+scorer-independent matching (SigLIP item relevance plus names read on screen, `items.evidence`).
+
+- `HeuristicScorer` is the hand-weighted total, an exact function of each row (it reads `h_rel_*`, the per-step blend
+  of SigLIP and nc saliency, and the `bucket_*` columns); `tests/data/heuristic_clips.json` pins its output. A dumped
+  row's score is the scorer on that row's features (score() for stage-1 candidates, the final total otherwise).
 - `LinearRankScorer` (`vhe-linear-rank/1` JSON: mu, sd, w over `[z, outer(z, q_small)]`, a feature mask) is the
-  first learned model; `vhe clips --scorer models/<name>.json`. A model of another feature or query version is
-  refused.
+  first learned model; `vhe clips --scorer models/<name>.json`. A model of another feature or query version (v1, v2)
+  is refused.
 - A fine-tuned model plugs in the same way: implement the protocol (e.g. a GBDT or a small MLP over X and q) and add
   its file format to `load_scorer`. Learned models should not read `h_rel_*` or `src_*` (masked in training).
+
+Feature v3 (2026-10-18) after v2's 82 columns (unchanged order): `edges_clean`, `legibility_mean`,
+`highlight_prior_mean`, `detail_z_mean`, `framing_frac`, `bucket_size`, `bucket_h_rel`, `bucket_quality`,
+`bucket_energy`, `bucket_steady`, `bucket_speech`, `bucket_legibility`, `bucket_highlight`; `h_rel_*` lost the
+legibility bonus and the highlight blend (now composed by the heuristic), `ocr_item_match` has the one OCR ignore
+rule. Query v3 appends `highlight` before the persona one-hot.
 - An owned highlight head replaces the non-commercial CG-DETR saliency in its slot: `Engine._nc_scores(text)` returns
   per-step saliency on the corpus grid (NaN where a file has none) and proposals per file; `brief_signals` z-scores it
   into `nc_sal`, which feeds `nc_sal_mean`, `nc_sal_top60`, `nc_present` and the heuristic's blend. A head with

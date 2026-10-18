@@ -103,16 +103,22 @@ def muted_steps(loudness: np.ndarray, has_audio: np.ndarray) -> np.ndarray:
     return ~np.asarray(has_audio, dtype=bool) | (loud < LIVE_MIN_DB)
 
 
-def _quality(grid: dict, usable: np.ndarray) -> np.ndarray:
+def _quality_parts(grid: dict) -> dict[str, np.ndarray]:
+    """The quality components per step: detail (pooled robust z of the log re-blur ratio, NaN where unmeasured),
+    blown highlights (0..1 of BLOWN_FRAC), shake above the pool's median (0..1 per 3 z) and the soft bad-framing
+    reason (0/1)."""
+    r = np.asarray(grid["blur_ratio"], dtype=float)
+    return {"detail": robust_z(np.log(np.where(np.isfinite(r) & (r > 0), r, np.nan))),
+            "blown": np.clip(np.nan_to_num(np.asarray(grid.get("blown", 0.0), dtype=float)) / BLOWN_FRAC, 0, 1),
+            "shaky": np.clip(robust_z(grid["shake"]), 0, None) / 3,
+            "framing": reason_mask(grid["unusable"], "bad_framing").astype(float)}
+
+
+def _quality(parts: dict[str, np.ndarray], usable: np.ndarray) -> np.ndarray:
     """Technical quality from defects only: detail (content-invariant re-blur ratio), blown highlights, shake, and
     the soft bad-framing reason (camera at the ground or straight up). Mean brightness is not used: a dark concert is
     not bad footage. Unusable steps get the floor."""
-    r = np.asarray(grid["blur_ratio"], dtype=float)
-    detail = robust_z(np.log(np.where(np.isfinite(r) & (r > 0), r, np.nan)))
-    blown = np.clip(np.nan_to_num(np.asarray(grid.get("blown", 0.0), dtype=float)) / BLOWN_FRAC, 0, 1)
-    shaky = np.clip(robust_z(grid["shake"]), 0, None) / 3
-    framing = reason_mask(grid["unusable"], "bad_framing")
-    q = 0.6 * detail - 1.5 * blown - 0.6 * shaky - FRAMING_PENALTY * framing
+    q = 0.6 * parts["detail"] - 1.5 * parts["blown"] - 0.6 * parts["shaky"] - FRAMING_PENALTY * parts["framing"]
     return np.where(usable, np.clip(q, -3, 3), -3.0)
 
 
@@ -140,12 +146,15 @@ def timestep_signals(grid: dict, fps: float, rel: np.ndarray | None = None, has_
                      file_id: np.ndarray | None = None) -> dict[str, np.ndarray]:
     """Signals per grid step. rel: from relevance() (zeros without a content query). has_audio: per step or one
     flag. file_id: per step, for per-file loudness centring and smoothing; None = one file. Besides the five
-    weighted signals: the energy components, and per-step audio, unusable and blown-pixel fractions (features)."""
+    weighted signals: the energy components, the quality components detail_z (0 where unmeasured) and framing (the
+    soft bad-framing reason), and per-step audio, unusable and blown-pixel fractions (features)."""
     n = len(grid["t"])
     audio = np.broadcast_to(np.asarray(has_audio, dtype=bool), (n,))
     usable = np.asarray(grid["usable"], dtype=bool)
     parts = _energy_parts(grid, audio, file_id)
-    return {"relevance": np.zeros(n) if rel is None else rel, "quality": _quality(grid, usable),
+    qparts = _quality_parts(grid)
+    return {"relevance": np.zeros(n) if rel is None else rel, "quality": _quality(qparts, usable),
+            "detail_z": np.nan_to_num(qparts["detail"]), "framing": qparts["framing"],
             "energy": _energy(parts, audio), "steady": -robust_z(grid["shake"]),
             "speech": np.asarray(grid["speech"], dtype=float), **parts,
             "audio": audio.astype(float), "unusable": (~usable).astype(float),

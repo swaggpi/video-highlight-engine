@@ -9,13 +9,17 @@ from vhe.query.candidates import cuts_inside, generate, peak_times, speech_spans
 from vhe.query.refine import SPEECH_TAIL, Context, refine
 from vhe.query.rules import parse
 from vhe.rank.select import (
-    EXHAUSTIVE_MIN_TOTAL,
+    EXHAUSTIVE_MIN_Z,
     EXHAUSTIVE_SCORE_MARGIN,
+    HEURISTIC_SCALE,
+    ScoreScale,
     select,
     select_for,
 )
 from vhe.rank.signals import segment_scores
 from vhe.signals import robust_z
+
+HEUR = HEURISTIC_SCALE  # the default scale: the heuristic's typical stage-1 pool, margins in its score units
 
 
 def test_parse_energy_and_short():
@@ -270,21 +274,29 @@ def test_select_explicit_count_with_budget_is_a_cap():
 
 
 def test_select_exhaustive_threshold_no_overlap():
-    # visual "every X": above the absolute threshold and within EXHAUSTIVE_SCORE_MARGIN of the best (strong matches
-    # only since r3), no overlap, no MMR cut
-    m = EXHAUSTIVE_SCORE_MARGIN
+    # visual "every X": above the pool floor and within EXHAUSTIVE_SCORE_MARGIN spreads of the best (strong matches
+    # only since r3), no overlap, no MMR cut. In the heuristic's typical pool (HEUR) these are the former absolute
+    # 0.5 and 2.5 score units.
+    m = EXHAUSTIVE_SCORE_MARGIN * HEUR.spread
+    floor = HEUR.loc + EXHAUSTIVE_MIN_Z * HEUR.spread
+    assert (m, floor) == (2.5, 0.5)
     cands = _pool([4.0] * 5, totals=[3.0, 2.0, 0.4, 3.0 - m + 0.1, 0.1]) + [{"start": 1.0, "end": 5.0, "total": 2.9}]
-    picked = select_for(cands, np.ones((6, 1)), _P(count=50, exhaustive=True))
+    picked = select_for(cands, np.ones((6, 1)), _P(count=50, exhaustive=True), scale=HEUR)
     assert sorted(c["total"] for c in picked) == [3.0 - m + 0.1, 2.0, 3.0]
-    assert all(c["total"] >= EXHAUSTIVE_MIN_TOTAL for c in picked)
+    assert all(c["total"] >= floor for c in picked)
     weak = _pool([4.0] * 5, totals=[3.0 + m, 2.0 + m, 0.4, 3.0 - 0.1, 0.1])
-    picked = select_for(weak, np.ones((5, 1)), _P(count=50, exhaustive=True))
+    picked = select_for(weak, np.ones((5, 1)), _P(count=50, exhaustive=True), scale=HEUR)
     assert sorted(c["total"] for c in picked) == [2.0 + m, 3.0 + m]  # 2.9: more than the margin below the best
     cands = _pool([4.0] * 5, totals=[3.0, 2.0, 0.4, 1.0, 0.1]) + [{"start": 1.0, "end": 5.0, "total": 2.9}]
     for c, f in zip(cands, [1.0, 0.2, 1.0, 0.9, 1.0, 0.0], strict=True):
         c["speech_frac"] = f
-    picked = select_for(cands, np.ones((6, 1)), _P(count=50, exhaustive=True, speech=1.0))
+    picked = select_for(cands, np.ones((6, 1)), _P(count=50, exhaustive=True, speech=1.0), scale=HEUR)
     assert sorted(c["total"] for c in picked) == [1.0, 3.0]  # speech intent: mostly-speech clips only
+    # the same lists on another score scale (x7 + 100, the pool scale with it): the same picks
+    big = ScoreScale(HEUR.loc * 7 + 100, HEUR.spread * 7)
+    scaled = [dict(c, total=c["total"] * 7 + 100) for c in cands]
+    picked = select_for(scaled, np.ones((6, 1)), _P(count=50, exhaustive=True, speech=1.0), scale=big)
+    assert sorted(round((c["total"] - 100) / 7, 9) for c in picked) == [1.0, 3.0]
 
 
 def test_budget_holds_after_refine():

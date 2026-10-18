@@ -16,6 +16,16 @@ AVOID_MAX = 1.0  # at most one unit off: avoid never sinks a clearly relevant sh
 # median (how unusual the match is for that item), and only this floor is absolute.
 ITEM_MIN_REL = 0.5
 ITEM_MARGIN = 0.5  # exhaustive per-item picks: the clip must match this item nearly as well as its best item
+# An item's words read on screen (vhe.query.text_match.ocr_item_scores, 0..1) are evidence of which item a span shows,
+# in relevance units at a full match: SigLIP cannot read "PASARGAD" on a float. Matching only (which item a span
+# serves, the exhaustive relevance gates); scores never see it here (HeuristicScorer has its own on-screen bonuses).
+ITEM_OCR_EVIDENCE = 1.0
+
+
+def evidence(rel: np.ndarray, ocr: np.ndarray | None) -> np.ndarray:
+    """(spans, items) how strongly each span shows each item: its SigLIP relevance plus ITEM_OCR_EVIDENCE times the
+    share of the item's words read on screen inside it (ocr None: no OCR in the index)."""
+    return rel if ocr is None else rel + ITEM_OCR_EVIDENCE * ocr
 
 
 def combine(rel_items: np.ndarray, rel_avoid: np.ndarray | None = None) -> np.ndarray:

@@ -75,18 +75,20 @@ def _p(**kw):
 
 def test_every_shot_keeps_strong_matches_of_each_item_only():
     # item 0 (specific): best 5.0; item 1 (generic): best 4.0. Each in its own file, 20 s apart (no duplicates).
-    spec = [  # (item, item relevance, total, penalty, unusable)
-        (0, 1.2, 5.0, 0.0, 0.0), (0, 1.0, 5.0 - S.EXHAUSTIVE_SCORE_MARGIN + 0.1, 0.0, 0.0),  # kept: within margins
-        (0, 1.1, 5.0 - S.EXHAUSTIVE_SCORE_MARGIN - 0.1, 0.0, 0.0),  # padding: too far below the item's best score
-        (0, 0.45, 4.9, 0.0, 0.0),  # under the absolute relevance floor
-        (1, 2.6, 4.0, 0.0, 0.0), (1, 2.6 - S.EXHAUSTIVE_ITEM_MARGIN - 0.1, 3.9, 0.0, 0.0),  # weakest generic match
-        (0, 1.2, 4.8, 1.5, 0.0),  # unclean edges
-        (0, 1.2, 4.8, 0.0, 0.2),  # unusable steps inside
-        (-1, 0.0, 6.0, 0.0, 0.0),  # serves no item
+    # Score margins are in spreads of the pool's scores: the default scale is the heuristic's typical pool.
+    m = S.EXHAUSTIVE_SCORE_MARGIN * S.HEURISTIC_SCALE.spread
+    spec = [  # (item, item relevance, total, clean edges, unusable)
+        (0, 1.2, 5.0, True, 0.0), (0, 1.0, 5.0 - m + 0.1, True, 0.0),  # kept: within margins
+        (0, 1.1, 5.0 - m - 0.1, True, 0.0),  # padding: too far below the item's best score
+        (0, 0.45, 4.9, True, 0.0),  # under the absolute relevance floor
+        (1, 2.6, 4.0, True, 0.0), (1, 2.6 - S.EXHAUSTIVE_ITEM_MARGIN - 0.1, 3.9, True, 0.0),  # weakest generic match
+        (0, 1.2, 4.8, False, 0.0),  # unclean edges
+        (0, 1.2, 4.8, True, 0.2),  # unusable steps inside
+        (-1, 0.0, 6.0, True, 0.0),  # serves no item
     ]
     cands, rows = [], []
-    for k, (it, rel, tot, pen, unus) in enumerate(spec):
-        cands.append({"file": k, "start": 20.0 * k, "end": 20.0 * k + 5, "total": tot, "penalty": pen,
+    for k, (it, rel, tot, clean, unus) in enumerate(spec):
+        cands.append({"file": k, "start": 20.0 * k, "end": 20.0 * k + 5, "total": tot, "clean_edges": clean,
                       "unusable_frac": unus, "item": it, "source": "window"})
         row = np.zeros(2)
         if it >= 0:
@@ -131,4 +133,16 @@ def test_every_moment_someone_speaks_keeps_every_sentence():
     cands = [{"file": 0, "start": 10.0 * k, "end": 10.0 * k + 3, "total": 5.0 - k, "source": "speech",
               "speech_frac": 0.9} for k in range(5)]
     p = _p(shots=[], weights={"relevance": 0.0, "speech": 1.0})
-    assert len(select_for(cands, np.eye(5), p)) == 5  # all above EXHAUSTIVE_MIN_TOTAL (5, 4, 3, 2, 1 >= 0.5)
+    assert len(select_for(cands, np.eye(5), p)) == 5  # all above the floor (5, 4, 3, 2, 1 >= 0.5 in heuristic units)
+
+
+def test_exhaustive_floor_is_in_pool_spreads_and_never_empties_a_list():
+    cands = [{"file": 0, "start": 10.0 * k, "end": 10.0 * k + 3, "total": 5.0 - k, "source": "speech",
+              "speech_frac": 0.9} for k in range(5)]
+    p = _p(shots=[], weights={"relevance": 0.0, "speech": 1.0})
+    # a pool whose median is 2.5 with spread 2: the floor is 3.0
+    assert [c["total"] for c in select_for(cands, np.eye(5), p, scale=S.ScoreScale(2.5, 2.0))] == [5.0, 4.0, 3.0]
+    # a pool far above every candidate: the floor drops to the best one instead of returning nothing
+    assert [c["total"] for c in select_for(cands, np.eye(5), p, scale=S.ScoreScale(50.0, 1.0))] == [5.0]
+    assert S.score_scale([1.0, 2.0, 3.0, 4.0, 5.0]) == S.ScoreScale(3.0, 2.0 / 1.349)
+    assert S.score_scale([2.0, 2.0, 2.0]) == S.ScoreScale(2.0, 1.0) and S.score_scale([]) == S.ScoreScale()

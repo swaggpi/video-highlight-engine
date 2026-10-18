@@ -46,7 +46,7 @@ HIGHLIGHT_MAX_LEN = 10.0  # ... and clips at most this long when the brief gives
 EDGE_WEIGHTS = {"relevance": 1.0, "steady": 0.8, "quality": 0.6}
 # The hook slot (vhe.rank.pool.edge_clip): the opener is drawn from a pool scored with these weights and framing
 # "close". No steadiness weight: a hook moves (the flag swept at the lens reads steady -3 from the motion it causes);
-# the usable gate still drops covered, blurred and very shaky spans, and EDGE_PENALTY unclean edges.
+# the usable gate still drops covered, blurred and very shaky spans, and unclean edges cost the scorer's EDGE_WEIGHT.
 HOOK_WEIGHTS = {"relevance": 0.5, "energy": 0.8, "steady": 0.0, "quality": 0.3}
 # A list of hooks as the deliverable ("rank me 3 hooks", "the 3 best possible first-shots"): every clip is ranked like
 # the hook slot (HOOK_WEIGHTS, steadiness kept at the floor every brief has): motion and the close / approach bonus

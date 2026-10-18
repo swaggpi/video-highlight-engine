@@ -2,11 +2,13 @@
 reports): the corpus signals (vhe.rank.signals.timestep_signals) plus the brief's relevance, its visual-cue bonus and
 its hard-exclusion masks.
 
-relevance is the hand-weighted relevance the candidates, the heuristic scorer and the reported scores use: per shot
-item (or the content text) SigLIP averaged with the highlight saliency where a file has it, the best item per step,
-minus the bounded avoid penalty; with "the best moments" and no shot list, a highlight prior from the zero-shot tags,
-faces and approach. siglip / avoid_pen / nc_sal keep the same parts apart for the features: nc_sal is the slot an
-owned highlight head will fill.
+relevance is the per-step relevance candidate peaks and the reported clip relevance use, with the heuristic's
+constants (vhe.rank.scorer): per shot item (or the content text) SigLIP averaged with the highlight saliency where a
+file has it, plus the legibility bonus of a readable-text brief, the best item per step, minus the bounded avoid
+penalty; with "the best moments" and no shot list, blended with a highlight prior from the zero-shot tags, faces and
+approach. No scorer reads it: features get the parts apart (features v3) - siglip, avoid_pen, nc_sal (the slot an owned
+highlight head will fill), h_rel (blended relevance minus avoid, no legibility, no prior), legibility and highlight
+(raw, whatever the brief asks), and per shot item items (SigLIP) and items_avoid (its avoid penalty).
 
 The models stay with the caller (vhe.engine): relevances(texts) -> (texts, steps) SigLIP relevance, and
 nc_scores(text) -> (raw highlight saliency or None, proposals per file)."""
@@ -25,10 +27,11 @@ from vhe.query.exclusions import (
     ocr_term_steps,
 )
 from vhe.query.model import ParsedQuery
-from vhe.query.text_match import LEGIBLE_BONUS, legibility_steps, legible_items
+from vhe.query.refine import clean_steps
+from vhe.query.text_match import legibility_steps, legible_items
 from vhe.rank.features import grid_steps
 from vhe.rank.items import combine, item_centre
-from vhe.rank.scorer import cue_bonus
+from vhe.rank.scorer import HIGHLIGHT_BLEND, LEGIBLE_BONUS, cue_bonus
 from vhe.rank.signals import blend_nc, nc_signal, timestep_signals
 from vhe.signals import robust_z, smooth
 
@@ -51,26 +54,31 @@ def brief_signals(corpus, p: ParsedQuery, relevances: Relevances, nc_scores: Cal
     nc_raw, proposals = nc_scores(nc_query(p))
     nc = nc_signal(nc_raw)
     sig = timestep_signals(c.grid, c.fps, None, c.audio_steps, c.file_id)
-    sig.update(siglip=None, avoid_pen=None, nc_sal=nc, items=None, item_centre=None, muted=muted)
+    sig.update(siglip=None, avoid_pen=None, nc_sal=nc, items=None, items_avoid=None, item_centre=None,
+               muted=muted, h_rel=np.zeros(c.n), legibility=legibility_steps(c.grid, True),
+               highlight=highlight_prior(c), clean=clean_steps(c.grid))
     items = p.shots or ([p.text] if p.text else [])
-    # "every shot where the text is legible", "the float with its name legible": confident OCR text counts as
-    # relevant, to the items that ask for it (all of them when none does)
+    # "every shot where the text is legible", "the float with its name legible": for candidate peaks, confident OCR
+    # text counts as relevant to the items that ask for it (all of them when none does)
     legible = legibility_steps(c.grid, p.legible_text)
     if items:
         rel_items = relevances(items)
         rel_avoid = relevances(p.avoid) if p.avoid else None
         want = combine(rel_items)
         blended = blend_nc(rel_items, nc)
+        peaks = blended
         if legible is not None:
-            blended = blended + LEGIBLE_BONUS * legible_items(items)[:, None] * legible[None, :]
-        sig.update(relevance=combine(blended, rel_avoid), siglip=want,
+            peaks = blended + LEGIBLE_BONUS * legible_items(items)[:, None] * legible[None, :]
+        sig.update(relevance=combine(peaks, rel_avoid), h_rel=combine(blended, rel_avoid), siglip=want,
                    avoid_pen=want - combine(rel_items, rel_avoid))
         if p.shots:
-            sig.update(items=rel_items, item_centre=item_centre(rel_items))
-    prior = highlight_prior(c) if p.highlight and not p.shots else None
+            sig.update(items=rel_items, item_centre=item_centre(rel_items),
+                       items_avoid=np.stack([rel_items[j] - combine(rel_items[j:j + 1], rel_avoid)
+                                             for j in range(len(rel_items))]))
+    prior = sig["highlight"] if p.highlight and not p.shots else None
     if prior is not None:  # "the best moments": people, faces, dancing ... count as relevant
         rel = sig["relevance"]
-        sig["relevance"] = 0.5 * rel + 0.5 * prior if items else prior
+        sig["relevance"] = (1 - HIGHLIGHT_BLEND) * rel + HIGHLIGHT_BLEND * prior if items else prior
         if sig["siglip"] is None:  # the rel_* features stay SigLIP-only (no text: zero, as before)
             sig["siglip"] = np.zeros(c.n)
     if legible is not None and not items:

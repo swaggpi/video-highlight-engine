@@ -1,20 +1,24 @@
 """The ranking seam: a Scorer maps candidate features X (vhe.rank.features.featurize) and the query vector q
 (query_vector) to one score per candidate. The engine ranks every gated candidate with score(), refines the edges
-of the best, featurises the refined spans again and asks rescore() for the totals selection runs on.
+of the best, featurises the refined spans again and asks rescore() for the totals selection runs on; with a shot list
+it also asks score_items() for each span's score per item (per-item pool extras, "every float: A, B, C").
 
-HeuristicScorer is the hand-weighted total the engine has always used, plus the visual-cue bonus (features v2).
-LinearRankScorer is a learned model in a JSON file (format "vhe-linear-rank/1", trained outside the package):
-standardised features plus their products with a few query entries, one weight each; a model of another feature or
-query version (v1) is refused. load_scorer picks one from a CLI/API argument."""
+Selection never reads a score's absolute value: thresholds and the diversity penalty are in units of the brief's
+stage-1 score spread (vhe.rank.select.ScoreScale), so any scorer whose scores are an increasing affine function of
+another's picks the same clips. Every hand-set weight, bonus and penalty is in HeuristicScorer; features are raw.
+
+HeuristicScorer is the hand-weighted total, an exact function of each feature row. LinearRankScorer is a learned
+model in a JSON file (format "vhe-linear-rank/1", trained outside the package): standardised features plus their
+products with a few query entries, one weight each; a model of another feature or query version is refused.
+load_scorer picks one from a CLI/API argument."""
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Iterable, Protocol, runtime_checkable
 
 import numpy as np
 
-from vhe.config import CANDIDATE_LENGTHS
 from vhe.rank.features import (
     FEATURE_VERSION,
     FEATURES,
@@ -30,8 +34,20 @@ CUT_PENALTY = 0.15
 LENGTH_PRIOR = 0.15
 SPEECH_BONUS = 0.3  # utterance-aligned candidates beat windows that start mid-sentence, scaled by speech weight
 BUCKET_MIN = 5  # length buckets smaller than this are not median-centred (a singleton would become exactly 0)
+EDGE_WEIGHT = 1.5  # score units off a refined visual clip whose first or last frames are not clean (edges_clean 0)
 LINEAR_FORMAT = "vhe-linear-rank/1"
 Q_SMALL = tuple(f"w_{k}" for k in SIGNALS)  # query entries a linear model crosses with every feature by default
+
+# ---- relevance terms (features v3: raw columns, composed here) ------------------------------------------------------
+# "every shot where the text is legible", "the float with its name legible": confident legible text counts as relevant
+# (relevance units at full OCR confidence, legibility_mean; the brief's legible_text flag).
+LEGIBLE_BONUS = 1.0
+# "the best moments" without a shot list: relevance is the highlight prior (highlight_prior_mean), averaged with the
+# content text's relevance at this weight when there is one.
+HIGHLIGHT_BLEND = 0.5
+# A shot item's words read on screen (ocr_item_match of the item's own features), in relevance units at a full match,
+# when a span is scored for one item (score_items: per-item pool extras and "every float: A, B, C" picks).
+OCR_ITEM_BONUS = 1.0
 
 # ---- visual-cue bonuses (features v2; ParsedQuery framing / want_faces / centered / legible_text) ------------------
 # Score units: about one robust z of energy or one relevance unit. Each term is a 0..1 ramp of a span feature times
@@ -52,7 +68,7 @@ APPROACH_BONUS = 0.5  # framing close: something growing toward the lens
 CENTER_BONUS = 0.3  # centered: the largest face near the frame centre (subjects without a face are not measured)
 WIDE_BONUS = 0.8  # framing wide: shot scale
 WIDE_CLOSE_PENALTY = 0.6  # framing wide: a close-up costs this at full close score
-OCR_MATCH_BONUS = 0.6  # legible_text: an item's words read by OCR in the span (the legibility prior is in relevance)
+OCR_MATCH_BONUS = 0.6  # legible_text: an item's words read by OCR in the span (legibility itself: LEGIBLE_BONUS)
 
 
 def _ramp(x, lo: float, hi: float):
@@ -69,26 +85,39 @@ def cue_terms(cols: dict) -> dict:
             "ocr": np.clip(np.asarray(cols["ocr_item_match"], dtype=float), 0.0, 1.0)}
 
 
-def cue_bonus(cols: dict, framing: str, want_faces: bool, centered: bool, legible_text: bool):
-    """The heuristic's visual-cue bonus for spans (cols: v2 feature columns by name) or steps (the same names over
-    per-step values); 0 for a brief without cues."""
+def cue_parts(cols: dict, framing: str, want_faces: bool, centered: bool, legible_text: bool) -> dict:
+    """The heuristic's visual-cue bonus by term (close, approach, face, wide, center, ocr), each only when its cue is
+    asked for: spans (cols: v2 feature columns by name) or steps (the same names over per-step values)."""
     t = cue_terms(cols)
-    out = np.zeros(np.shape(t["close"]))
+    out = {}
     if framing == "close":
-        out += CLOSE_BONUS * t["close"] + APPROACH_BONUS * t["approach"]
+        out["close"] = CLOSE_BONUS * t["close"]
+        out["approach"] = APPROACH_BONUS * t["approach"]
     if framing == "close" or want_faces:
-        out += FACE_BONUS * t["face"]
+        out["face"] = FACE_BONUS * t["face"]
     if framing == "wide":
-        out += WIDE_BONUS * t["wide"] - WIDE_CLOSE_PENALTY * t["close"]
+        out["wide"] = WIDE_BONUS * t["wide"]
+        out["close"] = -WIDE_CLOSE_PENALTY * t["close"]
     if centered:
-        out += CENTER_BONUS * t["center"]
+        out["center"] = CENTER_BONUS * t["center"]
     if legible_text:
-        out += OCR_MATCH_BONUS * t["ocr"]
+        out["ocr"] = OCR_MATCH_BONUS * t["ocr"]
+    return out
+
+
+def cue_bonus(cols: dict, framing: str, want_faces: bool, centered: bool, legible_text: bool):
+    """The heuristic's visual-cue bonus (the sum of cue_parts); 0 for a brief without cues."""
+    out = np.zeros(np.shape(np.asarray(cols["scale_close_mean"], dtype=float)))
+    for v in cue_parts(cols, framing, want_faces, centered, legible_text).values():
+        out = out + v
     return out
 
 
 @runtime_checkable
 class Scorer(Protocol):
+    """What the engine needs from a ranking model. Optional: explain(X, q, final=True) -> {term: (n,) contribution}
+    summing to the score, for the clip's `reason` (vhe.results); without it the reason names no terms."""
+
     name: str
     feature_version: str
     personas: tuple[str, ...]  # the persona one-hot the query vector is built with
@@ -99,7 +128,13 @@ class Scorer(Protocol):
 
     def rescore(self, s: np.ndarray, X_pre: np.ndarray, X_post: np.ndarray, q: np.ndarray) -> np.ndarray:
         """(m,) final scores of m shortlisted candidates after edge refinement: s their score() values, X_pre their
-        features as generated, X_post the features of the refined spans."""
+        features as generated, X_post the features of the refined spans (what a dump records with the score)."""
+        ...
+
+    def score_items(self, X_items: Iterable[np.ndarray], q: np.ndarray, final: bool) -> np.ndarray:
+        """(n, k) score of each span for each of k shot items: X_items yields, per item, the spans' features as if
+        the brief named that item alone (vhe.rank.features.item_features). final: the spans are refined (rescore's
+        stage) rather than as generated (score's stage); a scorer that scores both alike ignores it."""
         ...
 
 
@@ -107,14 +142,20 @@ def _col(X: np.ndarray, name: str) -> np.ndarray:
     return X[:, INDEX[name]]
 
 
+def _stack(cols: list[np.ndarray], n: int) -> np.ndarray:
+    return np.stack(cols, axis=1) if cols else np.zeros((n, 0))
+
+
 class HeuristicScorer:
-    """The hand-weighted total, exactly as the engine computed it before the seam: the weighted means of relevance
-    (SigLIP and nc saliency averaged per step, minus the avoid penalty), quality, energy, steadiness and speech,
-    centred on the median of each candidate length bucket (short windows on a peak have higher means than long
-    ones), a mild prior towards the target length, a penalty per cut inside and a bonus for utterance-aligned spans,
-    plus (features v2) the visual-cue bonus of a brief with framing / faces / centring / readable-text cues
-    (cue_bonus; exactly 0 without cues). The final total swaps the relevance mean for the mean of the best 60 % of
-    steps, on the span as generated."""
+    """The hand-weighted total, a function of each feature row and the query: the weighted means of relevance,
+    quality, energy, steadiness and speech, each centred on the median of the candidate's length bucket in the
+    brief's stage-1 pool (the bucket_* features; short windows on a peak have higher means than long ones; buckets
+    under BUCKET_MIN candidates are not centred), a mild prior towards the target length, a penalty per cut inside, a
+    bonus for utterance-aligned spans and the visual-cue bonus of a brief with framing / faces / centring /
+    readable-text cues (exactly 0 without cues). Relevance is the blended relevance (h_rel) plus LEGIBLE_BONUS times
+    the legibility for a readable-text brief, blended with the highlight prior for "the best moments" without a shot
+    list. score() uses the relevance mean (stage 1); the final total (rescore, on the refined span) uses the mean of
+    the best 60 % of steps and costs EDGE_WEIGHT when the clip's edges are not clean."""
 
     name = "heuristic"
     feature_version = FEATURE_VERSION
@@ -126,34 +167,80 @@ class HeuristicScorer:
     def _w(self, q: np.ndarray, key: str) -> float:
         return float(q[self._q[f"w_{key}"]])
 
-    def score(self, X: np.ndarray, q: np.ndarray) -> np.ndarray:
-        means = {"relevance": _col(X, "h_rel_mean"), "quality": _col(X, "quality_mean"),
-                 "energy": _col(X, "energy_mean"), "steady": _col(X, "steady_mean"),
-                 "speech": _col(X, "speech_frac") * 2 - 1}
-        total = sum(self._w(q, k) * means[k] for k in SIGNALS)
-        length = _col(X, "length_s")
-        bucket = np.searchsorted(np.asarray(CANDIDATE_LENGTHS, dtype=float), length - 1e-6)
-        for b in np.unique(bucket):
-            if np.count_nonzero(bucket == b) >= BUCKET_MIN:
-                total[bucket == b] -= np.median(total[bucket == b])
+    def _flag(self, q: np.ndarray, key: str) -> bool:
+        return float(q[self._q[key]]) > 0.5
+
+    def relevance(self, X: np.ndarray, q: np.ndarray, final: bool) -> tuple[np.ndarray, np.ndarray]:
+        """(relevance per span, its length-bucket median): the composed relevance and the same composition of the
+        bucket medians."""
+        h = _col(X, "h_rel_top60" if final else "h_rel_mean")
+        hm = _col(X, "bucket_h_rel")
+        legible = LEGIBLE_BONUS if self._flag(q, "legible_text") else 0.0
+        leg, legm = legible * _col(X, "legibility_mean"), legible * _col(X, "bucket_legibility")
+        if self._flag(q, "highlight") and not self._flag(q, "has_shots"):
+            prior, priorm = _col(X, "highlight_prior_mean"), _col(X, "bucket_highlight")
+            if self._flag(q, "has_text"):
+                a = HIGHLIGHT_BLEND
+                return (1 - a) * (h + leg) + a * prior, (1 - a) * (hm + legm) + a * priorm
+            return prior + leg, priorm + legm
+        return h + leg, hm + legm
+
+    def explain(self, X: np.ndarray, q: np.ndarray, final: bool = True) -> dict[str, np.ndarray]:
+        """The total by term (score units); the terms sum to score() (final=False) or rescore() (final=True)."""
+        centre = (_col(X, "bucket_size") >= BUCKET_MIN).astype(float)
+        rel, rel_med = self.relevance(X, q, final)
+        out = {"relevance": self._w(q, "relevance") * (rel - centre * rel_med)}
+        for key, col in (("quality", "quality_mean"), ("energy", "energy_mean"), ("steady", "steady_mean")):
+            out[key] = self._w(q, key) * (_col(X, col) - centre * _col(X, "bucket_" + key))
+        out["speech"] = self._w(q, "speech") * ((_col(X, "speech_frac") * 2 - 1)
+                                                - centre * (_col(X, "bucket_speech") * 2 - 1))
         target = float(q[self._q["target_len"]])
-        total += -LENGTH_PRIOR * np.abs(length - target) / max(target, 1.0) - CUT_PENALTY * _col(X, "n_cuts_inside")
-        total += SPEECH_BONUS * max(0.0, self._w(q, "speech")) * _col(X, "src_speech")
-        return total + self.cue_bonus(X, q)
+        out["length"] = -LENGTH_PRIOR * np.abs(_col(X, "length_s") - target) / max(target, 1.0)
+        out["cuts"] = -CUT_PENALTY * _col(X, "n_cuts_inside")
+        out["sentences"] = SPEECH_BONUS * max(0.0, self._w(q, "speech")) * _col(X, "src_speech")
+        out.update(self._cue_parts(X, q))
+        if final:
+            out["edges"] = -EDGE_WEIGHT * (1.0 - _col(X, "edges_clean"))
+        return out
+
+    def _total(self, X: np.ndarray, q: np.ndarray, final: bool) -> np.ndarray:
+        total = np.zeros(len(X))
+        for v in self.explain(X, q, final).values():
+            total = total + v
+        return total
+
+    def score(self, X: np.ndarray, q: np.ndarray) -> np.ndarray:
+        return self._total(X, q, final=False)
+
+    def rescore(self, s: np.ndarray, X_pre: np.ndarray, X_post: np.ndarray, q: np.ndarray) -> np.ndarray:
+        """The refined span's own total (X_post): best-60 % relevance and the clean-edge term."""
+        return self._total(X_post, q, final=True)
+
+    def score_items(self, X_items: Iterable[np.ndarray], q: np.ndarray, final: bool) -> np.ndarray:
+        """Per item: the total on the item's own features, plus OCR_ITEM_BONUS (relevance-weighted) times the share
+        of the item's words read on screen."""
+        cols, n = [], 0
+        for Xi in X_items:
+            n = len(Xi)
+            cols.append(self._total(Xi, q, final)
+                        + self._w(q, "relevance") * OCR_ITEM_BONUS * _col(Xi, "ocr_item_match"))
+        return _stack(cols, n)
+
+    def _cue_parts(self, X: np.ndarray, q: np.ndarray) -> dict[str, np.ndarray]:
+        flag = {k: self._flag(q, k) for k in ("framing_close", "framing_wide", "want_faces", "centered",
+                                               "legible_text")}
+        if not any(flag.values()):
+            return {}
+        framing = "close" if flag["framing_close"] else "wide" if flag["framing_wide"] else "none"
+        return cue_parts({n: _col(X, n) for n in FEATURES_V2}, framing, flag["want_faces"], flag["centered"],
+                         flag["legible_text"])
 
     def cue_bonus(self, X: np.ndarray, q: np.ndarray) -> np.ndarray:
         """cue_bonus from the v2 feature columns and the query's cue entries (0 for a brief without cues)."""
-        flag = {k: float(q[self._q[k]]) > 0.5 for k in ("framing_close", "framing_wide", "want_faces", "centered",
-                                                          "legible_text")}
-        if not any(flag.values()):
-            return np.zeros(len(X))
-        framing = "close" if flag["framing_close"] else "wide" if flag["framing_wide"] else "none"
-        return cue_bonus({n: _col(X, n) for n in FEATURES_V2}, framing, flag["want_faces"], flag["centered"],
-                         flag["legible_text"])
-
-    def rescore(self, s: np.ndarray, X_pre: np.ndarray, X_post: np.ndarray, q: np.ndarray) -> np.ndarray:
-        """The span as generated, with exact relevance; the refined edges do not change the total."""
-        return s + self._w(q, "relevance") * (_col(X_pre, "h_rel_top60") - _col(X_pre, "h_rel_mean"))
+        out = np.zeros(len(X))
+        for v in self._cue_parts(X, q).values():
+            out = out + v
+        return out
 
 
 class LinearRankScorer:
@@ -161,7 +248,8 @@ class LinearRankScorer:
     {"format": "vhe-linear-rank/1", "feature_version", "query_version", "features": [names, optional check],
      "personas": [...], "q_small": [query names, default the signal weights], "mu": [F], "sd": [F],
      "w": [F] or [F * (1 + len(q_small))], "mask": [F] optional 0/1, "trained_on", "created"}.
-    mask: the features the model uses; a masked-out column is ignored (its z is 0), whatever its value."""
+    mask: the features the model uses; a masked-out column is ignored (its z is 0), whatever its value. Both stages
+    score the span's own features; a span scored for one shot item is scored on the item's features."""
 
     def __init__(self, mu, sd, w, personas=PERSONAS, q_small=Q_SMALL, name: str = "linear",
                  feature_version: str = FEATURE_VERSION, query_version: str = QUERY_VERSION,
@@ -214,20 +302,42 @@ class LinearRankScorer:
                 "mu": self.mu.tolist(), "sd": self.sd.tolist(), "w": self.w.tolist(),
                 **({} if self.mask is None else {"mask": self.mask.astype(int).tolist()}), **self.meta}
 
-    def phi(self, X: np.ndarray, q: np.ndarray) -> np.ndarray:
+    def _z(self, X: np.ndarray) -> np.ndarray:
         z = np.nan_to_num((np.asarray(X, dtype=float) - self.mu) / np.where(self.sd > 0, self.sd, 1.0))
-        if self.mask is not None:
-            z = z * self.mask
+        return z if self.mask is None else z * self.mask
+
+    def phi(self, X: np.ndarray, q: np.ndarray) -> np.ndarray:
+        z = self._z(X)
         if len(self.w) == z.shape[1]:
             return z
         qs = np.asarray(q, dtype=float)[self._qi]
         return np.concatenate([z, (z[:, :, None] * qs[None, None, :]).reshape(len(z), -1)], axis=1)
+
+    def feature_weights(self, q: np.ndarray) -> np.ndarray:
+        """(F,) the weight each standardised feature carries under query q (main weight plus its interactions)."""
+        F = len(FEATURES)
+        if len(self.w) == F:
+            return self.w.copy()
+        qs = np.asarray(q, dtype=float)[self._qi]
+        return self.w[:F] + self.w[F:].reshape(F, len(self.q_small)) @ qs
 
     def score(self, X: np.ndarray, q: np.ndarray) -> np.ndarray:
         return self.phi(X, q) @ self.w
 
     def rescore(self, s: np.ndarray, X_pre: np.ndarray, X_post: np.ndarray, q: np.ndarray) -> np.ndarray:
         return self.score(X_post, q)
+
+    def score_items(self, X_items: Iterable[np.ndarray], q: np.ndarray, final: bool) -> np.ndarray:
+        cols, n = [], 0
+        for Xi in X_items:
+            n = len(Xi)
+            cols.append(self.score(Xi, q))
+        return _stack(cols, n)
+
+    def explain(self, X: np.ndarray, q: np.ndarray, final: bool = True) -> dict[str, np.ndarray]:
+        """w . phi split by feature: {feature name: z * its weight under q}; the values sum to score()."""
+        contrib = self._z(X) * self.feature_weights(q)[None, :]
+        return {name: contrib[:, j] for j, name in enumerate(FEATURES) if np.any(contrib[:, j])}
 
 
 def load_scorer(spec: "Scorer | str | Path | None" = None) -> Scorer:

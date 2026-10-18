@@ -35,14 +35,15 @@ from vhe.query.candidates import corpus_candidates, peak_times
 from vhe.query.model import ParsedQuery
 from vhe.query.parser import parse_brief
 from vhe.query.refine import Context, clean_steps
-from vhe.query.text_match import SEARCH_STOPWORDS
+from vhe.query.text_match import STOPWORDS
 from vhe.rank import dump as dumps
 from vhe.rank import pool as pools
 from vhe.rank.brief_signals import brief_signals
+from vhe.rank.features import featurize, pool_stats
 from vhe.rank.gate import gate
 from vhe.rank.items import combine
 from vhe.rank.scorer import Scorer, load_scorer
-from vhe.rank.select import disjoint, fill_budget, select_for
+from vhe.rank.select import disjoint, fill_budget, score_scale, select_for
 from vhe.rank.signals import muted_steps, relevance, timestep_signals
 
 EMB_BLOCK = 1 << 16  # rows cast to float32 per matmul block
@@ -204,7 +205,7 @@ class Engine:
         found = [c.locate(c.file_of(t), t - half_width_s, t + half_width_s) |
                  {"score": round(float(curve[min(int(round(t * fps)), c.n - 1)]), 3), "source": "visual"}
                  for t in peak_times(curve, fps, min_gap_s=2 * half_width_s, top=k, pct=0)]
-        terms = [w for w in re.findall(r"\w+", text.lower()) if len(w) > 2 and w not in SEARCH_STOPWORDS]
+        terms = [w for w in re.findall(r"\w+", text.lower()) if len(w) > 2 and w not in STOPWORDS]
         for seg in c.segments:
             words = set(re.findall(r"\w+", seg["text"].lower()))
             hits = sum(term in words for term in terms)
@@ -239,22 +240,18 @@ class Engine:
             result = {"query": p.to_dict(), "clips": clips, "candidates": n_spans, "files": len(c.members),
                       "noncommercial": [], "unusable_dropped": 0, "excluded_dropped": 0, "topic_match": method}
             if dump:
-                dumps.write_run(dump, c, self.scorer, query, p, persona, self._signals(p)[0], topic=clips)
+                sig, _, proposals = self._signals(p)
+                dumps.write_run(dump, c, self.scorer, query, p, persona, sig, topic=clips,
+                                stats=self._pool_stats(sig, self._candidates(sig, p, proposals)[0], p))
             return self._finish(result, t0, load_before, warn_before)
         sig, nc_raw, proposals = self._signals(p)
-        per_step = sum(p.weights.get(k, 0.0) * sig[k] for k in ("relevance", "quality", "energy", "steady"))
-        if sig.get("cue") is not None:
-            per_step = per_step + sig["cue"]
-        S, E, K, src = corpus_candidates(c, per_step, p, proposals)
-        result = {"query": p.to_dict(), "clips": [], "candidates": len(S), "files": len(c.members),
+        cands, n_generated = self._candidates(sig, p, proposals)
+        S, E, K, src, allowed = cands
+        result = {"query": p.to_dict(), "clips": [], "candidates": n_generated, "files": len(c.members),
                   "noncommercial": sorted({x for ix in c.members for x in ix.meta.get("noncommercial_components", [])})
                   if nc_raw is not None else []}
-        keep = self._gate(S, E, K, p)
-        result["unusable_dropped"] = int(len(S) - keep.sum())
-        S, E, K, src = S[keep], E[keep], K[keep], [s for s, k in zip(src, keep, strict=True) if k]
-        allowed = self._gate(S, E, K, p, sig)  # minus excluded content, camera defects or speech
+        result["unusable_dropped"] = int(n_generated - len(S))
         result["excluded_dropped"] = int(len(S) - allowed.sum())
-        cands = (S, E, K, src, allowed)
         if not allowed.any():
             if dump:
                 dumps.write_run(dump, c, self.scorer, query, p, persona, sig)
@@ -281,7 +278,7 @@ class Engine:
             p, count=max(0, p.count - len(edges)),
             budget=None if p.budget is None else (max(0.0, p.budget[0] - used), p.budget[1] - used))
 
-        trace = {} if dump and dump_all else None
+        trace: dict = {}  # the stage-1 pool: its scores set the brief's score scale, its statistics the features'
         pool = self._pool(sig, p.weights, cands, p, max(400, 40 * p.count), persona, trace)
         for cid, o in enumerate(pool):
             o["cid"] = cid
@@ -295,23 +292,57 @@ class Engine:
             taken = list(edges.values())
             body = select_for(scored, self._mean_vectors(r0, r1), body_p, groups=np.array([o["file"] for o in scored]),
                               item_rel=item_rel, item_centre=sig["item_centre"], taken=taken,
-                              taken_vectors=self._span_vectors(taken))
+                              taken_vectors=self._span_vectors(taken), scale=score_scale(trace["s"]))
         else:
             body = []
         if p.budget is not None:
             body = fill_budget(body, list(edges.values()), p, c, self._context,
                                lambda S, E, K: self._gate(S, E, K, p, sig), bite_s)
+            self._rescore_extended(body, sig, p, trace["stats"])
         # Edit order: files in manifest order (= virtual time), then time within the file; opener first, closer last.
         ordered = ([("opener", edges["opener"])] if "opener" in edges else []) + \
             [(None, o) for o in sorted(body, key=lambda o: o["start"])] + \
             ([("closer", edges["closer"])] if "closer" in edges else [])
         for role, o in ordered:
-            result["clips"].append(results.clip(c, o, sig, p, role))
+            result["clips"].append(results.clip(c, o, sig, p, role, self.scorer))
         result["clips"] += bites
         result["warnings"] = results.shortfall(result["clips"], p)
         if dump:
-            dumps.write_run(dump, c, self.scorer, query, p, persona, sig, pool, edges, body, bites, trace)
+            dumps.write_run(dump, c, self.scorer, query, p, persona, sig, pool, edges, body, bites,
+                            trace if dump_all else None, stats=trace["stats"])
         return self._finish(result, t0, load_before, warn_before)
+
+    def _candidates(self, sig: dict, p: ParsedQuery, proposals: list[list]) -> tuple[tuple, int]:
+        """((S, E, K, src, allowed) of the usable candidates, number generated): candidates from the brief's per-step
+        relevance, quality, energy, steadiness and cue curve (vhe.query.candidates), without unusable or muted spans;
+        allowed: minus excluded content, camera defects or speech (vhe.rank.gate)."""
+        c = self.corpus
+        per_step = sum(p.weights.get(k, 0.0) * sig[k] for k in ("relevance", "quality", "energy", "steady"))
+        if sig.get("cue") is not None:
+            per_step = per_step + sig["cue"]
+        S, E, K, src = corpus_candidates(c, per_step, p, proposals)
+        n = len(S)
+        keep = self._gate(S, E, K, p)
+        S, E, K, src = S[keep], E[keep], K[keep], [s for s, k in zip(src, keep, strict=True) if k]
+        return (S, E, K, src, self._gate(S, E, K, p, sig)), n
+
+    def _pool_stats(self, sig: dict, cands: tuple, p: ParsedQuery) -> dict:
+        """The stage-1 pool statistics of a brief (vhe.rank.features.pool_stats over its usable candidates), as
+        clips() computes them: for spans featurised outside a clips() run."""
+        S, E, K, src = cands[:4]
+        return pool_stats(featurize(self.corpus, sig, S, E, K, src, p))
+
+    def _rescore_extended(self, body: list[dict], sig: dict, p: ParsedQuery, stats: dict) -> None:
+        """Clips the budget fill lengthened (vhe.rank.select.fill_budget) get the features and total of their final
+        span, so the result and the dump describe the clip that is returned."""
+        grown = [o for o in body if o.get("extended")]
+        if not grown:
+            return
+        S, E, K = (np.array([o[key] for o in grown]) for key in ("start", "end", "file"))
+        X = featurize(self.corpus, sig, S, E, K, [o["source"] for o in grown], p, stats=stats)
+        for o, x in zip(grown, X, strict=True):
+            t = self.scorer.rescore(np.array([o["total"]]), o["x"][None], x[None], o["q"])
+            o.update(x=x, total=float(np.asarray(t)[0]))
 
     def _edge_clip(self, text: str | None, sig: dict, cands: tuple, p: ParsedQuery, taken: list[dict],
                    max_len: float, persona: str | None = None, hook: bool = False) -> dict | None:
@@ -349,7 +380,9 @@ class Engine:
     def features_for_spans(self, query: str, spans: list[dict], persona: str | None = None, llm: str | None = "auto",
                            **overrides) -> dict:
         """The dump document ("vhe-candidates/1", stage "external", vhe.rank.dump.external_spans) for spans picked
-        outside the engine: features from the same signals clips() computes for this brief, the score from the
-        engine scorer's score()."""
+        outside the engine: features from the same signals and stage-1 pool statistics clips() computes for this brief,
+        the score the engine's scorer gives a final clip (rescore of the span's own features)."""
         p = self.parse(query, llm, **overrides)
-        return dumps.external_spans(self.corpus, self.scorer, query, p, persona, self._signals(p)[0], spans)
+        sig, _, proposals = self._signals(p)
+        stats = self._pool_stats(sig, self._candidates(sig, p, proposals)[0], p)
+        return dumps.external_spans(self.corpus, self.scorer, query, p, persona, sig, spans, stats)

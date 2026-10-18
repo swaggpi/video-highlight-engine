@@ -176,16 +176,20 @@ def test_rows_of_another_feature_version_are_refused():
     assert len(ds) == len(rows) - 1 and ds.source["skipped"] == {"feature_version v0": 1}
 
 
-def test_v1_rows_are_refused_and_v2_rows_carry_the_appended_columns():
+def test_v1_and_v2_rows_are_refused_and_v3_rows_carry_the_appended_columns():
     rows = make_rows(n_queries=2, per_query=4, n_pool=0)
     for r in rows[:3]:
         r["feature_version"] = "v1"
-        for name in FEATURES[71:]:  # a v1 row has no v2 columns
+        for name in FEATURES[71:]:  # a v1 row has no v2 or v3 columns
+            r.pop(f"f_{name}")
+    for r in rows[3:5]:
+        r["feature_version"] = "v2"
+        for name in FEATURES[82:]:  # a v2 row has no v3 columns
             r.pop(f"f_{name}")
     ds = bd.build(rows)
-    assert FEATURE_VERSION == "v2" and ds.source["skipped"] == {"feature_version v1": 3}
-    assert len(ds) == len(rows) - 3 and ds.X.shape == (len(rows) - 3, len(FEATURES))
-    assert ds.Q.shape[1] == len(query_names(PERSONAS)) and "framing_close" in query_names(PERSONAS)
+    assert FEATURE_VERSION == "v3" and ds.source["skipped"] == {"feature_version v1": 3, "feature_version v2": 2}
+    assert len(ds) == len(rows) - 5 and ds.X.shape == (len(rows) - 5, len(FEATURES))
+    assert ds.Q.shape[1] == len(query_names(PERSONAS)) and {"framing_close", "highlight"} <= set(query_names(PERSONAS))
 
 
 def test_linear_scorer_mask_validation(tmp_path):
