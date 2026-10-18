@@ -36,6 +36,7 @@ from vhe.query.lexicon import (
     DELIVERABLE,
     EDGE_STOP,
     ENERGY,
+    EVALUATIVE,
     EXHAUSTIVE,
     FACES_CUE,
     FILLER,
@@ -441,6 +442,16 @@ def _nameable(item: str) -> bool:
                for w in word_tokens(item))
 
 
+def evaluation_only(text: str) -> bool:
+    """An opener / closer / shot description that only judges ("the single best 10-20 s moment of the stream", "the
+    funniest part", "the most hype clip", "the hook"): no word of something to see besides superlatives, clip nouns,
+    the source ("of the stream"), numbers and units. As slot text it would rank by image-text similarity to a
+    judgement; the brief's highlight / reaction prior answers it instead."""
+    return not any(len(w) > 2 and w not in EVALUATIVE | STYLE | GENERIC_HEAD | ITEM_EDGE | ABSTRACT | SOURCE_WORDS
+                   and not (len(w) >= 7 and w.endswith("iest")) and not re.fullmatch(UNIT, w)
+                   for w in word_tokens(text))
+
+
 def _dedupe(items: list[str], also: tuple = ()) -> list[str]:
     """Drop empties, repeats and items that restate one of `also` (opener/closer) or an earlier item."""
     def toks(s):
@@ -630,6 +641,9 @@ def finalise(p: ParsedQuery, explicit_len: bool, hint: str | None, count: int | 
         p.hook = True
         if _cue_only(p.opener):
             p.opener = None
+    # "open with the funniest part": a judgement, not a shot; the clips' own ranking finds it (in footage order)
+    p.opener = None if p.opener and evaluation_only(p.opener) else p.opener
+    p.closer = None if p.closer and evaluation_only(p.closer) else p.closer
     if p.framing not in ("none", "close", "wide"):
         p.framing = "none"
     p.shots = _categorise(_dedupe(p.shots, (p.opener, p.closer)), p.raw)

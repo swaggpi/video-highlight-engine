@@ -109,3 +109,58 @@ def test_cli_budget_accepts_unicode_dashes():
     from vhe.cli import _budget
 
     assert _budget("60—90") == _budget("60–90") == _budget("60-90") == (60.0, 90.0) and _budget("75") == 75.0
+
+
+# ---- an LLM opener / closer that judges instead of showing -----------------------------------------------------------
+COLD_OPEN = "cold open: the single best 10-20 s moment of the stream"
+
+
+@pytest.mark.parametrize("text", ["the single best 10-20 s moment of the stream", "best moment", "the funniest part",
+                                  "the most hype clip", "the hook", "the biggest reaction"])
+def test_evaluation_only_descriptions(text):
+    assert rules.evaluation_only(text)
+
+
+@pytest.mark.parametrize("text", ["establishing wide of Madison Avenue with barricades",
+                                  "giant flag and chanting crowd", "something huge filling the frame",
+                                  "face-filter intro", "the final Game Over", "the priest"])
+def test_visible_descriptions_are_not_evaluation_only(text):
+    assert not rules.evaluation_only(text)
+
+
+def test_llm_cold_open_judgement_is_no_opener_slot(monkeypatch):
+    _llm(monkeypatch, {"content": "best moment from stream", "shots": ["best moment"], "opener": COLD_OPEN})
+    p = llm.parse_with_llm(COLD_OPEN, "fake")
+    assert p.opener is None and p.closer is None and p.shots == []  # the reaction prior ranks the one clip
+    assert p.reaction and p.highlight and p.count == 1 and (p.min_len, p.max_len) == (10.0, 20.0)
+    r = parse(COLD_OPEN)
+    assert (r.opener, r.count, r.min_len, r.max_len, r.reaction) == (p.opener, p.count, p.min_len, p.max_len, True)
+
+
+def test_llm_opener_closer_grounded_in_the_rules(monkeypatch):
+    brief = ("Cut a 60-90 s recap of the parade. Open on an establishing wide of the avenue with barricades. Show the "
+             "dancers and the horses. End on the giant flag.")
+    _llm(monkeypatch, {"content": "parade recap", "shots": ["dancers", "horses"], "opener": "the best moment",
+                       "closer": "giant flag waving"})
+    p = llm.parse_with_llm(brief, "fake")
+    assert p.opener == parse(brief).opener  # a judgement from the model: the rules' visible opener stands
+    assert p.closer == "giant flag waving"  # the rules found a closer: the model's wording of it is kept
+    # The rules found no edge: the model's counts when it names something visible in the brief, not when invented.
+    loose = "A 2 minute recap of the parade with the dancers and the horses, and the giant flag at the end."
+    _llm(monkeypatch, {"content": "parade recap", "shots": ["dancers", "horses"], "opener": "drone over the harbour",
+                       "closer": "giant flag"})
+    p = llm.parse_with_llm(loose, "fake")
+    assert p.opener is None and p.closer == "giant flag"
+
+
+def test_llm_edge_in_a_one_clip_brief_is_the_clip_not_a_slot(monkeypatch):
+    brief = "Find the single best 10-20 s moment, ideally a jump scare with a loud scream on the facecam."
+    _llm(monkeypatch, {"content": "jump scare", "shots": [], "opener": "jump scare with a loud scream"})
+    p = llm.parse_with_llm(brief, "fake")
+    assert p.opener is None and p.count == 1 and p.reaction
+
+
+def test_rules_drop_a_judgement_opener():
+    p = parse("Cut a 60 s reel of the parade. Open with the most hype clip, then the dancers and the horses.")
+    assert p.opener is None
+    assert parse("Cut a 60 s reel. Open with the drone shot of the harbour.").opener == "drone shot of the harbour"

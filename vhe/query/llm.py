@@ -28,7 +28,7 @@ from vhe.query.lexicon import (
     TOPIC,
 )
 from vhe.query.model import BUDGET_TOL, ParsedQuery
-from vhe.query.rules import finalise, normalise, parse_rules, set_mood
+from vhe.query.rules import evaluation_only, finalise, normalise, parse_rules, set_mood
 from vhe.query.text_match import word_tokens
 
 # qwen3:1.7b was measured as the default (2026-10-18, 17 dev briefs, same prompt): 2-3x faster (mean 14.7 s vs 31.8 s
@@ -259,6 +259,25 @@ def _grounded(item: str, vocab: set[str]) -> bool:
     return bool(stems) and sum(s in vocab for s in stems) / len(stems) > 0.5
 
 
+def _edge(data: dict, key: str, base: ParsedQuery, vocab: set[str], english: bool) -> str | None:
+    """The model's opener / closer, grounded in the rules: a judgement ("the single best 10-20 s moment of the
+    stream", "the funniest part") is no shot, so the rules' description stands (none on that brief: qwen3:4b made
+    "cold open: the single best 10-20 s moment" the opener, and the one clip was ranked by SigLIP on that phrase
+    instead of by the reaction prior). One the rules did not find counts only where it names something visible in the
+    brief (_grounded), and never in a one-clip edit: there the clip is the whole deliverable ("the single best moment
+    as a cold open"), which the brief's own ranking picks, not a slot ranked on a description."""
+    v = " ".join(str(data.get(key) or "").split())
+    rules_v = getattr(base, key)
+    if not v or evaluation_only(v):
+        return rules_v
+    if rules_v:
+        return v
+    if base.count_explicit and base.count == 1:
+        return None
+    named = " ".join(w for w in word_tokens(v) if w not in STYLE | GENERIC_HEAD)  # "drone shot" for "drone opener"
+    return v if not english or _grounded(named, vocab) else None
+
+
 def _from_llm(data: dict, base: ParsedQuery, explicit_len: bool) -> tuple[ParsedQuery, bool]:
     """The model's plan, grounded in the brief: numbers it gives that the brief does not contain are ignored, and
     numbers, live sound, speech and exhaustiveness the rules found always stand."""
@@ -309,9 +328,8 @@ def _from_llm(data: dict, base: ParsedQuery, explicit_len: bool) -> tuple[Parsed
         EXHAUSTIVE_CUE, re.sub(NOT_EXHAUSTIVE, " ", p.raw.lower())) is not None)
     p.need_live_audio = base.need_live_audio or (bool(data.get("need_live_audio")) and
                                                  re.search(LIVE_CUE, p.raw.lower()) is not None)
-    p.opener = " ".join(str(data.get("opener") or "").split()) or base.opener
-    p.closer = " ".join(str(data.get("closer") or "").split()) or base.closer
-    p.shots = items("shots") or _shot_fallback(base.shots)
+    p.opener, p.closer = _edge(data, "opener", base, vocab, english), _edge(data, "closer", base, vocab, english)
+    p.shots = [x for x in items("shots") if not evaluation_only(x)] or _shot_fallback(base.shots)
     # Forbidden items stay hard only when the brief has a word that forbids ("no", "never", "keine", ...).
     ex = items("exclude")
     hard = re.search(HARD_CUE, low) is not None

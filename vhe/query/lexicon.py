@@ -186,6 +186,16 @@ FRAMING_WORDS = FRAMING_HEADS | {"close", "ups", "tight", "view", "views", "angl
 
 # Nothing to see: "has to work with no context", "no slow build" (a pacing rule, not a picture).
 ABSTRACT = {"something", "anything", "any", "context", "build", "buildup", "build-up", "intro", "setup", "explanation"}
+# A judgement, not a picture: an opener / closer / shot described only by these ("the single best 10-20 s moment of
+# the stream", "the funniest part", "the most hype clip", "the hook") names nothing an image-text model can match;
+# the highlight / reaction prior answers it (vhe.query.rules.evaluation_only). Superlatives in -iest count as well.
+EVALUATIVE = {"best", "top", "greatest", "biggest", "strongest", "coolest", "nicest", "loudest", "wildest", "hardest",
+              "finest", "sickest", "most", "more", "single", "great", "good", "nice", "cool", "favourite", "favorite",
+              "key", "epic", "insane", "crazy", "funny", "hype", "hyped", "hypest", "hook", "hooks", "hooky",
+              "highlight", "highlights", "memorable", "iconic", "viral", "exciting", "interesting", "standout",
+              "reaction", "reactions", "bits", "cold", "open", "opener", "opening", "closing", "ending", "beste",
+              "besten", "bester", "bestes", "schönste", "schönsten", "coolste", "coolsten", "tollste", "tollsten",
+              "lustigste", "lustigsten"}
 
 
 # ---- visual cues: framing, faces, hook, readable text, centring -------------------------------------------------
