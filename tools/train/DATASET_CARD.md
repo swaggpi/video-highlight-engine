@@ -1,4 +1,4 @@
-# Dataset card: vhe ranking rows (features v3)
+# Dataset card: vhe ranking rows (features v4)
 
 Training data for the learned candidate scorer (`vhe/rank/scorer.py`, `LinearRankScorer`). Built outside this
 repository by the field-test harness (`vhe-field-test/eval/`), consumed by `tools/train/`. Not shipped with the
@@ -25,21 +25,21 @@ package.
 |---|---|
 | `row_id` | `set/run_id/brief_id/origin/index` |
 | `set`, `run_id`, `brief_id` | the query: rows are only ever compared within one (set, run, brief) |
-| `persona`, `brief_kind`, `brief_text`, `parsed`, `q` | who the edit is for, `"reject"` briefs, the brief, the app's parse of it (with the visual cues framing, want_faces, hook, legible_text, centered), the query vector (`query_names()`, v3: v1, the v2 cue entries and the v3 `highlight` flag, then the personas) |
+| `persona`, `brief_kind`, `brief_text`, `parsed`, `q` | who the edit is for, `"reject"` briefs, the brief, the app's parse of it (with the visual cues framing, want_faces, hook, legible_text, centered), the query vector (`query_names()`, v4: v1, the v2 cue entries, the v3 `highlight` flag and the v4 `reaction` flag, then the personas) |
 | `file`, `start`, `end` | the span, file-local seconds (3 dp) |
 | `source`, `stage` | candidate generator (`window`, `peak`, ..., `external`) and dump stage |
 | `origin` | `app_dump` (the app's own dump), `app_picks` (app picks featurised afterwards), `opus` |
 | `selected_by` | `app`, `opus` or `none` (an unselected pool row) |
 | `app_rank`, `role` | selection order / opener-closer-soundbite in the app's run |
 | `dump_score` | the score recorded with the features: the run's scorer on the row's own features and `q` (`score()` for stage-1 `candidate` rows, the final total for every other row, `external` ones included; topic rows: the transcript match) |
-| `f_<name>` | the 95 features v3 (`vhe/rank/features.py: FEATURES`): the 71 of v1, the 11 index v3 columns `FEATURES_V2` (shot scale, faces, approach, OCR text, `ocr_item_match`), then the 13 `FEATURES_V3` (`edges_clean`, `legibility_mean`, `highlight_prior_mean`, `detail_z_mean`, `framing_frac`, and the `bucket_*` pool statistics of the brief's stage-1 candidates for the span's length bucket). Raw signals only: `h_rel_*` hold no legibility bonus or highlight blend since v3 |
+| `f_<name>` | the 101 features v4 (`vhe/rank/features.py: FEATURES`): the 71 of v1, the 11 index v3 columns `FEATURES_V2` (shot scale, faces, approach, OCR text, `ocr_item_match`), then the 13 `FEATURES_V3` (`edges_clean`, `legibility_mean`, `highlight_prior_mean`, `detail_z_mean`, `framing_frac`, and the `bucket_*` pool statistics of the brief's stage-1 candidates for the span's length bucket). then the 6 `FEATURES_V4` (`reaction_mean`, `reaction_max`: the audio reaction curve; `excitement_mean`: the transcript's excited speech; `quote_match`: a quoted line of the brief said in the span; `bucket_reaction`, `bucket_excitement`). Raw signals only: `h_rel_*` hold no legibility bonus or highlight blend since v3 |
 | `judge_clip`, `label_iou` | the judged clip the label came from, and the overlap (1.0 for an exact match) |
 | `judge_fit`, `judge_usable`, `judge_redundant` | the judge's clip scores; redundant = repeats an earlier clip of the same system's set |
 | `set_pref`, `set_margin` | +1 / -1 if the judge preferred / rejected the set this row was selected into; margin slight/clear/strong/forfeit |
 | `label_kind` | `judged`, `label_transfer`, `pool_negative`, `unjudged` |
 | `y_point`, `weight` | the target and row weight (below) |
 | `split` | `heldout` for set `festival-commons`, else `train` |
-| `feature_version`, `scorer_at_dump`, `app_sha` | provenance; rows of another feature version (v1 and v2 rows included: re-featurise the judged picks with `vhe features` or retrain on v3 dumps) are refused by `build_dataset.py` |
+| `feature_version`, `scorer_at_dump`, `app_sha` | provenance; rows of another feature version (v1 to v3 rows included: re-featurise the judged picks with `vhe features` or retrain on v4 dumps) are refused by `build_dataset.py` |
 
 ## Labels
 

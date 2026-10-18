@@ -26,6 +26,15 @@ from vhe.config import (
 REASONS = ("covered", "uniform", "blown_out", "blurry", "shaky", "obstructed", "bad_framing")
 SOFT = ("bad_framing",)
 SOFT_BITS = sum(1 << REASONS.index(r) for r in SOFT)
+COVERED_BIT, UNIFORM_BIT = np.uint8(1 << REASONS.index("covered")), np.uint8(1 << REASONS.index("uniform"))
+
+
+def decode_bits(bits: np.ndarray) -> np.ndarray:
+    """Stored reason bits as the query side reads them: "covered" counts only together with "uniform" (a dark frame
+    that shows something is content). Indexes written before covered required uniformity stored darkness alone; the
+    rule is applied here on read, so they need no re-index (for new indexes it changes nothing)."""
+    bits = np.asarray(bits, dtype=np.uint8)
+    return np.where((bits & UNIFORM_BIT) != 0, bits, bits & ~COVERED_BIT).astype(np.uint8)
 
 
 def blur_ratio(g: np.ndarray, side: int = BLUR_SIDE) -> float:
@@ -72,7 +81,8 @@ def usable_mask(luma: np.ndarray, contrast: np.ndarray, blown: np.ndarray, ratio
     def above(x: np.ndarray | None, thr: float) -> np.ndarray:  # NaN / missing: not flagged
         return np.zeros(n, dtype=bool) if x is None else np.nan_to_num(np.asarray(x, dtype=float), nan=-np.inf) > thr
 
-    tests = (luma < COVERED_LUMA, contrast < UNIFORM_STD, blown > BLOWN_FRAC, ratio < BLUR_RATIO,
+    uniform = contrast < UNIFORM_STD
+    tests = ((luma < COVERED_LUMA) & uniform, uniform, blown > BLOWN_FRAC, ratio < BLUR_RATIO,
              above(shake, SHAKY), above(obstruction, OBSTRUCTED_MARGIN), above(framing, BAD_FRAMING_MARGIN))
     bits = np.zeros(n, dtype=np.uint8)
     for i, t in enumerate(tests):
@@ -81,8 +91,9 @@ def usable_mask(luma: np.ndarray, contrast: np.ndarray, blown: np.ndarray, ratio
 
 
 def reason_names(bits: int) -> list[str]:
-    """The REASONS set in one step's bits."""
-    return [r for i, r in enumerate(REASONS) if int(bits) >> i & 1]
+    """The REASONS set in one step's bits (decode_bits applied)."""
+    bits = int(decode_bits(np.array([bits]))[0])
+    return [r for i, r in enumerate(REASONS) if bits >> i & 1]
 
 
 def reason_active(name: str) -> bool:
@@ -96,14 +107,15 @@ def _bits_of(names) -> np.uint8:
 
 def reason_mask(bits: np.ndarray, *names: str) -> np.ndarray:
     """bool per step: any of the named REASONS set in `bits` (grid["unusable"]); inactive reasons never show."""
-    return (np.asarray(bits, dtype=np.uint8) & _bits_of(r for r in names if reason_active(r))) > 0
+    return (decode_bits(bits) & _bits_of(r for r in names if reason_active(r))) > 0
 
 
 def query_usable(usable: np.ndarray, bits: np.ndarray) -> np.ndarray:
     """The stored usable mask as the query side applies it: steps made unusable only by inactive reasons are usable
-    again. With every reason active it is `usable` unchanged; a step marked unusable without any reason bit (or by
-    an active one) stays unusable."""
+    again (a dark but non-uniform step's stored "covered" bit counts as inactive: decode_bits). With every reason active
+    and new-rule bits it is `usable` unchanged; a step marked unusable without any reason bit (or by an active one)
+    stays unusable."""
     bits = np.asarray(bits, dtype=np.uint8)
     hard = _bits_of(r for r in REASONS if r not in SOFT)
     active = _bits_of(r for r in REASONS if r not in SOFT and reason_active(r))
-    return np.asarray(usable, dtype=bool) | (((bits & hard) != 0) & ((bits & active) == 0))
+    return np.asarray(usable, dtype=bool) | (((bits & hard) != 0) & ((decode_bits(bits) & active) == 0))

@@ -13,8 +13,9 @@ from __future__ import annotations
 import numpy as np
 
 from vhe.config import BLOWN_FRAC
-from vhe.signals import robust_z, smooth
+from vhe.signals import per_file, robust_z, smooth
 from vhe.signals.quality import reason_active, reason_mask
+from vhe.signals.reaction import reaction_steps
 
 # log-odds -> relevance: odds of e^-8 (p ~ 3e-4) is 0, every REL_WIDTH nats one unit, clipped to +-3 like the
 # z-scored signals. SigLIP2 logits: unrelated frames ~ -15..-10, partial matches ~ -6..-2, clear matches > 0.
@@ -22,18 +23,6 @@ REL_MID, REL_WIDTH = -8.0, 2.5
 FRAMING_PENALTY = 1.0  # quality units off a step with the soft bad_framing reason (detail is 0.6 per z unit)
 TOP_FRAC = 0.6  # a span is as relevant as the mean of its best 60 % of steps
 LIVE_MIN_DB = -60.0  # loudness (dBFS) below this is muted: phone mutes are digital silence at -120 dB
-
-
-def per_file(fn, x: np.ndarray, file_id: np.ndarray | None) -> np.ndarray:
-    """fn applied to each file's block of x separately (file_id is non-decreasing)."""
-    x = np.asarray(x, dtype=float)
-    if file_id is None:
-        return fn(x)
-    out = np.empty_like(x)
-    edges = np.flatnonzero(np.diff(file_id)) + 1
-    for a, b in zip(np.r_[0, edges], np.r_[edges, len(x)], strict=True):
-        out[a:b] = fn(x[a:b])
-    return out
 
 
 def relevance(sim: np.ndarray, fps: float, logit: tuple[float, float],
@@ -147,7 +136,8 @@ def timestep_signals(grid: dict, fps: float, rel: np.ndarray | None = None, has_
     """Signals per grid step. rel: from relevance() (zeros without a content query). has_audio: per step or one
     flag. file_id: per step, for per-file loudness centring and smoothing; None = one file. Besides the five
     weighted signals: the energy components, the quality components detail_z (0 where unmeasured) and framing (the
-    soft bad-framing reason), and per-step audio, unusable and blown-pixel fractions (features)."""
+    soft bad-framing reason), the audio reaction curve (vhe.signals.reaction: loudness and onset bursts over each
+    file's running baseline), and per-step audio, unusable and blown-pixel fractions (features)."""
     n = len(grid["t"])
     audio = np.broadcast_to(np.asarray(has_audio, dtype=bool), (n,))
     usable = np.asarray(grid["usable"], dtype=bool)
@@ -157,6 +147,7 @@ def timestep_signals(grid: dict, fps: float, rel: np.ndarray | None = None, has_
             "detail_z": np.nan_to_num(qparts["detail"]), "framing": qparts["framing"],
             "energy": _energy(parts, audio), "steady": -robust_z(grid["shake"]),
             "speech": np.asarray(grid["speech"], dtype=float), **parts,
+            "reaction": reaction_steps(grid["loudness"], grid["onset"], audio, fps, file_id),
             "audio": audio.astype(float), "unusable": (~usable).astype(float),
             "blown": np.nan_to_num(np.asarray(grid.get("blown", np.zeros(n)), dtype=float))}
 

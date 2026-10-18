@@ -1,7 +1,7 @@
 """Candidate dumps ("vhe-candidates/1"): every candidate a run scored, with its feature vector, its score and whether
 it was selected, so judge labels can be joined onto spans to build a training set.
 
-{"format": "vhe-candidates/1", "feature_version": "v3", "query_version": "v3",
+{"format": "vhe-candidates/1", "feature_version": "v4", "query_version": "v4",
  "run": {"app_sha", "scorer", "created", "corpus_root", "n_files"},
  "query": {"brief", "parsed", "persona", "q": {name: value}},
  "feature_names": [...],

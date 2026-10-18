@@ -2,11 +2,12 @@
 words read by OCR inside a span (ocr_item_scores), and the legibility prior for briefs that ask for readable text."""
 from __future__ import annotations
 
+import math
 import re
 
 import numpy as np
 
-from vhe.query.lexicon import LEGIBLE_CUE
+from vhe.query.lexicon import LEGIBLE_CUE, QUOTE_MIN_WORDS, QUOTED
 
 WORD = r"[^\W\d_][\w'-]*"  # a word: a letter, then letters, digits, apostrophes or hyphens
 
@@ -105,3 +106,70 @@ def legible_items(items: list[str]) -> np.ndarray:
     banner readable"); all True when none does (the whole brief asks: "every shot where text is legible")."""
     ask = np.array([re.search(LEGIBLE_CUE, x.lower()) is not None for x in items], dtype=bool)
     return ask if ask.any() else np.ones(len(items), dtype=bool)
+
+
+# ---- quoted lines against the transcript -------------------------------------------------------------------------
+# A brief that quotes what someone says ("the 'I made it into Harvard' speech", "she thought I was a watermelon")
+# wants the moment the line is said: its words are looked up in the transcript (ParsedQuery.lines; the heuristic's
+# QUOTE_BONUS, the quote_match feature). Whisper rarely has the exact wording ("I finally made the Harvard"), so a
+# line is matched on its content words (5-letter stems) inside a window of its length plus LINE_SLACK transcript
+# words, each word weighted by how rare it is in the transcript (a match on "watermelon" counts more than one on
+# "thought"). The step value ramps from 0 at LINE_FLOOR of the line's weight to 1 at all of it; matches below
+# LINE_MIN_MATCH are dropped.
+LINE_MIN_MATCH = 0.5
+LINE_MIN_ALL = 0.75  # a line of function words and a name ("we are going to Granny"): most of it must be said
+LINE_FLOOR = 0.35
+LINE_SLACK = 4
+
+
+def quoted_lines(text: str) -> list[str]:
+    """Quoted passages of at least QUOTE_MIN_WORDS words ('the "I made it into Harvard" speech' -> "I made it into
+    Harvard"); a quote with a slash is a label ("scare/death"), not a line."""
+    return [" ".join(m.group(1).split()) for m in re.finditer(QUOTED, text)
+            if "/" not in m.group(1) and len(word_tokens(m.group(1))) >= QUOTE_MIN_WORDS]
+
+
+def _stem(word: str) -> str:
+    return re.sub(r"[^\w]", "", word.lower())[:5]
+
+
+def line_steps(words: list[dict], lines: list[str], n: int, fps: float) -> np.ndarray:
+    """(len(lines), n) per quoted line, 0..1 per grid step (module notes above): the best rarity-weighted share of the
+    line's content words (STOPWORDS left out unless that leaves fewer than two; then a match needs one of its content
+    words too and LINE_MIN_ALL of it: "we are going to Granny" is not any "where are you, Granny") said within a
+    window of the line's length plus LINE_SLACK transcript words, ramped from LINE_FLOOR to 1, on the steps from the
+    first to the last matched word. Words of one or two letters are no content words.
+    words: transcript words with virtual-second "start" / "end"."""
+    out = np.zeros((len(lines), n))
+    stems = [_stem(str(w.get("word", ""))) for w in words]
+    counts: dict[str, int] = {}
+    for s in stems:
+        counts[s] = counts.get(s, 0) + 1
+    idf = lambda s: 1.0 + math.log((len(stems) + 1) / (counts.get(s, 0) + 1))  # noqa: E731
+    for j, line in enumerate(lines):
+        toks = word_tokens(line)
+        content = {_stem(t) for t in toks if t not in STOPWORDS and len(t) > 2}
+        want = [_stem(t) for t in toks if _stem(t) in content] if len(content) >= 2 else [_stem(t) for t in toks]
+        if not want:
+            continue
+        total = sum(idf(s) for s in want)
+        width = len(toks) + LINE_SLACK
+        need = LINE_MIN_MATCH if len(content) >= 2 else LINE_MIN_ALL
+        for i in range(len(words)):
+            left = list(want)
+            got, first, last = 0.0, None, None
+            key = not content or len(content) >= 2  # the all-words fallback needs a content word
+            for k in range(i, min(len(words), i + width)):
+                if stems[k] and stems[k] in left:
+                    left.remove(stems[k])
+                    got += idf(stems[k])
+                    first = k if first is None else first
+                    last = k
+                    key = key or stems[k] in content
+            share = got / total
+            if first is None or share < need or not key:
+                continue
+            a = max(0, int(words[first]["start"] * fps))
+            b = min(n, int(np.ceil(words[last]["end"] * fps)))
+            out[j, a:b] = np.maximum(out[j, a:b], (share - LINE_FLOOR) / (1.0 - LINE_FLOOR))
+    return out

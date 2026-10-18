@@ -25,7 +25,10 @@ LANG_DETECT_S = 30.0  # seconds of speech per file used for language detection
 # Usable mask: ABSOLUTE thresholds per analysis step. BLUR_RATIO is calibrated on real footage (below); the others
 # are still initial guesses.
 # Darkness alone is not a defect (a well exposed concert can average 0.1), so only these count.
-COVERED_LUMA = 0.03  # mean luma (0..1) below this: lens covered / in a pocket
+# Covered = dark AND uniform (mean luma below COVERED_LUMA and luma std below UNIFORM_STD): a black frame that still
+# shows something (a game's black "Game Over" / "Day 2" screen with a facecam and chat overlay, std 0.06-0.09) is
+# content, not a covered lens. Real covered lenses / pockets in the camera sets read std <= 0.004.
+COVERED_LUMA = 0.03  # mean luma (0..1) below this (and uniform): lens covered / in a pocket
 UNIFORM_STD = 0.02  # luma std (0..1) below this: near-uniform frame (fabric, lens cap, wall right in front)
 BLOWN_FRAC = 0.5  # fraction of pixels >= 250 above this: blown out
 # Blurry: var(Lap(g)) / var(Lap(blur(g))) at BLUR_SIDE px below BLUR_RATIO (re-blur test, independent of texture).

@@ -2,7 +2,7 @@
 phi(x, q) = [z, outer(z, q_small)], z the standardised features (learned mask applied), q_small the brief's signal
 weights; plus a pointwise ridge baseline on the same phi. numpy only.
 
-  python tools/train/train_linear.py ROWS.jsonl [--name linear_v3] [--learner ranknet|ridge] [--split train]
+  python tools/train/train_linear.py ROWS.jsonl [--name linear_v4] [--learner ranknet|ridge] [--split train]
                                      [--l2 1e-3,1e-2,0.1,1,10] [--no-cv] [--keep-all-features]
                                      [--no-interactions] [--seed 0] [--report OUT.json]
 

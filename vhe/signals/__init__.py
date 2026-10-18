@@ -51,3 +51,15 @@ def fill_nan(x: np.ndarray) -> np.ndarray:
         good = np.flatnonzero(~bad)
         x[bad] = np.interp(np.flatnonzero(bad), good, x[good])
     return x
+
+
+def per_file(fn, x: np.ndarray, file_id: np.ndarray | None) -> np.ndarray:
+    """fn applied to each file's block of x separately (file_id is non-decreasing; None: one file)."""
+    x = np.asarray(x, dtype=float)
+    if file_id is None:
+        return fn(x)
+    out = np.empty_like(x)
+    edges = np.flatnonzero(np.diff(file_id)) + 1
+    for a, b in zip(np.r_[0, edges], np.r_[edges, len(x)], strict=True):
+        out[a:b] = fn(x[a:b])
+    return out

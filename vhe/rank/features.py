@@ -33,8 +33,11 @@ from vhe.signals.tags import LABELS
 # are raw columns now, the heuristic composes them); FEATURES_V3 appended (clean edges, legibility, highlight prior,
 # quality components, length-bucket pool statistics); ocr_item_match has the one ignore rule (OCR_GENERIC); the
 # query vector gains the highlight flag (QUERY_V3). The first 82 names are v2's, in v2's order.
-FEATURE_VERSION = "v3"
-QUERY_VERSION = "v3"
+# v4 (2026-10-18): reaction signals appended (FEATURES_V4: the audio reaction curve, the transcript's excited speech,
+# quoted-line matches, their length-bucket medians) and the reaction flag to the query (QUERY_V4). The first 95 names
+# are v3's, in v3's order.
+FEATURE_VERSION = "v4"
+QUERY_VERSION = "v4"
 SOURCES = ("shot", "window", "peak", "model", "speech")  # vhe.query.candidates.generate
 PERSONAS = ("p1-videographer", "p2-tiktok", "p3-newsedit", "p4-vlogger", "p5-marketing", "p6-casual")
 SIGNALS = ("relevance", "quality", "energy", "steady", "speech")  # the weighted signals of ParsedQuery.weights
@@ -99,7 +102,16 @@ BUCKET_COLS = {"bucket_h_rel": "h_rel_mean", "bucket_quality": "quality_mean", "
                "bucket_highlight": "highlight_prior_mean"}
 FEATURES_V3 = ("edges_clean", "legibility_mean", "highlight_prior_mean", "detail_z_mean", "framing_frac",
                "bucket_size", *BUCKET_COLS)
-FEATURES = FEATURES + FEATURES_V2 + FEATURES_V3
+# v4, appended (vhe.signals.reaction; whatever the brief asks). reaction_mean / reaction_max: the audio reaction curve
+# (loudness and onset bursts over the file's running baseline, robust z); excitement_mean: the transcript's excited
+# speech (exclamations, laughter tokens, strong words, shouted words, repeats, speech-rate bursts; robust z, 0
+# without a transcript); quote_match: the best share of a quoted line of the brief (ParsedQuery.lines) said inside
+# the span (0..1, vhe.query.text_match.line_steps; 0 without lines); bucket_reaction / bucket_excitement: their
+# length-bucket medians over the stage-1 pool, like the v3 bucket_* columns.
+BUCKET_COLS_V4 = {"bucket_reaction": "reaction_mean", "bucket_excitement": "excitement_mean"}
+FEATURES_V4 = ("reaction_mean", "reaction_max", "excitement_mean", "quote_match", *BUCKET_COLS_V4)
+BUCKETS = {**BUCKET_COLS, **BUCKET_COLS_V4}  # every bucket_* column and its source
+FEATURES = FEATURES + FEATURES_V2 + FEATURES_V3 + FEATURES_V4
 INDEX = {name: i for i, name in enumerate(FEATURES)}
 # The columns that describe a span's relevance to the brief: per shot item, item_features gives each item's own.
 ITEM_COLS = ("rel_mean", "rel_top60", "rel_max", "item_rel", "avoid_pen", "h_rel_mean", "h_rel_top60",
@@ -118,10 +130,11 @@ QUERY_BASE = (
 FRAMINGS = ("none", "close", "wide")
 QUERY_V2 = (*(f"framing_{x}" for x in FRAMINGS), "want_faces", "hook", "legible_text", "centered")
 QUERY_V3 = ("highlight",)
+QUERY_V4 = ("reaction",)  # a reaction brief (ParsedQuery.reaction: "the funniest moments", "every jump scare")
 
 
 def query_names(personas: tuple[str, ...] | list[str] = PERSONAS) -> tuple[str, ...]:
-    return QUERY_BASE + QUERY_V2 + QUERY_V3 + tuple(f"persona_{x}" for x in personas)
+    return QUERY_BASE + QUERY_V2 + QUERY_V3 + QUERY_V4 + tuple(f"persona_{x}" for x in personas)
 
 
 def target_len(p) -> float:
@@ -143,6 +156,7 @@ def query_vector(p, persona: str | None = None, personas: tuple[str, ...] | list
     v += [float(p.framing == x) for x in FRAMINGS]
     v += [float(bool(x)) for x in (p.want_faces, p.hook, p.legible_text, p.centered)]
     v += [float(bool(getattr(p, "highlight", False)))]
+    v += [float(bool(getattr(p, "reaction", False)))]
     v += [float(persona == x) for x in personas]
     return np.array(v, dtype=np.float64)
 
@@ -158,7 +172,7 @@ def pool_stats(X: np.ndarray) -> dict[str, np.ndarray]:
     b = length_bucket(X[:, INDEX["length_s"]]) if len(X) else np.zeros(0, int)
     nb = len(CANDIDATE_LENGTHS) + 1
     out = {"bucket_size": np.bincount(b, minlength=nb).astype(float)}
-    for name, src in BUCKET_COLS.items():
+    for name, src in BUCKETS.items():
         med = np.zeros(nb)
         for k in np.unique(b):
             med[k] = np.median(X[b == k, INDEX[src]])
@@ -170,7 +184,7 @@ def apply_pool(X: np.ndarray, stats: dict[str, np.ndarray]) -> np.ndarray:
     """Fill X's bucket_* columns from pool statistics (pool_stats), by each row's own length bucket; in place."""
     if len(X):
         b = length_bucket(X[:, INDEX["length_s"]])
-        for name in ("bucket_size", *BUCKET_COLS):
+        for name in ("bucket_size", *BUCKETS):
             X[:, INDEX[name]] = np.asarray(stats[name])[b]
     return X
 
@@ -199,10 +213,10 @@ def featurize(corpus, sig: dict, S: np.ndarray, E: np.ndarray, K: np.ndarray, sr
 
     sig: per-step signals. Required: relevance, quality, energy, steady, speech. Used when present: h_rel (the blended
     relevance, else relevance), siglip (else relevance), avoid_pen, nc_sal (NaN where absent), items / item_centre
-    (shot list), motion_z / cam_speed_z / loud_z / onset_z, detail_z, framing, legibility, highlight, clean, audio,
-    unusable, blown, muted (else from the corpus grid). item_rel: (n, items) SigLIP relevance of each span to each
-    shot item and ocr: (n, items) ocr_matrix, when the caller already has them. stats: the stage-1 pool's
-    statistics (pool_stats); None: these spans are the pool."""
+    (shot list), motion_z / cam_speed_z / loud_z / onset_z, detail_z, framing, legibility, highlight, clean, reaction,
+    excitement, quote, audio, unusable, blown, muted (else from the corpus grid). item_rel: (n, items) SigLIP
+    relevance of each span to each shot item and ocr: (n, items) ocr_matrix, when the caller already has them. stats:
+    the stage-1 pool's statistics (pool_stats); None: these spans are the pool."""
     c = corpus
     S, E, K = np.asarray(S, dtype=float), np.asarray(E, dtype=float), np.asarray(K, dtype=int)
     X = np.zeros((len(S), len(FEATURES)))
@@ -301,6 +315,16 @@ def featurize(corpus, sig: dict, S: np.ndarray, E: np.ndarray, K: np.ndarray, sr
                       ("detail_z_mean", "detail_z"), ("framing_frac", "framing")):
         if sig.get(key) is not None:
             put(name, span_mean(np.asarray(sig[key], dtype=float), i0, i1))
+
+    # v4: reaction, excited speech, quoted lines
+    if sig.get("reaction") is not None:
+        r = np.asarray(sig["reaction"], dtype=float)
+        put("reaction_mean", span_mean(r, i0, i1))
+        put("reaction_max", span_max(r, i0, i1))
+    if sig.get("excitement") is not None:
+        put("excitement_mean", span_mean(np.asarray(sig["excitement"], dtype=float), i0, i1))
+    if sig.get("quote") is not None:
+        put("quote_match", span_max(np.asarray(sig["quote"], dtype=float), i0, i1))
     return apply_pool(X, pool_stats(X) if stats is None else stats)
 
 

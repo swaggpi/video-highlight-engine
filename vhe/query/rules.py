@@ -32,6 +32,8 @@ from vhe.query.lexicon import (
     CUE_FILLER,
     CUE_NEGATION,
     DASHES,
+    DEAD_AIR,
+    DELIVERABLE,
     EDGE_STOP,
     ENERGY,
     EXHAUSTIVE,
@@ -54,10 +56,13 @@ from vhe.query.lexicon import (
     NOTHING_AFTER,
     NUMBER_WORDS,
     OPENER,
+    ORDER,
+    REACTION_CUE,
     SHORT,
     SHOT_LEAD,
     SINGLE,
     SOFT_AVOID,
+    SOURCE_WORDS,
     SOUNDBITE,
     SPEECH_FREE,
     SPEECH_ITEM,
@@ -75,6 +80,7 @@ from vhe.query.model import (
     BUDGET_TOL,
     EXHAUSTIVE_CAP,
     HIGHLIGHT_ENERGY,
+    HIGHLIGHT_LONG_BUDGET_S,
     HIGHLIGHT_MAX_LEN,
     HOOK_LIST_WEIGHTS,
     MAX_CLIPS,
@@ -87,7 +93,7 @@ from vhe.query.model import (
     TYPICAL_LEN,
     ParsedQuery,
 )
-from vhe.query.text_match import WORD, word_tokens
+from vhe.query.text_match import WORD, quoted_lines, word_tokens
 
 BARE_BUDGET_S = 30.0  # a duration with no clip/recap noun anywhere: at least this long reads as total runtime
 
@@ -124,6 +130,8 @@ def normalise(q: str) -> str:
     # "not too long" / "nich zu lang" asks for short clips; it must not read as "long" (or as something to avoid).
     q = re.sub(r"\b(?:not|nicht|nich|net)\s+(?:too|so|zu|allzu)\s+(?:long|lang|lange)\b", "short", q)
     q = re.sub(r"\b(?:not|nicht|nich|net)\s+(?:too|so|zu|allzu)\s+(?:short|kurz|kurze)\b", " ", q)
+    # "readable without context": understandable on its own, not legible text
+    q = re.sub(r"\b(?:readable|understandable)\s+(?:without|with\s+no)\s+(?:any\s+)?context\b", "self-contained", q)
     q = re.sub(r"\b(\d+):([0-5]\d)\b(?:\s*(?:min|mins|minutes?|minuten)\b)?",
                lambda m: f"{int(m.group(1)) * 60 + int(m.group(2))} s", q)  # 1:30 -> 90 s
     q = re.sub(r"\b(?:a|an|one|eine|einer)\s+(?=(?:min|minute|minuten)\b)", "1 ", q)
@@ -132,7 +140,8 @@ def normalise(q: str) -> str:
         pronoun = m.group(1) == "one" and re.search(r"\b(?:each|every|any|no|which|this|that|the)\s+$", q[:m.start()])
         return m.group(0) if pronoun else str(NUMBER_WORDS[m.group(1)])
 
-    q = re.sub(rf"\b({words})\b(?=[\s-]+(?:{UNIT}|{WORDS}{{0,3}}?{CLIP_NOUNS}\b))", number, q)
+    q = re.sub(rf"\b({words})\b(?=[\s-]+(?:{UNIT}|{WORDS}{{0,3}}?{CLIP_NOUNS}\b|{VALUE}[\s-]+{WORDS}{{0,2}}?"
+               rf"{CLIP_NOUNS}\b))", number, q)
     # "six to 12 seconds" (the second number word was converted above): the first one of the range too
     return re.sub(rf"\b({words})\b(?=\s*(?:-|to|bis|or|oder)\s*\d)", lambda m: str(NUMBER_WORDS[m.group(1)]), q)
 
@@ -348,6 +357,8 @@ def _plan(rest: str, q: str, p: ParsedQuery) -> str:
     topic and output-instruction parts. Sentences with a topic give no shots (their subject is the speaker)."""
     m = re.search(rf"(?<![\w-]){BUDGET_NOUNS}\s+(?:of|from|about|for)\s+(?P<x>[^.,;:!?]+)", q)
     subject = _clean_item(m.group("x")) if m else ""
+    if all(w in SOURCE_WORDS for w in subject.split()):  # "a highlights video from this vod": no content
+        subject = ""
     shots: list[str] = []
     kept: list[str] = []
     cue_parts: list[str] = []
@@ -356,6 +367,10 @@ def _plan(rest: str, q: str, p: ParsedQuery) -> str:
         s = sentence.strip()
         if re.search(META_SENTENCE, s):
             continue
+        m = re.search(DEAD_AIR, s)
+        if m:  # "cut all dead air: the menus, him leaving the desk": what to leave out, preferably (soft)
+            p.avoid += [x for x in map(_clean_item, _list_items(s[m.end():])) if x]
+            s = s[:m.start()]
         soft = re.search(SOFT_AVOID, s) is not None
         m = re.search(AVOID_STRONG, s)
         if m:
@@ -380,17 +395,20 @@ def _plan(rest: str, q: str, p: ParsedQuery) -> str:
             p.topics += _topic_items(m.group(0), s[m.end():])
             kept.append(re.sub(r"\b(?:where|when|while|in which)\s*$", "", s[:m.start()].strip()))
             continue
-        clauses = []
+        clauses, deliverable = [], []
         for c in _split_top(s, ","):
             colon = _top_colon(c)
             if re.search(META_CLAUSE, c[:colon].strip() if colon is not None else c.strip()):
                 c = c[colon + 1:] if colon is not None else ""  # "for example: a, b" keeps the list
+            if re.match(DELIVERABLE, c.strip()) and re.search(rf"(?<![\w-]){BUDGET_NOUNS}(?![\w-])", c):
+                deliverable.append(c)  # "cut a 10 min highlights video from this vod": format and subject, no shot
+                c = ""                 # (its words still set the mood: "cut an energetic recap")
             clauses.append("" if _cue_only(c) else c)  # "keep everything centered": a cue, not a shot
         s = ",".join(c for c in clauses if c.strip())
         colon = _top_colon(s)
         body = s if colon is None or not s[colon + 1:].strip() else s[colon + 1:]
         shots += [x for x in map(_clean_item, _list_items(body)) if x and x != subject]
-        kept.append(s)
+        kept.append(",".join([*deliverable, s]) if deliverable else s)
     seen = set()
     p.shots = [x for x in shots if not (x in seen or seen.add(x))] if len(set(shots)) >= 2 else []
     if p.shots:
@@ -450,12 +468,15 @@ def parse_rules(query: str) -> tuple[ParsedQuery, bool, str | None]:
     raw = query.strip()
     q = normalise(raw)
     p = ParsedQuery(raw=raw, text="")
-    rest = q
+    rest = re.sub(ORDER, " ", q)  # "with the best moments in stream order": clips always come in footage order
 
     for attr, pattern in (("opener", OPENER), ("closer", CLOSER)):
         m = re.search(pattern, rest)
         if m:
-            setattr(p, attr, m.group("x").strip())
+            # "each must ... end on a payoff": how every clip ends, not the edit's closing shot
+            sentence = re.split(r"[.!?;]", rest[:m.start()])[-1]
+            if not re.match(r"\s*(?:each|every|all)\b", sentence):
+                setattr(p, attr, m.group("x").strip())
             rest = _cut(rest, m.start(), m.end())
 
     m = re.search(LIVE_AUDIO, rest)
@@ -544,6 +565,28 @@ def parse_rules(query: str) -> tuple[ParsedQuery, bool, str | None]:
     return p, explicit_len, hint
 
 
+def _reaction(p: ParsedQuery) -> None:
+    """Quoted spoken lines (p.lines, minus the ones the opener/closer descriptions or the spoken topics hold: they serve
+    that slot or the topic match) and the reaction flag, read on the brief without its avoid clauses (rules; the raw
+    brief for the LLM path). A reaction brief is a highlight brief whose named moments are events, not pictures: its
+    shot list becomes one content text, and its named moments are looked up in the transcript like quoted lines."""
+    def flat(x: str) -> str:
+        return " " + " ".join(word_tokens(x)) + " "
+
+    elsewhere = [flat(x) for x in (p.opener, p.closer, *p.topics) if x]
+    lines = [x for x in quoted_lines(p.raw) if not any(flat(x) in e for e in elsewhere)]
+    p.lines = _dedupe(lines + list(p.lines))
+    cues = re.sub(r"[\"“”„][^\"“”„]*[\"“”]", " ", p.cue_text or normalise(p.raw))  # a quote is a line, not a cue
+    p.reaction = p.reaction or (re.search(REACTION_CUE, cues) is not None and not p.topics)
+    if not p.reaction:
+        return
+    p.highlight = True
+    if p.shots:  # "the fart gag, the bear trap, the mum cameo": events to find by reaction, not pictures to match,
+        p.text = ", ".join(x for x in (p.text, *p.shots) if x)  # and by what is said ("I'm in a bear trap!")
+        p.lines = _dedupe(p.lines + p.shots)
+        p.shots = []
+
+
 def finalise(p: ParsedQuery, explicit_len: bool, hint: str | None, count: int | None, min_len: float | None,
               max_len: float | None, budget_s: float | tuple | None) -> ParsedQuery:
     """Caller overrides, then everything derived from the budget, then clamps, then the plan lists. Shared by rules
@@ -553,13 +596,19 @@ def finalise(p: ParsedQuery, explicit_len: bool, hint: str | None, count: int | 
     if count is not None:
         p.count, p.count_explicit = int(count), True
     explicit_len = explicit_len or min_len is not None or max_len is not None
+    _reaction(p)
     mid = sum(p.budget) / 2 if p.budget else 0.0
+    # a reaction brief, or a highlights video several minutes long: moments of a few sentences, not 4 s cuts
+    moments = (p.reaction or (p.highlight and mid >= HIGHLIGHT_LONG_BUDGET_S)) and hint is None \
+        and p.mood != "energetic"
     if p.budget and not explicit_len:
         if p.count_explicit:  # "5 clips, 60 s total": each about 12 s
             per = mid / max(1, p.count)
             p.min_len, p.max_len = 0.75 * per, 1.25 * per
         else:
-            p.min_len, p.max_len = TYPICAL_LEN[hint or p.mood]
+            p.min_len, p.max_len = TYPICAL_LEN["moment" if moments else hint or p.mood]
+    elif moments and not explicit_len:
+        p.min_len, p.max_len = TYPICAL_LEN["moment"]
     if min_len is not None:
         p.min_len = min_len
     if max_len is not None:
@@ -600,10 +649,10 @@ def finalise(p: ParsedQuery, explicit_len: bool, hint: str | None, count: int | 
     if p.highlight and not p.shots and not p.topics:
         if p.mood is None:  # "the best moments": lively over static, unless the brief sets a mood
             p.weights["energy"] = max(p.weights["energy"], HIGHLIGHT_ENERGY)
-        if not explicit_len and not p.budget:  # many short moments, never one long static take
+        if not explicit_len and not p.budget and not moments:  # many short moments, never one long static take
             p.min_len, p.max_len = min(p.min_len, TYPICAL_LEN[None][0]), min(p.max_len, HIGHLIGHT_MAX_LEN)
     else:
-        p.highlight = False
+        p.highlight = p.reaction = False
     if p.shots and not p.text:
         p.text = ", ".join(p.shots)
     if len(p.shots) >= 2 and not p.hook_list:

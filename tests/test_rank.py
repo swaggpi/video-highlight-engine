@@ -18,6 +18,7 @@ from vhe.rank.features import (
     FEATURE_VERSION,
     FEATURES,
     FEATURES_V3,
+    FEATURES_V4,
     INDEX,
     PERSONAS,
     featurize,
@@ -114,9 +115,11 @@ def test_span_statistics_match_the_per_span_definitions():
 
 # ---- features --------------------------------------------------------------------------------------------------
 def test_feature_names_are_stable_and_unique():
-    assert FEATURE_VERSION == "v3" and len(set(FEATURES)) == len(FEATURES)  # v2 block: test_cues
+    assert FEATURE_VERSION == "v4" and len(set(FEATURES)) == len(FEATURES)  # v2 block: test_cues
     assert FEATURES[:3] == ("rel_mean", "rel_top60", "rel_max")
-    assert FEATURES[82:] == FEATURES_V3 == (  # v3, appended after v2's 82
+    assert FEATURES[95:] == FEATURES_V4 == (  # v4, appended after v3's 95
+        "reaction_mean", "reaction_max", "excitement_mean", "quote_match", "bucket_reaction", "bucket_excitement")
+    assert FEATURES[82:95] == FEATURES_V3 == (  # v3, appended after v2's 82
         "edges_clean", "legibility_mean", "highlight_prior_mean", "detail_z_mean", "framing_frac", "bucket_size",
         "bucket_h_rel", "bucket_quality", "bucket_energy", "bucket_steady", "bucket_speech", "bucket_legibility",
         "bucket_highlight")

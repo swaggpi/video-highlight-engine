@@ -17,6 +17,7 @@ from vhe.rank.features import (
     FEATURES,
     FEATURES_V2,
     FEATURES_V3,
+    FEATURES_V4,
     FRAMINGS,
     INDEX,
     PERSONAS,
@@ -192,9 +193,10 @@ def test_hook_slot_is_the_first_clip_and_the_best_hook(tmp_path):
 
 # ---- schema: features and query v2 (inside v3), dumps, v1/v2 models --------------------------------------------
 def test_features_v2_append_to_v1_in_order():
-    # v3 appends FEATURES_V3 after the v2 block (test_rank checks the v3 tail); v1 then v2 stay the prefix
-    assert FEATURE_VERSION == "v3" and QUERY_VERSION == "v3" and len(set(FEATURES)) == len(FEATURES)
-    assert len(FEATURES) == V1_LEN + len(FEATURES_V2) + len(FEATURES_V3)
+    # v3 and v4 append FEATURES_V3 / FEATURES_V4 after the v2 block (test_rank checks the tail); v1 then v2 stay the
+    # prefix
+    assert FEATURE_VERSION == "v4" and QUERY_VERSION == "v4" and len(set(FEATURES)) == len(FEATURES)
+    assert len(FEATURES) == V1_LEN + len(FEATURES_V2) + len(FEATURES_V3) + len(FEATURES_V4)
     assert FEATURES[V1_LEN - len(V1_TAIL):V1_LEN] == V1_TAIL
     assert FEATURES[V1_LEN:V1_LEN + len(FEATURES_V2)] == FEATURES_V2 == (
         "scale_close_mean", "scale_close_max", "scale_wide_mean", "face_area_max_mean", "face_area_max_max",
@@ -202,7 +204,7 @@ def test_features_v2_append_to_v1_in_order():
     names = query_names()
     assert names[:len(QUERY_BASE)] == QUERY_BASE and names[len(QUERY_BASE):len(QUERY_BASE) + len(QUERY_V2)] == (
         "framing_none", "framing_close", "framing_wide", "want_faces", "hook", "legible_text", "centered")
-    assert names[len(QUERY_BASE) + len(QUERY_V2):-len(PERSONAS)] == ("highlight",)
+    assert names[len(QUERY_BASE) + len(QUERY_V2):-len(PERSONAS)] == ("highlight", "reaction")
     assert names[-len(PERSONAS):] == tuple(f"persona_{x}" for x in PERSONAS)
     q = query_vector(parse(TIKTOK), "p2-tiktok")
     assert len(q) == len(names) and q[names.index("framing_close")] == 1.0 and q[names.index("framing_none")] == 0.0
@@ -244,11 +246,11 @@ def test_featurize_v2_is_neutral_without_index_v3_signals(tmp_path):
     np.testing.assert_array_equal(HeuristicScorer().cue_bonus(X, query_vector(p)), 0.0)
 
 
-def test_dumps_carry_v3(tmp_path):
+def test_dumps_carry_v4(tmp_path):
     eng = cue_engine(tmp_path / "cues")
     eng.clips(CUE_BRIEFS["cue_close"], llm=None, dump=tmp_path / "d.json", dump_all=True)
     d = dumps.read(tmp_path / "d.json")
-    assert d["feature_version"] == "v3" and d["query_version"] == "v3" and d["feature_names"] == list(FEATURES)
+    assert d["feature_version"] == "v4" and d["query_version"] == "v4" and d["feature_names"] == list(FEATURES)
     assert d["query"]["q"]["framing_close"] == 1.0 and d["query"]["parsed"]["framing"] == "close"
     rows = [c for c in d["candidates"] if c["stage"] == "candidate"]
     X = np.array([c["features"] for c in rows])
@@ -256,23 +258,29 @@ def test_dumps_carry_v3(tmp_path):
     np.testing.assert_allclose(HeuristicScorer().score(X, q), [c["score"] for c in rows], atol=1e-4)
 
 
-def test_v1_and_v2_model_files_are_refused_clearly(tmp_path):
+def test_v1_to_v3_model_files_are_refused_clearly(tmp_path):
     F = len(FEATURES)
-    v3 = LinearRankScorer(np.zeros(F), np.ones(F), np.zeros(F)).to_json()
-    path = tmp_path / "v3.json"
-    path.write_text(json.dumps(v3))
+    v4 = LinearRankScorer(np.zeros(F), np.ones(F), np.zeros(F)).to_json()
+    path = tmp_path / "v4.json"
+    path.write_text(json.dumps(v4))
     assert isinstance(load_scorer(path), LinearRankScorer)
-    v1 = dict(v3, feature_version="v1", query_version="v1", features=list(FEATURES[:V1_LEN]), mu=[0.0] * V1_LEN,
+    v1 = dict(v4, feature_version="v1", query_version="v1", features=list(FEATURES[:V1_LEN]), mu=[0.0] * V1_LEN,
               sd=[1.0] * V1_LEN, w=[0.0] * V1_LEN)
     path.write_text(json.dumps(v1))
-    with pytest.raises(ValueError, match=r"features 'v1'.*this engine computes features 'v3'.*Retrain"):
+    with pytest.raises(ValueError, match=r"features 'v1'.*this engine computes features 'v4'.*Retrain"):
         load_scorer(path)
     V2_LEN = V1_LEN + len(FEATURES_V2)
-    v2 = dict(v3, feature_version="v2", query_version="v2", features=list(FEATURES[:V2_LEN]), mu=[0.0] * V2_LEN,
+    v2 = dict(v4, feature_version="v2", query_version="v2", features=list(FEATURES[:V2_LEN]), mu=[0.0] * V2_LEN,
               sd=[1.0] * V2_LEN, w=[0.0] * V2_LEN)
     path.write_text(json.dumps(v2))
-    with pytest.raises(ValueError, match=r"features 'v2'.*this engine computes features 'v3'.*Retrain"):
+    with pytest.raises(ValueError, match=r"features 'v2'.*this engine computes features 'v4'.*Retrain"):
         load_scorer(path)
-    with pytest.raises(ValueError, match="query vector 'v2'"):
-        path.write_text(json.dumps(dict(v3, query_version="v2")))
+    V3_LEN = V2_LEN + len(FEATURES_V3)
+    v3 = dict(v4, feature_version="v3", query_version="v3", features=list(FEATURES[:V3_LEN]), mu=[0.0] * V3_LEN,
+              sd=[1.0] * V3_LEN, w=[0.0] * V3_LEN)
+    path.write_text(json.dumps(v3))
+    with pytest.raises(ValueError, match=r"features 'v3'.*this engine computes features 'v4'.*Retrain"):
+        load_scorer(path)
+    with pytest.raises(ValueError, match="query vector 'v3'"):
+        path.write_text(json.dumps(dict(v4, query_version="v3")))
         load_scorer(path)

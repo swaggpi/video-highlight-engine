@@ -62,6 +62,10 @@ MMR_LAMBDA = 0.5  # spreads off a candidate at full similarity to a pick (above 
 # MMR penalty stays the only cross-file diversity.
 DUP_GAP_S = 5.0
 DUP_SIM = 0.92
+# The cosine rule holds within DUP_SIM_WINDOW_S of a pick: a long recording keeps one look for an hour (a game
+# livestream with its overlay reads cosine >= 0.92 between almost any two spans), and two spans of it minutes apart are
+# different moments. The calibration pairs above are camera clips of 10-230 s.
+DUP_SIM_WINDOW_S = 60.0
 EXHAUSTIVE_MIN_SPEECH = 0.5  # speech-intent exhaustive queries: fraction of the clip with voice activity
 # "every usable shot of X" / "every shot where ...", visual: precision over recall. A blind judge failed r3's long
 # lists (p1-videographer-2: 29 picks, mean fit 0.86, hit rate 0.24; Opus 5 picks at 2.4) for padding with
@@ -83,6 +87,9 @@ EXHAUSTIVE_ITEM_MARGIN = 1.5  # relevance units below the item's best match
 EXHAUSTIVE_SCORE_MARGIN = 1.25  # spreads below the item's best clean span (2.5 heuristic units at spread 2)
 EXHAUSTIVE_MAX_UNUSABLE = 0.05  # fraction of unusable steps (the candidate gate allows 0.2)
 EXHAUSTIVE_VISUAL_CAP = 20  # at most this many picks for a visual "every X" list without a count (Opus: 5-18)
+# "every jump scare, death and clutch play" (a reaction brief): events of a long recording (a livestream has dozens),
+# kept by strong_matches up to this many
+EXHAUSTIVE_REACTION_CAP = 40
 # Exhaustive lists also never hold two back-to-back takes of the same view: same file, within EXHAUSTIVE_DUP_GAP_S
 # and mean-embedding cosine >= EXHAUSTIVE_DUP_SIM. On the r3 judge labels, same-file pairs 5-10 s apart at cosine
 # >= 0.9 were flagged redundant 10 times in 18 (at 10-15 s: 4 in 14), against 114 in 2688 over all pairs.
@@ -107,8 +114,9 @@ def duplicates(cands: list[dict], vectors: np.ndarray, o: dict, v: np.ndarray, g
                sim: float = DUP_SIM, talk_track: bool = False,
                back_to_back: tuple[float, float] | None = None) -> np.ndarray:
     """bool per candidate: a near-duplicate of clip `o` (vector v). Same file and either within `gap` seconds of it
-    (overlapping included: the same continuous action) or embedding cosine >= `sim`. back_to_back (gap2, sim2):
-    also same file, within gap2 seconds and cosine >= sim2 (exhaustive lists: two takes of the same view in a row).
+    (overlapping included: the same continuous action) or embedding cosine >= `sim` within DUP_SIM_WINDOW_S of it.
+    back_to_back (gap2, sim2): also same file, within gap2 seconds and cosine >= sim2 (exhaustive lists: two takes of
+    the same view in a row).
     talk_track (a brief that wants speech): two speech clips are distinct sentences unless they overlap (a talking
     track is consecutive sentences); in a visual edit a speech clip is a picture like any other."""
     if not cands:
@@ -119,7 +127,7 @@ def duplicates(cands: list[dict], vectors: np.ndarray, o: dict, v: np.ndarray, g
     speech = np.array([c.get("source") == "speech" for c in cands])
     between = np.maximum(starts, o["start"]) - np.minimum(ends, o["end"])  # < 0: overlap
     cos = vectors @ v
-    near = (between <= gap) | (cos >= sim)
+    near = (between <= gap) | ((cos >= sim) & (between <= DUP_SIM_WINDOW_S))
     if back_to_back is not None:
         near |= (between <= back_to_back[0]) & (cos >= back_to_back[1])
     if talk_track and o.get("source") == "speech":
@@ -284,7 +292,9 @@ def select_for(cands: list[dict], vectors: np.ndarray, p, groups: np.ndarray | N
     penalty are in its spreads. The exhaustive floor never rises above the best kept candidate, so a list with
     matches is never empty on any score scale."""
     covering = item_rel is not None and len(getattr(p, "shots", [])) >= 2 and len(item_rel) == len(cands)
-    talk = p.weights.get("speech", 0.0) > 0  # the brief wants speech: consecutive sentences are distinct clips
+    # the brief wants speech: consecutive sentences are distinct clips (not in a reaction brief: one moment is several
+    # sentences, and "the Harvard speech" names a moment, not a talking track)
+    talk = p.weights.get("speech", 0.0) > 0 and not getattr(p, "reaction", False)
     exhaustive = p.exhaustive and p.budget is None
     scale = scale or HEURISTIC_SCALE
     if covering and exhaustive and getattr(p, "per_item", True):
@@ -297,7 +307,8 @@ def select_for(cands: list[dict], vectors: np.ndarray, p, groups: np.ndarray | N
             n, b2b = p.count, None
         else:  # "every shot where ...": only strong, distinct matches of an item, a capped list
             keep = strong_matches(cands, items, item_rel if items is not None else None, scale)
-            n = p.count if getattr(p, "count_explicit", False) else min(p.count, EXHAUSTIVE_VISUAL_CAP)
+            cap = EXHAUSTIVE_REACTION_CAP if getattr(p, "reaction", False) else EXHAUSTIVE_VISUAL_CAP
+            n = p.count if getattr(p, "count_explicit", False) else min(p.count, cap)
             b2b = (EXHAUSTIVE_DUP_GAP_S, EXHAUSTIVE_DUP_SIM)
         cands, vectors = [cands[k] for k in keep], vectors[keep]
         floor = scale.loc + EXHAUSTIVE_MIN_Z * scale.spread

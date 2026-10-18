@@ -48,6 +48,28 @@ HIGHLIGHT_BLEND = 0.5
 # A shot item's words read on screen (ocr_item_match of the item's own features), in relevance units at a full match,
 # when a span is scored for one item (score_items: per-item pool extras and "every float: A, B, C" picks).
 OCR_ITEM_BONUS = 1.0
+# The highlight prior (features v4): the visual prior (highlight_prior_mean: people, faces, dancing, approach) with the
+# reaction prior mixed in, the mean of the audio reaction curve and the excited speech (reaction_mean,
+# excitement_mean; z units, vhe.signals.reaction), at REACTION_SHARE; a reaction brief ("the funniest moments",
+# "every jump scare, death and clutch play") leans on the reaction prior (REACTION_SHARE_REACTION) and averages it
+# with its content text's relevance at REACTION_BLEND instead of HIGHLIGHT_BLEND (the moments it names are events,
+# which SigLIP barely sees). The avoid penalty is not blended: it costs in full ("cut the menus" stays a penalty).
+REACTION_SHARE = 0.5
+REACTION_SHARE_REACTION = 0.8
+REACTION_BLEND = 0.75
+# A quoted line of the brief ("the 'I made it into Harvard' speech") said inside the span (quote_match, 0..1, at least
+# LINE_MIN_MATCH when matched), in relevance units at a full match; with the opener/closer, the quotes of its
+# description (vhe.rank.pool.edge_clip's relevance).
+QUOTE_BONUS = 3.0
+
+
+def compose_prior(visual, reaction, excitement, reaction_brief: bool):
+    """The heuristic's highlight prior from its parts (span means, or per-step values): the visual prior and the
+    reaction prior (mean of reaction and excitement) at REACTION_SHARE, or REACTION_SHARE_REACTION for a reaction
+    brief."""
+    share = REACTION_SHARE_REACTION if reaction_brief else REACTION_SHARE
+    react = 0.5 * (np.asarray(reaction, dtype=float) + np.asarray(excitement, dtype=float))
+    return (1 - share) * np.asarray(visual, dtype=float) + share * react
 
 # ---- visual-cue bonuses (features v2; ParsedQuery framing / want_faces / centered / legible_text) ------------------
 # Score units: about one robust z of energy or one relevance unit. Each term is a 0..1 ramp of a span feature times
@@ -154,8 +176,10 @@ class HeuristicScorer:
     bonus for utterance-aligned spans and the visual-cue bonus of a brief with framing / faces / centring /
     readable-text cues (exactly 0 without cues). Relevance is the blended relevance (h_rel) plus LEGIBLE_BONUS times
     the legibility for a readable-text brief, blended with the highlight prior for "the best moments" without a shot
-    list. score() uses the relevance mean (stage 1); the final total (rescore, on the refined span) uses the mean of
-    the best 60 % of steps and costs EDGE_WEIGHT when the clip's edges are not clean."""
+    list (compose_prior: the visual prior and the reaction prior; a reaction brief leans on reactions), plus
+    QUOTE_BONUS where a quoted line of the brief is said. score() uses the relevance mean (stage 1); the final total
+    (rescore, on the refined span) uses the mean of the best 60 % of steps and costs EDGE_WEIGHT when the clip's edges
+    are not clean."""
 
     name = "heuristic"
     feature_version = FEATURE_VERSION
@@ -177,13 +201,19 @@ class HeuristicScorer:
         hm = _col(X, "bucket_h_rel")
         legible = LEGIBLE_BONUS if self._flag(q, "legible_text") else 0.0
         leg, legm = legible * _col(X, "legibility_mean"), legible * _col(X, "bucket_legibility")
+        quote = QUOTE_BONUS * _col(X, "quote_match")  # 0 without quoted lines; no bucket median (sparse)
         if self._flag(q, "highlight") and not self._flag(q, "has_shots"):
-            prior, priorm = _col(X, "highlight_prior_mean"), _col(X, "bucket_highlight")
-            if self._flag(q, "has_text"):
-                a = HIGHLIGHT_BLEND
-                return (1 - a) * (h + leg) + a * prior, (1 - a) * (hm + legm) + a * priorm
-            return prior + leg, priorm + legm
-        return h + leg, hm + legm
+            rb = self._flag(q, "reaction")
+            prior = compose_prior(_col(X, "highlight_prior_mean"), _col(X, "reaction_mean"),
+                                  _col(X, "excitement_mean"), rb)
+            priorm = compose_prior(_col(X, "bucket_highlight"), _col(X, "bucket_reaction"),
+                                   _col(X, "bucket_excitement"), rb)
+            if self._flag(q, "has_text"):  # the avoid penalty in full, not blended away with the text
+                a = REACTION_BLEND if rb else HIGHLIGHT_BLEND
+                pen = a * _col(X, "avoid_pen")
+                return (1 - a) * (h + leg) + a * prior - pen + quote, (1 - a) * (hm + legm) + a * priorm
+            return prior + leg + quote, priorm + legm
+        return h + leg + quote, hm + legm
 
     def explain(self, X: np.ndarray, q: np.ndarray, final: bool = True) -> dict[str, np.ndarray]:
         """The total by term (score units); the terms sum to score() (final=False) or rescore() (final=True)."""

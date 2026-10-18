@@ -6,9 +6,11 @@ relevance is the per-step relevance candidate peaks and the reported clip releva
 constants (vhe.rank.scorer): per shot item (or the content text) SigLIP averaged with the highlight saliency where a
 file has it, plus the legibility bonus of a readable-text brief, the best item per step, minus the bounded avoid
 penalty; with "the best moments" and no shot list, blended with a highlight prior from the zero-shot tags, faces and
-approach. No scorer reads it: features get the parts apart (features v3) - siglip, avoid_pen, nc_sal (the slot an owned
-highlight head will fill), h_rel (blended relevance minus avoid, no legibility, no prior), legibility and highlight
-(raw, whatever the brief asks), and per shot item items (SigLIP) and items_avoid (its avoid penalty).
+approach and the reaction prior (audio reaction and excited speech, vhe.signals.reaction; a reaction brief leans on
+it); plus QUOTE_BONUS where a quoted line of the brief is said. No scorer reads it: features get the parts apart
+(features v3/v4) - siglip, avoid_pen, nc_sal (the slot an owned highlight head will fill), h_rel (blended relevance
+minus avoid, no legibility, no prior), legibility, highlight, reaction and excitement (raw, whatever the brief asks),
+quote (the brief's quoted lines), and per shot item items (SigLIP) and items_avoid (its avoid penalty).
 
 The models stay with the caller (vhe.engine): relevances(texts) -> (texts, steps) SigLIP relevance, and
 nc_scores(text) -> (raw highlight saliency or None, proposals per file)."""
@@ -28,12 +30,13 @@ from vhe.query.exclusions import (
 )
 from vhe.query.model import ParsedQuery
 from vhe.query.refine import clean_steps
-from vhe.query.text_match import legibility_steps, legible_items
+from vhe.query.text_match import legibility_steps, legible_items, line_steps
 from vhe.rank.features import grid_steps
 from vhe.rank.items import combine, item_centre
-from vhe.rank.scorer import HIGHLIGHT_BLEND, LEGIBLE_BONUS, cue_bonus
+from vhe.rank.scorer import HIGHLIGHT_BLEND, LEGIBLE_BONUS, QUOTE_BONUS, REACTION_BLEND, compose_prior, cue_bonus
 from vhe.rank.signals import blend_nc, nc_signal, timestep_signals
 from vhe.signals import robust_z, smooth
+from vhe.signals.reaction import excitement_steps
 
 # "the best moments" with no shot list: relevance is a highlight prior from the zero-shot tags (people, faces,
 # dancing, a crowd, a stage), z-scored over the corpus and averaged with the content text's relevance when there is one.
@@ -56,7 +59,8 @@ def brief_signals(corpus, p: ParsedQuery, relevances: Relevances, nc_scores: Cal
     sig = timestep_signals(c.grid, c.fps, None, c.audio_steps, c.file_id)
     sig.update(siglip=None, avoid_pen=None, nc_sal=nc, items=None, items_avoid=None, item_centre=None,
                muted=muted, h_rel=np.zeros(c.n), legibility=legibility_steps(c.grid, True),
-               highlight=highlight_prior(c), clean=clean_steps(c.grid))
+               highlight=highlight_prior(c), clean=clean_steps(c.grid),
+               excitement=excitement_steps(c.words, c.n, c.fps, c.file_id), quote=quote_steps(c, p.lines))
     items = p.shots or ([p.text] if p.text else [])
     # "every shot where the text is legible", "the float with its name legible": for candidate peaks, confident OCR
     # text counts as relevant to the items that ask for it (all of them when none does)
@@ -75,17 +79,29 @@ def brief_signals(corpus, p: ParsedQuery, relevances: Relevances, nc_scores: Cal
             sig.update(items=rel_items, item_centre=item_centre(rel_items),
                        items_avoid=np.stack([rel_items[j] - combine(rel_items[j:j + 1], rel_avoid)
                                              for j in range(len(rel_items))]))
-    prior = sig["highlight"] if p.highlight and not p.shots else None
-    if prior is not None:  # "the best moments": people, faces, dancing ... count as relevant
-        rel = sig["relevance"]
-        sig["relevance"] = (1 - HIGHLIGHT_BLEND) * rel + HIGHLIGHT_BLEND * prior if items else prior
+    if p.highlight and not p.shots:  # "the best moments": people, faces, dancing, reactions ... count as relevant
+        visual = sig["highlight"] if sig["highlight"] is not None else np.zeros(c.n)
+        prior = compose_prior(visual, sig["reaction"], sig["excitement"], p.reaction)
+        rel, a = sig["relevance"], REACTION_BLEND if p.reaction else HIGHLIGHT_BLEND
+        pen = a * sig["avoid_pen"] if sig["avoid_pen"] is not None else 0.0  # the avoid penalty in full
+        sig["relevance"] = (1 - a) * rel + a * prior - pen if items else prior
         if sig["siglip"] is None:  # the rel_* features stay SigLIP-only (no text: zero, as before)
             sig["siglip"] = np.zeros(c.n)
+    if sig["quote"] is not None:  # "the 'I made it into Harvard' speech": where the line is said
+        sig["relevance"] = sig["relevance"] + QUOTE_BONUS * sig["quote"]
     if legible is not None and not items:
         sig["relevance"] = sig["relevance"] + LEGIBLE_BONUS * legible
     sig["cue"] = cue_steps(c, p)
     sig.update(exclusions(c, p, relevances))
     return sig, nc_raw, proposals
+
+
+def quote_steps(corpus, lines: list[str]) -> np.ndarray | None:
+    """Per step: the best share of any quoted line said there (vhe.query.text_match.line_steps), 0..1; None without
+    lines."""
+    if not lines:
+        return None
+    return line_steps(corpus.words, lines, corpus.n, corpus.fps).max(0)
 
 
 def nc_query(p: ParsedQuery) -> str:

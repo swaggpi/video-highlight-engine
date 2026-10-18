@@ -79,6 +79,35 @@ HIGHLIGHT = (r"\b(?:best|top|greatest|coolest|nicest|beste[nmrs]?|schönste[nmrs
 # A count with no clip noun, before a relative clause: "die 5 die ich behalten soll", "the 3 that I should keep".
 COUNT_RELATIVE = (r"\b(?:the|die|der|das|den|top)\s+(\d+)\s+(?=(?:die|that|which|i|ich|you|du|we|wir|worth|to\s+keep)"
                   r"\b)")
+# A reaction brief: the moments it wants are reactions and events of a person on camera (a streamer, a vlogger, a
+# player), told by sound and speech more than by the picture: "the funniest moments", "every jump scare, death and
+# clutch play", "a cold open with the biggest reaction", "screams", "punchlines". It is a highlight brief whose prior
+# leans on the audio reaction and excited speech (vhe.signals.reaction), and its shot list becomes one content text
+# (the moments it names are events, not pictures). Read on the brief without its avoid clauses (cue_text).
+REACTION_CUE = (r"\b(?:funn(?:y|ier|iest)|hilarious|laugh(?:s|ing|ter|ed)?|jokes?|gags?|punch[\s-]?lines?|banter|"
+                r"(?:jump[\s-]?)?scares?|scary|scream(?:s|ing|ed)?|shout(?:s|ing)?|react(?:s|ion|ions|ing|ed)?|rage|"
+                r"clutch(?:es)?|fails?|deaths?|dies|died|hype[ds]?|cold[\s-]open|witzig\w*|lustig\w*|lach\w*|"
+                r"schrei\w*|reaktion(?:en)?)\b")
+# A quoted line ("I made it into Harvard"): matched against the transcript (ParsedQuery.lines) when it has at least
+# QUOTE_MIN_WORDS words; a one-word quote ("Granny") is a name or a label, not a line.
+QUOTED = r"[\"“„]([^\"“”„]{2,200}?)[\"“”]"
+QUOTE_MIN_WORDS = 2
+# "in stream order", "chronologically": an ordering rule (clips always come in footage order), not content.
+ORDER = (r"\b(?:in|by)\s+(?:the\s+)?(?:stream|chronological|time|story|playback|original|broadcast|footage|"
+         r"recording)\s+order\b|\bchronologically\b|\bin\s+chronologischer\s+reihenfolge\b")
+# What the footage is, named as the deliverable's subject ("highlights video from this VOD"): no content.
+SOURCE_WORDS = {"this", "that", "the", "my", "his", "her", "their", "our", "full", "whole", "entire", "raw", "vod",
+                "vods", "stream", "streams", "livestream", "livestreams", "live", "footage", "video", "videos",
+                "recording", "recordings", "broadcast", "material", "archive", "session", "playthrough", "clips"}
+# "Cut a ... highlights video from this VOD", "make an edit of ...": a deliverable clause names the format and its
+# subject (BUDGET_NOUNS ... of/from X), no shot.
+DELIVERABLE = (r"^(?:(?:please|also|then)\s+)*(?:cut|make|create|edit|build|put\s+together|assemble)\s+(?:me\s+)?"
+               r"(?:a|an|one|the|my)\b")
+# "cut all dead air: the menus, him leaving the desk", "skip the boring parts", "no dead air": the list after it
+# (after a colon) is what to leave out, preferably (a soft avoid: such items are often no picture, "slow searching").
+DEAD_AIR = (r"\b(?:cut|skip|drop|remove|lose|trim|avoid|no|without|ohne)\s+(?:out\s+)?(?:all\s+(?:of\s+)?(?:the\s+)?|"
+            r"the\s+|any\s+)?(?:dead[\s-]air|boring\s+(?:parts?|bits?|stuff|stretches|moments)|dull\s+(?:parts?|bits?|"
+            r"stuff|stretches|moments)|filler|downtime|down[\s-]time)\b\s*:?")
 
 
 DASHES = re.compile(r"[‒–—−]")  # en/em dashes and minus sign -> '-' (also used by the CLI's --budget)
@@ -131,13 +160,16 @@ TOPIC = (r"\b(?:(?:talks?|talking|speaks?|speaking|chats?|chatting)\s+(?:directl
          r"spricht\s+über|redet\s+über|erzählt|erklärt)\b")
 # Instructions about the output, not content: a sentence that starts like this is dropped whole; a clause like
 # "for a news package" or "so they can be used as ..." is dropped on its own.
-META_SENTENCE = (r"^(?:also\s+)?(?:give|return|provide|include|output|mark|export|note|add)\b.*"
-                 r"\b(?:clips?|times?|time\s*codes?|timecodes?|timestamps?|ranges?)\b")
+META_SENTENCE = (r"^(?:also\s+)?(?:for\s+each(?:\s+one|\s+clip|\s+of\s+them)?,?\s+)?"
+                 r"(?:give|return|provide|include|output|mark|export|note|add)\b.*"
+                 r"\b(?:clips?|times?|time\s*codes?|timecodes?|timestamps?|ranges?|(?:in|out)[\s-]?points?|captions?)\b")
 META_CLAUSE = (r"^(?:so\s+(?:that\s+)?(?:they|it|we|i|you)\s+can\b|"
+               r"(?:with\s+)?(?:the\s+)?(?:exact\s+)?in[\s-]+and[\s-]+out[\s-]+points?\b|(?:and\s+)?rank(?:ed)?\s+(?:them|it)\b|"
                r"to\s+(?:sit|go|play|run|lay)\s+(?:under|over|with)\b|for\s+(?:a|an|the|our|my)\s+[\w\s-]*?\b(?:package|voice-?over|segment|story|piece|post|deck|"
                r"channel|show|report)\b|for\s+example\b|e\.?g\.?$)")
 LEAD = (r"^(?:(?:also|please|then|plus|and|or)\s+)*(?:(?:cut|make|create|build(?:\s+up)?(?:\s+through)?|show|include|"
-        r"feature|cover|pick|find|get|give(?:\s+me)?|list|use|add|want|need|i\s+want|i\s+need|we\s+need)\b\s*)?")
+        r"feature|cover|pick|find|get|give(?:\s+me)?|list|use|add|want|need|i\s+want|i\s+need|we\s+need|look\s+for|"
+        r"(?:good\s+)?candidates?(?:\s+(?:include|are|could\s+be))?)\b\s*)?")
 SHOT_LEAD = (r"^(?:(?:shots?|clips?|scenes?|footage|frames?|moments?|anything|parts?)\s+"
              r"(?:where|when|with|of|that|in which|showing)?\s*)")
 SUPERLATIVE = ["the most", "most", "best", "strongest", "nicest", "greatest", "recommended", "single"]

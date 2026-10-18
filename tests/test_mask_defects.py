@@ -150,7 +150,7 @@ def test_camera_defect_checks_are_off_by_default():
     assert config.ACTIVE_REASONS == {"covered", "uniform", "blown_out", "blurry"}
     bit = {r: np.uint8(1 << i) for i, r in enumerate(REASONS)}
     bits = np.array([0, bit["shaky"], bit["obstructed"], bit["bad_framing"], bit["shaky"] | bit["blurry"],
-                     bit["covered"], 0], np.uint8)
+                     bit["covered"] | bit["uniform"], 0], np.uint8)  # covered implies uniform (decode_bits)
     stored = np.array([True, False, False, True, False, False, False])  # last: unusable without a reason bit
     assert query_usable(stored, bits).tolist() == [True, True, True, True, False, False, False]
     assert not reason_mask(bits, "shaky", "obstructed", "bad_framing").any()
@@ -197,7 +197,8 @@ def test_index_applies_active_reasons_at_load(tmp_path, monkeypatch):
 
     n = 6
     bit = {r: 1 << i for i, r in enumerate(REASONS)}
-    unusable = np.array([0, bit["shaky"], bit["obstructed"], bit["covered"], bit["bad_framing"], 0], np.uint8)
+    unusable = np.array([0, bit["shaky"], bit["obstructed"], bit["covered"] | bit["uniform"], bit["bad_framing"], 0],
+                        np.uint8)
     usable = np.array([True, False, False, False, True, True])
     save_index(tmp_path, {"fps": 3.0, "duration": 2.0, "cuts": []},
                {"t": np.arange(n) / 3.0, "usable": usable, "unusable": unusable}, None)
@@ -206,3 +207,19 @@ def test_index_applies_active_reasons_at_load(tmp_path, monkeypatch):
         assert np.array_equal(g["usable"], usable)  # the file is not rewritten
     monkeypatch.setattr(config, "ACTIVE_REASONS", frozenset(REASONS))
     assert np.array_equal(Index(tmp_path).usable, usable)
+
+
+def test_covered_needs_a_uniform_frame():
+    """A dark frame that still shows something (a game's black "Game Over" screen with a facecam and chat overlay) is
+    content: covered = dark AND uniform, at index time and when an older index's darkness-only bit is read."""
+    luma = np.array([0.01, 0.01, 0.01, 0.4])
+    contrast = np.array([0.003, 0.07, 0.015, 0.2])  # lens cap / black screen with an overlay / dark fabric / scene
+    ones, zero = np.ones(4), np.zeros(4)
+    usable, bits = usable_mask(luma, contrast, zero, 20 * ones, zero)
+    assert usable.tolist() == [False, True, False, True]
+    assert [reason_names(b) for b in bits] == [["covered", "uniform"], [], ["covered", "uniform"], []]
+    bit = {r: np.uint8(1 << i) for i, r in enumerate(REASONS)}
+    old = np.array([bit["covered"], bit["covered"] | bit["uniform"], 0], np.uint8)  # darkness alone, stored by v3
+    assert query_usable(np.array([False, False, True]), old).tolist() == [True, False, True]
+    assert reason_mask(old, "covered").tolist() == [False, True, False]
+    assert reason_names(int(old[0])) == []

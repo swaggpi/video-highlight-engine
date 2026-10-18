@@ -1,6 +1,6 @@
 """Offline ranking metrics of learned models against the hand-weighted scorer, on any split of the training rows.
 
-  python tools/train/eval_rank.py ROWS.jsonl --model models/linear_v3.json [--model ...] [--split heldout|train|all]
+  python tools/train/eval_rank.py ROWS.jsonl --model models/linear_v4.json [--model ...] [--split heldout|train|all]
                                   [--boot 2000] [--json OUT]
 
 Per query (set, run, brief) over its labelled rows (judged and label_transfer; unlabelled pool rows carry no y and
@@ -9,12 +9,12 @@ with gain y. Each metric is averaged over queries (briefs) with a 95 % bootstrap
 compared with the heuristic by the bootstrap CI of the paired difference.
 
 The heuristic bar, two ways:
-  heuristic        HeuristicScorer's final total recomputed from each row's features (features v3: a function of the
+  heuristic        HeuristicScorer's final total recomputed from each row's features (features v4: a function of the
                    row alone; its length-bucket centring reads the bucket_* pool-statistics columns), so app and Opus
                    rows are scored alike. Rows of one query with different parsed briefs (q) are scored per q.
   heuristic_dump   the score recorded with each app row (dump_score): its total in the run for app_dump rows, the
                    final total of `vhe features` for app_picks rows (runs without a dump). Only on the "app rows"
-                   table. With v3 dumps both equal "heuristic" up to float32 rounding (stage-1 "candidate" rows,
+                   table. With v4 dumps both equal "heuristic" up to float32 rounding (stage-1 "candidate" rows,
                    scored by score(), excepted).
 Tables: "all rows" (models vs heuristic) and "app rows" (rows the app featurised in its run: models vs both).
 """

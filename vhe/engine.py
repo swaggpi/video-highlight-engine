@@ -37,10 +37,10 @@ from vhe.query.candidates import corpus_candidates, peak_times
 from vhe.query.model import ParsedQuery
 from vhe.query.parser import parse_brief
 from vhe.query.refine import Context, clean_steps
-from vhe.query.text_match import STOPWORDS
+from vhe.query.text_match import STOPWORDS, quoted_lines
 from vhe.rank import dump as dumps
 from vhe.rank import pool as pools
-from vhe.rank.brief_signals import brief_signals
+from vhe.rank.brief_signals import brief_signals, quote_steps
 from vhe.rank.features import featurize, pool_stats
 from vhe.rank.gate import gate
 from vhe.rank.items import combine
@@ -399,10 +399,13 @@ class Engine:
 
     def _edge_clip(self, text: str | None, sig: dict, cands: tuple, p: ParsedQuery, taken: list[dict],
                    max_len: float, persona: str | None = None, hook: bool = False) -> dict | None:
-        """The opener/closer (or hook) slot (vhe.rank.pool.edge_clip) on the description's own SigLIP relevance."""
+        """The opener/closer (or hook) slot (vhe.rank.pool.edge_clip) on the description's own SigLIP relevance and
+        the lines it quotes ('end on his "W first time playing Granny" verdict': the slot's quote_match, not the
+        body's)."""
         rel = avoided = None
         if text:
             rel = self._relevance(text)
+            sig = dict(sig, quote=quote_steps(self.corpus, quoted_lines(text)))
             avoided = combine(rel[None], self._relevances(p.avoid)) if p.avoid else rel  # the brief's avoid penalty
         return pools.edge_clip(self.corpus, self.scorer, self._context, self._muted, self._span_vectors, sig, rel,
                                avoided, cands, p, taken, max_len, persona, hook)
