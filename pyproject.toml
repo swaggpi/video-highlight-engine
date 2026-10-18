@@ -36,9 +36,10 @@ dev = ["pytest"]
 
 [project.scripts]
 vhe = "vhe.cli:main"
+vtl = "vtl.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["vhe*"]
+include = ["vhe*", "vtl*"]
 
 [tool.setuptools.package-data]
 vhe = ["ui/*.html"]
