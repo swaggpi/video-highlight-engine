@@ -33,7 +33,7 @@ LIVE_MAX_MUTED = 0.1  # need_live_audio: clips with a larger muted (or audio-les
 
 EMBED_MODEL = "bge-m3"
 EMBED_TIMEOUT = 30.0
-EMBED_KEEP_ALIVE = "30s"
+EMBED_KEEP_ALIVE = "0s"  # unload at once (as the parser LLM): the next query's SigLIP / CG-DETR share the 6 GB GPU
 # bge-m3 cosines between transcript sentences and topic descriptions are compressed (on the irl-event footage:
 # median 0.49 over all host speech, on-topic sentences 0.51-0.70), and an embedding alone misses literal cues
 # ("copyright"); so the score is cosine + KEYWORD_BONUS * keyword overlap, kept from TOPIC_MIN_SIM on.
@@ -169,3 +169,141 @@ def topic_scores(spans: list[str], topics: list[str], embed_fn=None) -> tuple[np
     else:
         sims, method, thresh = kw, "keywords", TOPIC_MIN_KEYWORD
     return sims.max(1), sims.argmax(1), method, thresh
+
+
+# ---- hard exclusions ------------------------------------------------------------------------------------------------
+# "no protest signs", "absolutely no sanitation trucks": a clip showing an excluded item is dropped, not penalised.
+# SigLIP relevance is not comparable across phrases (on the irl-event footage "empty street" has a corpus median of
+# +0.75, "portraits of victims" never exceeds -0.7), so an item counts as present at a step when its relevance is in
+# the item's own top decile over the corpus and above an absolute floor (log-odds about -7.4). Calibrated 2026-10-18
+# on clips the judge failed for showing an excluded thing: protest signs +1.25..+2.17 (gate 0.5), sanitation trucks
+# +2.27 (0.68), floats +2.34 (0.84), flag +0.65 (0.55); judged-fine clips of the same brief stayed below their gates
+# except one flag-waving float at 0.59 for "protest signs". Abstract phrases ("portraits of victims") are not
+# detected at all at this scale: the soft avoid penalty still applies to them.
+EXCLUDE_QUANTILE = 0.9
+EXCLUDE_MIN_REL = 0.25
+EXCLUDE_CLEAR_REL = 1.5  # a clear match (log-odds about -4.3) always counts, also for an item common in the footage
+EXCLUDE_MIN_RUN = 2  # grid steps (0.67 s at 3 fps)
+EXCLUDE_MAX_FRAC = 0.1  # a clip with more of its steps showing an excluded item is dropped
+DEFECT_MAX_FRAC = 0.1  # ... or with more of its steps showing an excluded camera defect ("no whip-pans")
+NO_SPEECH_MAX_FRAC = 0.3  # "no host talking over it": clips with more voice activity are dropped
+WHIP_SPEED = 0.15  # cam_speed of a whip-pan (follow pans are 0.02-0.06; vhe.query.refine EDGE_MAX_SPEED)
+# Exclude items about the camera, not the content: the index's own defect signals answer them, not SigLIP.
+DEFECTS = {
+    "whip": r"\b(?:whip\w*|swish\w*|fast pans?|reißschwenks?)\b",
+    "shaky": r"\b(?:shak\w*|wobbl\w*|jitter\w*|unsteady|verwackel\w*|wackler)\b",
+    "blocked": r"\b(?:block\w*|cover\w*|obstruct\w*|lens|linse|finger\w*|hands?|in front of)\b",
+    "framing": (r"\b(?:ground|floor|pavement|asphalt|boden|straight up)\b|"
+                r"\b(?:camera|pointing|points|pointed)\b.*\bsky\b"),
+}
+GENERIC_WORDS = {"shot", "shots", "clip", "clips", "frame", "frames", "anything", "something", "any", "the", "with",
+                 "filling", "fills", "fill", "across", "close", "closeup", "close-up", "close-ups", "view", "scene"}
+
+
+def defect_kind(item: str) -> str | None:
+    """'whip', 'shaky', 'blocked' or 'framing' for an exclude item about a camera defect, else None."""
+    low = item.lower()
+    return next((k for k, pat in DEFECTS.items() if re.search(pat, low)), None)
+
+
+def defect_steps(grid: dict, kind: str, n: int) -> np.ndarray:
+    """bool per grid step where the camera defect `kind` shows (from the usable-mask reasons and motion)."""
+    from vhe.query.refine import EDGE_MAX_SHAKE
+    from vhe.signals.quality import REASONS
+
+    bits = np.asarray(grid["unusable"] if "unusable" in grid else np.zeros(n), dtype=np.uint8)
+
+    def reason(*names: str) -> np.ndarray:
+        return (bits & np.uint8(sum(1 << REASONS.index(r) for r in names))) > 0
+
+    def above(key: str, limit: float) -> np.ndarray:
+        return np.nan_to_num(np.asarray(grid[key] if key in grid else np.zeros(n), dtype=float), nan=0.0) > limit
+
+    if kind == "whip":
+        return above("cam_speed", WHIP_SPEED)
+    if kind == "shaky":
+        return reason("shaky") | above("shake", EDGE_MAX_SHAKE)
+    if kind == "blocked":
+        return reason("covered", "uniform", "obstructed")
+    return reason("bad_framing")
+
+
+def _stems(text: str) -> set[str]:
+    return {w[:5] for w in re.findall(r"[^\W\d_][\w'-]*", text.lower()) if len(w) > 2 and w not in STOPWORDS
+            and w not in GENERIC_WORDS}
+
+
+def conflicts(item: str, wanted: list[str]) -> bool:
+    """The exclude item names only things a wanted shot asks for ('frame with a barricade' against 'establishing wide
+    with the barricades'): it then stays a soft penalty, never a gate that would remove the wanted shot."""
+    stems = _stems(item)
+    return bool(stems) and any(stems <= _stems(w) for w in wanted if w)
+
+
+def exclusion_steps(rel_excl: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """rel_excl: (items, steps) SigLIP relevance of each exclude item. (bool per step where any item shows, the
+    per-item thresholds): an item shows where its relevance is in its corpus top decile and above EXCLUDE_MIN_REL,
+    or above EXCLUDE_CLEAR_REL in any case, for at least EXCLUDE_MIN_RUN steps in a row (a one-frame blip is not a
+    sighting)."""
+    rel_excl = np.atleast_2d(np.asarray(rel_excl, dtype=float))
+    if not len(rel_excl) or not rel_excl.shape[1]:
+        return np.zeros(rel_excl.shape[1], dtype=bool), np.zeros(len(rel_excl))
+    thr = np.clip(np.quantile(rel_excl, EXCLUDE_QUANTILE, axis=1), EXCLUDE_MIN_REL, EXCLUDE_CLEAR_REL)
+    hit = (rel_excl >= thr[:, None]).any(0)
+    edges = np.diff(np.r_[0, hit.astype(np.int8), 0])
+    for a, b in zip(np.flatnonzero(edges == 1), np.flatnonzero(edges == -1)):
+        if b - a < EXCLUDE_MIN_RUN:
+            hit[a:b] = False
+    return hit, thr
+
+
+# ---- on-screen text (hook) ------------------------------------------------------------------------------------------
+OCR_BONUS = 1.0  # relevance units for a span whose legible text contains all of an item's words
+
+
+def ocr_item_scores(corpus, items: list[str], S: np.ndarray, E: np.ndarray, K: np.ndarray) -> np.ndarray | None:
+    """Hook for on-screen text: (spans, items) the share of each item's words found in the text read inside
+    each span (0..1, matched without spaces), or None when the corpus exposes no text (indexes before on-screen text,
+    or OCR not run): callers then change nothing.
+
+    Reads `corpus.text_items` when it exists: [{"t": virtual seconds, "text", "conf", "file", ...}] (vhe.corpus, from
+    each index's ocr.json). The engine adds OCR_BONUS times this to each span's item relevance, so a float whose name
+    is legible serves its item ("PASARGAD float"). A legibility prior for "every shot where text is readable" briefs
+    can come from the grid's text_area / text_conf the same way. S, E: virtual seconds; K: file index per span."""
+    texts = getattr(corpus, "text_items", None)
+    if not texts or not items or not len(S):
+        return None
+    t = np.array([float(x["t"]) for x in texts])
+    order = np.argsort(t, kind="stable")
+    t = t[order]
+    read = [_squash(str(texts[j].get("text", ""))) for j in order]
+    files = np.array([int(texts[j].get("file", 0)) for j in order])
+    # OCR often drops spaces ("TOMBof CYRUS"): words are matched as substrings of the span's text with spaces removed
+    terms = [[_squash(w) for w in re.findall(r"[^\W\d_][\w'-]*", x.lower()) if len(w) > 2 and w not in STOPWORDS]
+             for x in items]
+    out = np.zeros((len(S), len(items)))
+    for i, (s, e, k) in enumerate(zip(S, E, K)):
+        a, b = np.searchsorted(t, s, "left"), np.searchsorted(t, e, "right")
+        text = "|".join(r for r, f in zip(read[a:b], files[a:b]) if f == k)
+        if text:
+            out[i] = [sum(w in text for w in ws) / len(ws) if ws else 0.0 for ws in terms]
+    return out
+
+
+LEGIBLE_CUE = (r"\b(?:legible|readable|read(?:s|ing)? the|on-screen text|exact (?:text|wording)|spelling|fact-check|"
+               r"lesbar|schrift)\b")
+LEGIBLE_BONUS = 1.0  # relevance units at full OCR confidence, for briefs that ask for readable text
+
+
+def legibility_steps(grid: dict, raw: str) -> np.ndarray | None:
+    """Per step 0..1: confident legible text in frame (grid text_conf where text_area > 0, index v3), for a brief that
+    asks for readable text ("every shot where the text is legible"); None otherwise or without OCR in the index."""
+    if "text_conf" not in grid or "text_area" not in grid or not re.search(LEGIBLE_CUE, raw.lower()):
+        return None
+    conf = np.nan_to_num(np.asarray(grid["text_conf"], dtype=float), nan=0.0)
+    area = np.nan_to_num(np.asarray(grid["text_area"], dtype=float), nan=0.0)
+    return np.clip(np.where(area > 0, conf, 0.0), 0.0, 1.0)
+
+
+def _squash(text: str) -> str:
+    return re.sub(r"[^0-9a-zäöüß]", "", text.lower())

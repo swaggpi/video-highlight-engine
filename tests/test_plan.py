@@ -100,7 +100,8 @@ def test_simple_briefs_have_no_plan_lists():
 
 # ---- LLM path -------------------------------------------------------------------------------------------------------
 def _answer(**kw):
-    a = {"content": "", "shots": [], "avoid": [], "topics": [], "need_live_audio": False, "mood": "neutral",
+    a = {"content": "", "shots": [], "avoid": [], "exclude": [], "topics": [], "need_live_audio": False,
+         "mood": "neutral",
          "speech": "any", "min_seconds": 0, "max_seconds": 0, "count": 0, "budget_min_seconds": 0,
          "budget_max_seconds": 0, "soundbite_min_seconds": 0, "soundbite_max_seconds": 0, "exhaustive": False,
          "opener": "", "closer": ""}
@@ -131,7 +132,9 @@ def test_llm_plan_is_grounded_and_cached(monkeypatch):
     p = parse_with_llm(B1, model="qwen3:4b")
     assert p.parser == "llm:qwen3:4b" and p.parser_note is None and len(calls) == 1
     body = calls[0]
-    assert body["think"] is False and body["options"]["temperature"] == 0 and body["keep_alive"] == "30s"
+    # keep_alive 0: the model unloads as soon as it answers, before SigLIP / CG-DETR load on the same GPU.
+    assert body["think"] is False and body["options"]["temperature"] == 0 and body["keep_alive"] == 0
+    assert body["options"]["num_ctx"] >= 4096  # the prompt and its worked examples fit
     assert body["format"]["required"] == parser.LLM_SCHEMA["required"] and body["messages"][-1]["content"] == B1
     # Numbers the brief does not contain (10-30 s per clip, 7 clips) are ignored; the budget is in it.
     assert p.budget == (60.0, 90.0) and (p.min_len, p.max_len) == (2.0, 4.0) and not p.count_explicit

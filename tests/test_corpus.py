@@ -36,7 +36,9 @@ def make_index(root, dur, seed=0, has_audio=True, emb=None, **overrides):
     grid = {"t": np.arange(n) / FPS, "emb": (emb if emb is not None else _unit(rng, n)).astype(np.float16),
             "sharpness": rng.random(n), "blur_ratio": 4 + rng.random(n), "blown": np.zeros(n),
             "motion": rng.random(n), "loudness": rng.random(n) if has_audio else np.zeros(n),
-            "onset": rng.random(n) if has_audio else np.zeros(n), "cam_speed": rng.random(n),
+            # cam_speed of steady handheld footage (real: median 0.005, whip-pans > 0.15): the energy z-score is
+            # scale-free, and clip edges are clean (vhe.query.refine.clean_steps) unless a case makes them swing
+            "onset": rng.random(n) if has_audio else np.zeros(n), "cam_speed": 0.05 * rng.random(n),
             "shake": 0.05 * rng.random(n), "speech": np.zeros(n), "usable": np.ones(n, bool),
             "tags": np.zeros((n, 2), np.float16)}
     grid.update(overrides)

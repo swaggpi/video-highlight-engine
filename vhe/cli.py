@@ -57,11 +57,13 @@ def _budget(v: str | None) -> float | tuple[float, float] | None:
 
 
 def edit_json(res: dict) -> dict:
-    """The edit list in edit order; start/end are seconds in each clip's own file."""
+    """The edit list in edit order; start/end are seconds in each clip's own file. warnings: what the edit could not
+    deliver (a budget the footage cannot fill, a model that fell back to the CPU)."""
     return {"query": res["query"]["raw"], "parser": res["query"].get("parser"), "parsed": res["query"],
             "clips": [{"file": c["file"], "start": c["file_start"], "end": c["file_end"], "duration": c["duration"],
                        "score": c["score"], "reason": c["reason"], "source": c["source"], "role": c.get("role"),
-                       "item": c.get("item")} for c in res["clips"]]}
+                       "item": c.get("item")} for c in res["clips"]],
+            "warnings": list(res.get("warnings", []))}
 
 
 def cmd_search(a: argparse.Namespace) -> None:
@@ -84,13 +86,16 @@ def cmd_clips(a: argparse.Namespace) -> None:
     note = f" ({q['parser_note']})" if q.get("parser_note") else ""
     print(f"parsed by {q['parser']}{note}: text={q['text']!r} mood={q['mood']} n={q['count']} "
           f"len={q['min_len']:.0f}-{q['max_len']:.0f}s{budget}{edges} weights={q['weights']}")
-    for key in ("shots", "avoid", "topics"):
+    for key in ("shots", "avoid", "exclude", "topics"):
         if q.get(key):
             print(f"  {key}: " + "; ".join(q[key]))
+    if q.get("no_speech"):
+        print("  no speech: speech-heavy clips excluded")
     if q.get("need_live_audio") or q.get("soundbite_len"):
         bite = f" soundbite={q['soundbite_len'][0]:.0f}-{q['soundbite_len'][1]:.0f}s" if q.get("soundbite_len") else ""
         print(f"  live audio: {'required' if q.get('need_live_audio') else 'any'}{bite}")
-    print(f"{res['files']} files, {res.get('candidates', 0)} candidates ({res.get('unusable_dropped', 0)} unusable), "
+    print(f"{res['files']} files, {res.get('candidates', 0)} candidates ({res.get('unusable_dropped', 0)} unusable, "
+          f"{res.get('excluded_dropped', 0)} excluded), "
           f"ranking {res['seconds']:.2f}s, model load {res['load_seconds']:.1f}s")
     for i, c in enumerate(res["clips"], 1):
         said = f'  "{c["transcript"]}"' if c["transcript"] else ""
@@ -98,6 +103,8 @@ def cmd_clips(a: argparse.Namespace) -> None:
         print(f"{i:2d}. {c['file']}  {_fmt(c['file_start'])}-{_fmt(c['file_end'])} ({c['duration']:.1f}s)  "
               f"score {c['score']:+.2f}{item}  {c['reason']}{said}")
     print(f"total {sum(c['duration'] for c in res['clips']):.1f}s in {len(res['clips'])} clips")
+    for w in res.get("warnings", []):
+        print(f"WARNING: {w}")
     if res.get("noncommercial"):
         print("NON-COMMERCIAL components used:", ", ".join(res["noncommercial"]))
     if a.json:

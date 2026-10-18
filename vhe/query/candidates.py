@@ -28,22 +28,56 @@ def peak_times(x: np.ndarray, fps: float, min_gap_s: float = 3.0, top: int = 60,
     return [i / fps for i in out]
 
 
-def _sentences(segments: list[dict], limit: float) -> list[tuple[float, float]]:
-    """Transcript sentences as (start, end); a sentence longer than limit is split at word boundaries."""
-    out: list[tuple[float, float]] = []
-    for seg in segments:
-        words = seg.get("words") or []
-        if not words:
-            out.append((float(seg["start"]), float(seg["end"])))
-            continue
-        a = words[0]["start"]
-        for k, w in enumerate(words):
-            last = k == len(words) - 1
-            if last or w["word"].rstrip("\"')»”").endswith(SENTENCE_END) or words[k + 1]["end"] - a > limit:
-                out.append((float(a), float(w["end"])))
-                if not last:
-                    a = words[k + 1]["start"]
+SENTENCE_PAUSE = 1.2  # a pause this long between words ends a sentence even without punctuation (ASR omits it)
+CLAUSE_END = (",", ";", ":", "—", "-")
+CLAUSE_PAUSE = 0.4  # an over-long sentence splits at a clause mark, else at its longest pause from this on
+
+
+def _ends(word: str, marks: tuple) -> bool:
+    return word.strip().rstrip("\"')»”").endswith(marks)
+
+
+def sentence_spans(words: list[dict], pause: float = SENTENCE_PAUSE) -> list[tuple[int, int]]:
+    """Sentences as (first, last) word indices over start-sorted words: a sentence ends at a word ending in . ! ? …
+    or before a pause of at least `pause` seconds."""
+    out, a = [], 0
+    for k, w in enumerate(words):
+        last = k == len(words) - 1
+        if last or _ends(w["word"], SENTENCE_END) or words[k + 1]["start"] - w["end"] >= pause:
+            out.append((a, k))
+            a = k + 1
     return out
+
+
+def _split_long(words: list[dict], a: int, b: int, limit: float) -> list[tuple[int, int]]:
+    """Word range a..b (one sentence) in pieces no longer than limit: at clause marks or long pauses where possible,
+    else at the word boundary that keeps the piece longest."""
+    out = []
+    while words[b]["end"] - words[a]["start"] > limit:
+        fits = [k for k in range(a, b) if words[k]["end"] - words[a]["start"] <= limit]
+        if not fits:  # one word longer than the limit
+            fits = [a]
+        clause = [k for k in fits if _ends(words[k]["word"], CLAUSE_END)
+                  or words[k + 1]["start"] - words[k]["end"] >= CLAUSE_PAUSE]
+        k = max(clause or fits)
+        out.append((a, k))
+        a = k + 1
+    out.append((a, b))
+    return out
+
+
+def _sentences(segments: list[dict], limit: float) -> list[tuple[float, float]]:
+    """Transcript sentences as (start, end). Sentences run across ASR segments (a segment often starts mid-sentence);
+    one longer than limit is split at a clause mark or pause, else at a word boundary. Segments without word
+    timings count as one sentence each."""
+    out: list[tuple[float, float]] = []
+    words = sorted((w for seg in segments for w in seg.get("words") or []), key=lambda w: w["start"])
+    for seg in segments:
+        if not seg.get("words"):
+            out.append((float(seg["start"]), float(seg["end"])))
+    for a, b in sentence_spans(words):
+        out += [(float(words[i]["start"]), float(words[j]["end"])) for i, j in _split_long(words, a, b, limit)]
+    return sorted(out)
 
 
 def speech_spans(segments: list[dict], vad: list[tuple[float, float]], max_len: float,
@@ -72,15 +106,35 @@ def speech_spans(segments: list[dict], vad: list[tuple[float, float]], max_len: 
     return out
 
 
-def fit_span(s: float, e: float, lo: float, hi: float, duration: float) -> tuple[float, float] | None:
-    """An utterance grown evenly to at least lo seconds (into the surrounding pause), or None if longer than hi."""
-    if e - s > hi + 1e-6:
-        return None
-    if e - s < lo:
-        L = min(lo, duration)
-        s = min(max(0.0, (s + e) / 2 - L / 2), max(0.0, duration - L))
-        e = s + L
-    return s, e
+def fit_utterances(spans: list[tuple[float, float]], lo: float, hi: float, duration: float,
+                   guard: float = 0.05) -> list[tuple[float, float]]:
+    """Utterance clips (speech_spans, in time order) of at least lo seconds without cutting a neighbour: a short one
+    grows evenly into the pauses around it (never into the next utterance), then takes whole neighbouring
+    utterances in while it stays within hi. One still shorter than lo, or longer than hi, is dropped."""
+    spans = sorted(spans)
+    out = []
+    for j, (s, e) in enumerate(spans):
+        a, b = j, j
+        while e - s < lo:
+            left = spans[a - 1][1] + guard if a > 0 else 0.0
+            right = spans[b + 1][0] - guard if b + 1 < len(spans) else duration
+            need = lo - (e - s)
+            grow_l = min(max(0.0, s - left), max(need / 2, need - max(0.0, right - e)))
+            s, e = s - grow_l, min(right, e + need - grow_l)
+            if e - s >= lo - 1e-6:
+                break
+            # the pauses are too short: take the nearer whole neighbour in, if it fits
+            nxt = spans[b + 1] if b + 1 < len(spans) and spans[b + 1][1] - s <= hi else None
+            prv = spans[a - 1] if a > 0 and e - spans[a - 1][0] <= hi else None
+            if nxt is not None and (prv is None or nxt[0] - e <= s - prv[1]):
+                b, e = b + 1, nxt[1]
+            elif prv is not None:
+                a, s = a - 1, prv[0]
+            else:
+                break
+        if lo - 1e-6 <= e - s <= hi + 1e-6:
+            out.append((max(0.0, s), min(duration, e)))
+    return out
 
 
 def generate(duration: float, cuts: list[float], change_points: list[float], min_len: float, max_len: float,
@@ -100,10 +154,10 @@ def generate(duration: float, cuts: list[float], change_points: list[float], min
             out.append((float(s), float(e), src))
 
     # First, so an identical window does not take the utterance's place.
-    for s, e in speech:  # utterances shorter than min_len grow evenly into the surrounding pause
-        fitted = fit_span(s, e, min_len, max_len, duration)
-        if fitted:
-            add(*fitted, "speech")
+    # Utterances shorter than min_len grow into the surrounding pause, then by whole neighbours: never by a word of
+    # another sentence.
+    for s, e in fit_utterances(list(speech), min_len, max_len, duration):
+        add(s, e, "speech")
     for a, b in shots_from_cuts(sorted(set(cuts) | set(change_points)), duration):
         add(a, b, "shot")
         for L in lengths:

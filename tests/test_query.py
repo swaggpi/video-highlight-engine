@@ -234,9 +234,12 @@ class _P:  # stands in for ParsedQuery in select_for
 
 
 def _pool(lengths, gap=1.0, totals=None):
+    """Distinct moments, 1 s apart on the virtual timeline. Each is in its own file: clips of one file within
+    DUP_GAP_S of each other are near-duplicates (select.duplicates), which these budget/count tests are not about."""
     out, t = [], 0.0
     for k, L in enumerate(lengths):
-        out.append({"start": t, "end": t + L, "total": float(totals[k] if totals is not None else 10 - k * 0.01)})
+        out.append({"start": t, "end": t + L, "total": float(totals[k] if totals is not None else 10 - k * 0.01),
+                    "file": k})
         t += L + gap
     return out
 

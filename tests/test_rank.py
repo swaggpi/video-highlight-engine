@@ -49,7 +49,7 @@ def _vec_patch(monkeypatch, vec):
 
 # ---- regression: the hand-weighted scorer is the engine as it was --------------------------------------------------
 def test_heuristic_scorer_reproduces_pre_seam_clips(tmp_path):
-    """tests/data/heuristic_clips.json was written by Engine.clips at 138dcd6 (before vhe/rank) on the same cases."""
+    """tests/data/heuristic_clips.json: Engine.clips on the same cases (see heuristic_cases for its provenance)."""
     expected = json.loads((DATA / "heuristic_clips.json").read_text())
     got = json.loads(json.dumps(run_all(tmp_path), default=_jsonable, ensure_ascii=False))
     assert set(got) == set(expected)
@@ -244,6 +244,7 @@ def test_dump_schema_and_selected_spans_match_the_clips(tmp_path, monkeypatch):
     eng.clips(BRIEF, llm=None, dump=tmp_path / "all.json", dump_all=True)
     full = dumps.read(tmp_path / "all.json")["candidates"]
     n = sum(c["stage"] == "candidate" for c in full)
+    assert res["excluded_dropped"] > 0  # "Leave out shots of the birds": scored, but never shortlisted
     assert n == res["candidates"] - res["unusable_dropped"] and len(full) == n + len(cands)
 
 

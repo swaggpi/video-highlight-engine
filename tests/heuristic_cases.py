@@ -1,10 +1,12 @@
 """Synthetic engine cases for the ranking-seam regression test (test_rank.py).
 
-tests/data/heuristic_clips.json holds what Engine.clips returned for every case before the ranking seam
-(vhe/rank) existed, generated at commit 138dcd6; HeuristicScorer must reproduce it exactly. The cases cover the
-paths the hand-weighted total runs through: length buckets, cut and length priors, the speech bonus, the usable
-and live-sound gates, opener/closer pools, shot lists (per-item pool extras, round robin, exhaustive per-item),
-avoid items, spoken topics, and the non-commercial saliency blend (mocked: NaN on one file)."""
+tests/data/heuristic_clips.json holds what Engine.clips returns for every case; HeuristicScorer must reproduce it
+exactly. First written at 138dcd6 (before the ranking seam, vhe/rank); regenerated on purpose after the r2 field-test
+fixes changed the selection itself (near-duplicates are never picked, visual edges move onto clean frames, speech
+clips are whole sentences, "leave out X" is a hard gate, a short budget is reported): any other change to it is a
+regression. The cases cover the paths the hand-weighted total runs through: length buckets, cut and length priors,
+the speech bonus, the usable and live-sound gates, opener/closer pools, shot lists (per-item pool extras, round robin,
+exhaustive per-item), avoid items, spoken topics, and the non-commercial saliency blend (mocked: NaN on one file)."""
 from __future__ import annotations
 
 import zlib
