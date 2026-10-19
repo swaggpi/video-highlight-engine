@@ -11,6 +11,7 @@ from __future__ import annotations
 import gc
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -60,12 +61,19 @@ def decode(video: Path, out: Path, max_fps: float) -> dict:
             "has_audio": p.has_audio, "max_fps": max_fps, "n_dense": len(list(dense.glob("*.jpg")))}
 
 
-def visual_change(paths: list[Path]) -> tuple[np.ndarray, np.ndarray]:
-    """(32x18 grey thumbnails, mean abs difference (0..1) of each to the previous one, [0] = 0)."""
+def visual_change(paths: list[Path], crop: list[int] | None = None) -> tuple[np.ndarray, np.ndarray]:
+    """(32x18 grey thumbnails, mean abs difference (0..1) of each to the previous one, [0] = 0).
+    crop: [x, y, w, h] in frame pixels; only that area is compared."""
     import cv2
 
-    thumbs = [cv2.resize(cv2.imread(str(p), cv2.IMREAD_REDUCED_GRAYSCALE_8), (32, 18), interpolation=cv2.INTER_AREA)
-              for p in paths]
+    def small(p):
+        g = cv2.imread(str(p), cv2.IMREAD_REDUCED_GRAYSCALE_8)
+        if crop:
+            x, y, w, h = (max(0, v // 8) for v in crop)
+            g = g[y:y + max(1, h), x:x + max(1, w)]
+        return cv2.resize(g, (32, 18), interpolation=cv2.INTER_AREA)
+
+    thumbs = [small(p) for p in paths]
     g = np.stack(thumbs).astype(np.float32) / 255.0
     return g, np.concatenate([[0.0], np.abs(np.diff(g, axis=0)).mean(axis=(1, 2))])
 
@@ -155,8 +163,8 @@ class Captioner:
                 attn_implementation="eager").to(device).eval()
             self.proc = AutoProcessor.from_pretrained(CAPTION_MODEL, trust_remote_code=True)
 
-    def caption(self, images) -> list[str]:
-        inp = self.proc(text=[CAPTION_TASK] * len(images), images=images, return_tensors="pt")
+    def caption(self, images, task: str = CAPTION_TASK) -> list[str]:
+        inp = self.proc(text=[task] * len(images), images=images, return_tensors="pt")
         inp = inp.to(self.device, self.dtype)
         with self.torch.inference_mode():
             out = self.model.generate(input_ids=inp["input_ids"], pixel_values=inp["pixel_values"],
@@ -170,14 +178,21 @@ class Captioner:
             self.torch.cuda.empty_cache()
 
 
-def describe(out: Path, meta: dict, fps: float, segments: list[dict], captioner, batch: int = 4,
-             log=print) -> tuple[list[dict], dict]:
-    """frames.jsonl rows {frame, t, text, kind[, dup_of]} and sampling stats. Resumable via frames.partial.jsonl."""
+def _image(path: Path, crop: list[int] | None):
     from PIL import Image
 
+    img = Image.open(path).convert("RGB")
+    return img.crop((crop[0], crop[1], crop[0] + crop[2], crop[1] + crop[3])) if crop else img
+
+
+def describe(out: Path, meta: dict, fps: float, segments: list[dict], captioner, batch: int = 4,
+             log=print, crop: list[int] | None = None) -> tuple[list[dict], dict]:
+    """frames.jsonl rows {frame, t, text, kind[, dup_of]} and sampling stats. Resumable via frames.partial.jsonl.
+    crop: [x, y, w, h] in dense-frame pixels (streamer mode: the game area); changes, duplicates and captions are
+    then all judged on that area only."""
     rate, src_fps = meta["max_fps"], meta["src_fps"]
     paths = sorted((out / "dense").glob("*.jpg"))
-    thumbs, vis = visual_change(paths)
+    thumbs, vis = visual_change(paths, crop)
     db = loudness_db(out / "audio.wav", len(paths), rate)
     sp = spikes(vis, db, speech_onsets(segments), rate)
     step = max(1, round(rate / fps))
@@ -197,8 +212,8 @@ def describe(out: Path, meta: dict, fps: float, segments: list[dict], captioner,
     with partial.open("a") as fh:
         for b in range(0, len(todo), batch):
             idx = todo[b:b + batch]
-            texts = captioner.caption([Image.open(paths[i]).convert("RGB") for i in idx])
-            for i, text in zip(idx, texts):
+            texts = captioner.caption([_image(paths[i], crop) for i in idx])
+            for i, text in zip(idx, texts, strict=True):
                 done[i] = {"i": i, "text": text}
                 fh.write(json.dumps(done[i]) + "\n")
             if time.time() - shown > 60:
@@ -221,3 +236,69 @@ def describe(out: Path, meta: dict, fps: float, segments: list[dict], captioner,
              "captioned": len(result) - n_dup, "spikes": {k: len(v) for k, v in sp.items()},
              "caption_s": round(time.time() - t0, 1)}
     return result, stats
+
+
+# Streamer mode: short facecam "reaction" captions, only around loudness onsets and speech starts.
+REACT_VERSION = "react-1"
+REACT_TASK = "<DETAILED_CAPTION>"  # <CAPTION> only names the room; the detailed one sometimes sees hands, posture
+REACT_GAP_S = 3.0     # spikes closer than this to the last reaction share it
+REACT_DELAY_S = 0.33  # the face is read a beat after the spike: reactions lag the sound
+_ROOM = re.compile(r"\b(piano|wall|sticker|poster|background|frame|table|shel(f|ves)|window|green screen|room|"
+                   r"microphone|desk|monitor|keyboard|chair|logo|sign)", re.I)
+_BODY = re.compile(r"\b(hand|arm|mouth|face|facial|express|smil|laugh|scream|shout|shock|surpris|scared|fear|cover|"
+                   r"point|stand|lean|jump|eyes|head|look)", re.I)
+
+
+def reaction_points(db: np.ndarray, speech_starts: list[float], rate: float) -> list[tuple[int, str, float]]:
+    """(dense index, 'loud' | 'speech', dB above the recent median) for every loudness onset and speech start,
+    merged so reactions are at least REACT_GAP_S apart (a loud spike wins over a speech start at the same index)."""
+    w = max(1, int(CONTEXT_S * rate))
+    jump = db - _prev_median(db, w)
+    pts = [(int(i), "loud") for i in np.flatnonzero(jump > AUDIO_JUMP_DB)]
+    pts += [(int(round(t * rate)), "speech") for t in speech_starts if 0 <= round(t * rate) < len(db)]
+    out: list[tuple[int, str, float]] = []
+    for i, kind in sorted(pts, key=lambda p: (p[0], p[1] != "loud")):
+        if out and i - out[-1][0] < REACT_GAP_S * rate:
+            continue
+        out.append((i, kind, round(float(jump[i]), 1)))
+    return out
+
+
+_CLAUSE = re.compile(r",\s*|\s+(?=(?:in front of|with|at a|in a|on the|in the background|and there)\b)", re.I)
+
+
+def reaction_text(caption: str) -> str:
+    """What a facecam caption says about the person, without the room: clauses of the first sentence that do not
+    describe the room, plus clauses of later sentences about hands, face or posture. Room-only text gives ''."""
+    caption = re.sub(r"^(the image shows|the image is|it shows|this is)\s+", "", caption.strip(), flags=re.I)
+    keep = []
+    for k, sent in enumerate(s for s in re.split(r"(?<=\.)\s+", caption) if s.strip()):
+        for c in _CLAUSE.split(sent.strip().rstrip(".")):
+            c = c.strip()
+            if c and (_BODY.search(c) and not re.search(r"\b(on|in) the (left|right) side", c)
+                      or k == 0 and not _ROOM.search(c)):
+                keep.append(c)
+    return ", ".join(keep)[:140]
+
+
+def reactions(out: Path, meta: dict, segments: list[dict], captioner, box: list[int], batch: int = 4,
+              log=print) -> tuple[list[dict], dict]:
+    """facecam.jsonl rows {frame, t, text, caption, who: streamer, source: facecam, trigger, loud_db} for the facecam
+    `box` (dense-frame pixels) at each reaction point."""
+    rate, src_fps = meta["max_fps"], meta["src_fps"]
+    paths = sorted((out / "dense").glob("*.jpg"))
+    db = loudness_db(out / "audio.wav", len(paths), rate)
+    pts = reaction_points(db, speech_onsets(segments), rate)
+    delay = round(REACT_DELAY_S * rate)
+    t0, rows = time.time(), []
+    for b in range(0, len(pts), batch):
+        part = pts[b:b + batch]
+        idx = [min(len(paths) - 1, i + delay) for i, _, _ in part]
+        texts = captioner.caption([_image(paths[j], box) for j in idx], task=REACT_TASK)
+        for (_, kind, jump), j, cap in zip(part, idx, texts, strict=True):
+            t = round(j / rate, 3)
+            rows.append({"frame": int(round(t * src_fps)), "t": t, "text": reaction_text(cap), "caption": cap,
+                         "who": "streamer", "source": "facecam", "trigger": kind, "loud_db": jump})
+    stats = {"reactions": len(rows), "loud": sum(r["trigger"] == "loud" for r in rows),
+             "speech": sum(r["trigger"] == "speech" for r in rows), "react_s": round(time.time() - t0, 1)}
+    return rows, stats

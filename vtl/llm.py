@@ -1,8 +1,9 @@
 """The single LLM entry point: llm(system, user, model, schema) -> str.
 
-Backends, chosen by name (env VTL_LLM, per stage VTL_LLM_TIMELINE / VTL_LLM_CANDIDATES / VTL_LLM_DECISION):
-  ollama:<model>  local Ollama (default ollama:qwen3:4b): JSON-schema structured output, no thinking, temperature 0.
-  haiku | sonnet  optional Claude CLI, isolated (no user settings/hooks/MCP/tools/session); only for comparisons.
+Backends, chosen by name per stage: env VTL_LLM_TIMELINE / VTL_LLM_CANDIDATES / VTL_LLM_DECISION, else VTL_LLM for
+all stages, else the stage default (STAGE_DEFAULTS: the timeline is local, candidates and decision use Haiku for now):
+  ollama:<model>  local Ollama (ollama:qwen3:4b): JSON-schema structured output, no thinking, temperature 0.
+  haiku | sonnet  Claude CLI, isolated (no user settings/hooks/MCP/tools/session).
 Every call is appended to STATS (wall time, tokens, $) so stages can report their cost.
 """
 from __future__ import annotations
@@ -18,6 +19,7 @@ import urllib.request
 from vtl.common import extract_json
 
 DEFAULT = "ollama:qwen3:4b"
+STAGE_DEFAULTS = {"timeline": DEFAULT, "candidates": "haiku", "decision": "haiku"}
 OLLAMA_URL = os.environ.get("OLLAMA_HOST", "http://localhost:11434").rstrip("/")
 if not OLLAMA_URL.startswith("http"):
     OLLAMA_URL = "http://" + OLLAMA_URL
@@ -25,11 +27,12 @@ if not OLLAMA_URL.startswith("http"):
 CHILD_ENV_DROP = ("ANTHROPIC_BASE_URL", "CLAUDECODE", "AI_AGENT", "_CLAUDE_CODE_ASSUME_FIRST_PARTY_BASE_URL",
                   "CLAUDE_EFFORT", "CLAUDE_PID", "CLAUDE_JOB_DIR")
 STATS: list[dict] = []
+OLLAMA_OPTIONS: dict = {}  # extra Ollama options for every call, e.g. {"num_gpu": 999} with an exclusive GPU
 _LOCK = threading.Lock()
 
 
 def model_for(stage: str) -> str:
-    return os.environ.get(f"VTL_LLM_{stage.upper()}") or os.environ.get("VTL_LLM") or DEFAULT
+    return os.environ.get(f"VTL_LLM_{stage.upper()}") or os.environ.get("VTL_LLM") or STAGE_DEFAULTS.get(stage, DEFAULT)
 
 
 def is_local(model: str) -> bool:
@@ -47,7 +50,8 @@ def _ollama(system: str, user: str, name: str, schema: dict | None) -> str:
     body = {"model": name, "stream": False, "think": False, "keep_alive": os.environ.get("VTL_OLLAMA_KEEP", "30s"),
             "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
             "options": {"temperature": 0, "seed": 0, "num_ctx": min(32768, -(-need // 2048) * 2048),
-                        "num_predict": 2500}}  # a looping answer is cut off (invalid JSON -> one retry)
+                        "num_predict": 2500,  # a looping answer is cut off (invalid JSON -> one retry)
+                        **OLLAMA_OPTIONS}}
     if schema:
         body["format"] = schema
     req = urllib.request.Request(f"{OLLAMA_URL}/api/chat", data=json.dumps(body).encode(),
@@ -98,17 +102,21 @@ def llm(system: str, user: str, model: str, schema: dict | None = None) -> str:
 def llm_json(system: str, user: str, model: str, schema: dict | None = None, check=None, call=None) -> dict:
     """llm() + JSON extraction (+ optional check(dict) raising ValueError), with one retry on failure."""
     call = call or llm
-    err = None
+    err, reply = None, ""
     for attempt in range(2):
-        prompt = user if attempt == 0 else f"{user}\n\n(Your previous reply was invalid: {err}. Reply with the JSON object only.)"
+        prompt = user if attempt == 0 else \
+            f"{user}\n\n(Your previous reply was invalid: {err}. Reply with the JSON object only.)"
         try:
-            data = extract_json(call(system, prompt, model, schema))
+            reply = ""
+            reply = call(system, prompt, model, schema)
+            data = extract_json(reply)
             if check:
                 check(data)
             return data
         except (ValueError, RuntimeError, OSError) as e:  # bad JSON, CLI or HTTP failure
             err = str(e)[:200]
-    raise RuntimeError(f"LLM ({model}) gave no valid JSON after a retry: {err}")
+    raise RuntimeError(f"LLM ({model}) gave no valid JSON after a retry: {err} "
+                       f"(last reply: {len(reply or '')} chars, ending {str(reply or '')[-150:]!r})")
 
 
 def unload(model: str) -> None:
@@ -121,6 +129,15 @@ def unload(model: str) -> None:
                                                       headers={"Content-Type": "application/json"}), timeout=30)
     except OSError:
         pass
+
+
+def running() -> list[str]:
+    """Models Ollama has loaded right now ([] if Ollama is not reachable)."""
+    try:
+        with urllib.request.urlopen(f"{OLLAMA_URL}/api/ps", timeout=10) as r:
+            return [m["name"] for m in json.loads(r.read()).get("models", [])]
+    except (OSError, ValueError, KeyError):
+        return []
 
 
 def summary(since: int = 0) -> dict:

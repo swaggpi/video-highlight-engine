@@ -7,6 +7,7 @@ from pathlib import Path
 
 from vtl import llm as L
 from vtl.common import hms, parse_time, read_json, read_jsonl, slug
+from vtl.index import index_dir
 from vtl.timeline import compact_caption, line
 
 VERSION = "find-1"
@@ -42,21 +43,27 @@ For EVERY candidate return {id, score, start, end, label, reason}:
          respect the requested clip length
   label: a 1-3 word tag (e.g. "scare/death", "clutch/win", "funny")
   reason: at most 20 words on what happens and why it fits the brief"""
+DEC_STREAMER = """
+This is a game stream: SEE captions show the game area only; TEXT lines are on-screen game text read by OCR (GAME
+OVER, DAY 2, prompts); CAM lines describe the streamer's facecam at loud moments."""
 DEC_SCHEMA = {"type": "object", "required": ["picks"], "properties": {"picks": {"type": "array", "items": {
     "type": "object", "required": ["id", "score", "start", "end", "label", "reason"], "properties": {
         "id": {"type": "integer"}, "score": {"type": "number"}, "start": {"type": "string"},
         "end": {"type": "string"}, "label": {"type": "string"}, "reason": {"type": "string"}}}}}}
 
 
-def load_index(root: Path) -> list[dict]:
+def load_index(root: Path, streamer: bool = False) -> list[dict]:
     files = []
-    for meta_path in sorted((root / ".vtl").glob("*/meta.json")):
+    for meta_path in sorted(index_dir(root, streamer).glob("*/meta.json")):
         meta, out = read_json(meta_path), meta_path.parent
         if not meta or not (out / "timeline.jsonl").exists():
             continue
-        files.append({"file": meta["file"], "duration": meta["duration"], "timeline": read_jsonl(out / "timeline.jsonl"),
-                      "frames": read_jsonl(out / "frames.jsonl"),
-                      "segments": (read_json(out / "transcript.json") or {}).get("segments", [])})
+        f = {"file": meta["file"], "duration": meta["duration"], "timeline": read_jsonl(out / "timeline.jsonl"),
+             "frames": read_jsonl(out / "frames.jsonl"),
+             "segments": (read_json(out / "transcript.json") or {}).get("segments", [])}
+        if streamer:
+            f.update(cards=read_jsonl(out / "cards.jsonl"), cams=read_jsonl(out / "facecam.jsonl"))
+        files.append(f)
     return files
 
 
@@ -114,6 +121,10 @@ def context(f: dict, start: float, end: float, max_see: int = 12) -> list[str]:
             for e in f["timeline"] if a <= e["t"] <= b]
     rows += [(s["start"], 1, f"[{hms(s['start'], 1)}] SAY: \"{s['text']}\"")
              for s in f["segments"] if s["end"] >= a and s["start"] <= b]
+    rows += [(c["t"], 1, f"[{hms(c['t'], 1)}] TEXT: \"{c['text']}\"") for c in f.get("cards", [])
+             if c["end"] >= a and c["t"] <= b]
+    rows += [(r["t"], 1, f"[{hms(r['t'], 1)}] CAM: {r['text']}") for r in f.get("cams", [])
+             if a <= r["t"] <= b and r["text"]]
     see, prev = [], None
     for fr in f["frames"]:
         if a <= fr["t"] <= b:
@@ -200,10 +211,15 @@ def select(scored: list[dict], plan: dict, count: int | None, files: dict[str, d
     return picked
 
 
-def find(root: Path, brief: str, count: int | None = None, call=None, log=print) -> dict:
-    files = {f["file"]: f for f in load_index(root)}
+def find(root: Path, brief: str, count: int | None = None, call=None, log=print, streamer: bool = False) -> dict:
+    files = {f["file"]: f for f in load_index(root, streamer)}
+    if not files and not streamer and load_index(root, True):
+        log("  no plain index; using the streamer-mode index")
+        streamer, files = True, {f["file"]: f for f in load_index(root, True)}
     if not files:
-        raise SystemExit(f"no vtl index under {root} (run: vtl index {root})")
+        raise SystemExit(f"no vtl {'streamer ' if streamer else ''}index under {root} "
+                         f"(run: vtl index {'--streamer ' if streamer else ''}{root})")
+    dec_system = DEC_SYSTEM + (DEC_STREAMER if streamer else "")
     io: list[dict] = []
     base = call or L.llm
 
@@ -228,7 +244,7 @@ def find(root: Path, brief: str, count: int | None = None, call=None, log=print)
 
     par = 1 if L.is_local(m_cand) else 4
     with ThreadPoolExecutor(par) as ex:
-        for k, d in enumerate(ex.map(one_window, range(len(wins)))):
+        for d in ex.map(one_window, range(len(wins))):
             plans += [d["plan"]] if isinstance(d.get("plan"), dict) else []
             cands += clean_candidates(d.get("candidates"), files)
     # Windows sometimes size the plan to their own part: keep the first plan but the largest count.
@@ -240,7 +256,7 @@ def find(root: Path, brief: str, count: int | None = None, call=None, log=print)
     batches = [list(enumerate(cands))[i:i + DEC_BATCH] for i in range(0, len(cands), DEC_BATCH)]
 
     def one_batch(batch):
-        return L.llm_json(DEC_SYSTEM, dec_prompt(brief, plan, batch, files), m_dec, DEC_SCHEMA,
+        return L.llm_json(dec_system, dec_prompt(brief, plan, batch, files), m_dec, DEC_SCHEMA,
                           call=recorded("decision")).get("picks") or []
 
     scored = []
@@ -259,7 +275,7 @@ def find(root: Path, brief: str, count: int | None = None, call=None, log=print)
                                "label": str(p.get("label", "")), "reason": str(p.get("reason") or c["why"])})
     clips = select(scored, plan, count, files)
     stats = L.summary(n0)
-    return {"query": brief, "version": VERSION, "plan": plan,
+    return {"query": brief, "version": VERSION, "mode": "streamer" if streamer else "plain", "plan": plan,
             "clips": [{"file": c["file"], "start": c["start"], "end": c["end"], "duration": c["duration"],
                        "reason": c["reason"], "label": c["label"], "score": c["score"], "source": "vtl"}
                       for c in clips],
@@ -268,5 +284,5 @@ def find(root: Path, brief: str, count: int | None = None, call=None, log=print)
                        "total_s": round(time.time() - t0, 1)}, "llm": stats, "_io": io}
 
 
-def default_out(root: Path, brief: str) -> Path:
-    return root / ".vtl" / "queries" / f"{slug(brief)[:60]}.json"
+def default_out(root: Path, brief: str, streamer: bool = False) -> Path:
+    return index_dir(root, streamer) / "queries" / f"{slug(brief)[:60]}.json"
